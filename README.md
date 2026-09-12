@@ -25,6 +25,28 @@ adapter.py ──drives──▶ RobotBinding ──wraps──▶ MqttClient + 
                                           vda5050 (now) ──┤── iso21423 (later)
 ```
 
+### The binding lifecycle is part of the contract
+
+`RobotBinding` declares `start()` / `stop()` / `transport_alive()`, and the adapter drives
+them unconditionally from `bring_up_robot()` — no `hasattr` probe, no `--comms` branch. A
+binding with nothing to bring up implements the first two as **documented no-ops** (see
+`SimulatedRobot`), which is two visible lines; an *absent* lifecycle is invisible, and that
+is what shipped: `--comms vda5050` constructed `Vda5050Binding` and never called `start()`,
+so it subscribed to no topic, connected to no broker, published no orders — and nothing
+raised. `pose()` answered the origin, `battery_percent()` answered 0 and `is_stopped()`
+answered False forever, which can never confirm a stop.
+
+`transport_alive()` is the other half. It answers True only while the broker session is up
+**and** the robot's own VDA5050 `connection` topic says `ONLINE`; the adapter asks it before
+every telemetry publish and reports `ROBOT_PHASE_OFFLINE` with `position` and `battery`
+**omitted** rather than defaulted when the answer is False — proto3 message-field presence
+is what makes "unknown" distinguishable from "0" on the wire (C6.2).
+
+If you implement `RobotBinding` against your own fleet API: `start()` MUST raise when it
+cannot connect (returning quietly is the defect above), `stop()` MUST be idempotent and safe
+when `start()` never ran, and `transport_alive()` MUST mean *"the readings below are
+measurements"* — not *"the process is alive"*.
+
 ## Running
 
 ```bash

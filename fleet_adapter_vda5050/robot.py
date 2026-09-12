@@ -22,6 +22,97 @@ class RobotBinding(Protocol):
     """The methods the adapter drives. Implemented by SimulatedRobot and by the
     VDA5050 binding (and, later, any ISO 21423 profile behind the same binding)."""
 
+    # ── lifecycle ────────────────────────────────────────────────────────────
+    # DECIDED (ported from fleet-adapter-ros2): the lifecycle belongs IN this contract,
+    # and the adapter calls it unconditionally, rather than being discovered by the
+    # adapter with `if hasattr(robot, "start")`.
+    #
+    # The decision is `fleet-adapter-ros2`'s, taken on the evidence measured across all
+    # three reference adapters: ALL THREE BINDINGS ALREADY HAD A `start()`, two of the
+    # three adapters never called it -- `fleet-adapter-ros2` and this one -- and all
+    # three Protocols omitted it. The defect was never that bindings disagreed about
+    # NAMING; it was that the contract did not require the call, and "Protocol silent"
+    # tracked "call forgotten" almost perfectly.
+    #
+    # A `hasattr("start")` check would in fact have worked on all three bindings as they
+    # exist today. It is rejected for what it ENCODES, not for a naming divergence
+    # anyone has observed: `if hasattr(...)` literally says "a binding with no lifecycle
+    # is fine", which is the assumption that was wrong, and it cannot tell an absent
+    # lifecycle from one spelled differently by a binding not yet written.
+    #
+    # NOTHING ABOUT THIS ADAPTER ARGUED FOR DIVERGING. The one thing that is different
+    # here is that the divergence would have been in the OTHER direction, and is worth
+    # naming because it is the reason this repo's defect was the worse of the two:
+    #
+    #   `Vda5050Binding.start()` subscribes to the robot's `connection`, `state` and
+    #   `factsheet` topics and connects the broker, and it is what sets `_started`
+    #   ("orders now publish; before this they are cached only"). Nothing called it, so
+    #   `--comms vda5050` built an object subscribed to nothing, connected to no broker,
+    #   publishing no orders -- and NOT ONE CALL RAISED: pose() answered (0,0,0),
+    #   battery_percent() answered 0, phase_hint() answered IDLE, and is_stopped()
+    #   answered False forever, which can never confirm a stop. On the ros2 adapter that
+    #   last one failed three estop conformance checks (C5.2, C8.3, C14.1) for a reason
+    #   nobody could see; the same accessor here fails them the same way.
+    #
+    #   And unlike ros2, THIS binding already knew. VDA5050 has a protocol-level
+    #   `connection` topic (ONLINE / OFFLINE / CONNECTIONBROKEN); the binding parsed it
+    #   into `connection_state()` and `is_online()`, and the adapter read neither. The
+    #   best liveness signal of the three adapters, computed and discarded. That is why
+    #   `transport_alive()` below is declared here rather than left to each binding: a
+    #   signal no caller is obliged to ask for is a signal nobody asks for.
+    #
+    # A binding with no lifecycle implements both as documented no-ops (see
+    # `SimulatedRobot.start`), which is a visible, reviewable two lines; an absent
+    # lifecycle was invisible.
+
+    def start(self) -> None:
+        """Bring the binding's transport up: open connections, subscribe, and start
+        whatever background I/O the robot side needs. Called ONCE by the adapter before
+        `spawn`, and before any command or telemetry read.
+
+        MUST raise if the transport cannot be established. Returning normally is the
+        adapter's only evidence that the binding is live, so a binding that cannot
+        connect must not return quietly -- that is an inert binding reporting plausible
+        values, the defect this method was added to prevent.
+
+        A binding that needs no bring-up implements this as an explicit no-op."""
+
+    def stop(self) -> None:
+        """Tear the transport down: close connections and JOIN any background thread
+        before the interpreter exits. MUST be idempotent, and MUST be safe to call when
+        `start` was never called or raised.
+
+        Declared alongside `start` deliberately. A lifecycle with a bring-up and no
+        teardown is half a lifecycle: before the lifecycle fix this adapter had no `stop()` at
+        all -- not on the binding, not on the Protocol -- so a `--comms vda5050` run left
+        paho's network thread and the broker connection to the interpreter's exit."""
+
+    def transport_alive(self) -> bool:
+        """True only while this binding can still OBSERVE the robot — its transport is up
+        and delivering, so the values the accessors below return are measurements rather
+        than defaults or frozen copies.
+
+        Declared here for the same reason as the lifecycle, and it is the other half of
+        the same defect. The adapter must ask this BEFORE it publishes a
+        `TelemetryPayload`, because a binding that cannot observe the robot still answers
+        every accessor: `pose()` returns the origin, `battery_percent()` returns 0.
+        Sending those is a **C6.2 violation** — *"never send a defaulted 0/false where the
+        true reading is unknown"* — and the control plane cannot distinguish it from a
+        robot genuinely parked at the origin on a flat battery.
+
+        A predicate, deliberately, and not only an exception out of `tick()`. An
+        exception is a ONE-SHOT signal, so whichever thread reaches it first consumes it
+        on behalf of every other: an estop arriving before bring-up spends the binding's
+        single `tick()` raise inside `confirm_estop`, and the telemetry loop that starts
+        afterwards then sees a silent, apparently healthy binding and publishes defaults
+        at full cadence forever. A predicate cannot be consumed, so it cannot be raced.
+
+        A binding with no transport to lose returns True — `SimulatedRobot` does, because
+        its readings are exactly as live as the simulation it models. Returning True is
+        therefore the honest answer for it and NOT a stub."""
+
+    # ── robot ────────────────────────────────────────────────────────────────
+
     def spawn(self, robot_id: str) -> None: ...
 
     def command_move(self, robot_id: str, x: float, y: float, yaw: float = 0.0) -> None:
@@ -71,6 +162,28 @@ class SimulatedRobot:
         self._hw_prev: dict[str, str] = {}  # last-reported hardware status (delta base)
 
     # ── RobotBinding contract (safety-critical; scenario never weakens it) ───────
+
+    def start(self) -> None:
+        """No-op, DELIBERATELY: a simulated robot has no transport to bring up.
+
+        This is not an oversight and must not be deleted as dead code. `RobotBinding`
+        declares a lifecycle (see the Protocol above) so that every binding answers the
+        question "what does bring-up mean here?" in writing. For this one the answer is
+        "nothing", and writing it down is what lets the adapter call `start()`
+        unconditionally on whatever binding it was handed -- which is the fix for
+        the defect where an adapter that could not call a lifecycle it did not know about
+        shipped a `--comms vda5050` that talked to no broker."""
+
+    def stop(self) -> None:
+        """No-op, for the same reason as `start`: nothing to tear down. Idempotent
+        trivially."""
+
+    def transport_alive(self) -> bool:
+        """Always True, and that is the honest answer rather than a stub: this robot's
+        readings come from an in-process model, so they are exactly as live as the
+        simulation. There is no transport that can die and leave the accessors returning
+        frozen copies, which is the condition the adapter is asking about."""
+        return True
 
     def spawn(self, robot_id: str) -> None:
         self._moving[robot_id] = False
