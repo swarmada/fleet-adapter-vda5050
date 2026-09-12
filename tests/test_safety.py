@@ -16,6 +16,8 @@ import json
 
 from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED, confirm_estop
 
+from conftest import mark_transport_live
+
 from fleet_adapter_vda5050 import profiles
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
@@ -68,15 +70,20 @@ def test_stop_uses_monotonic_header_id() -> None:
     assert h2 > h1                                    # per-topic dedup key advances
 
 
+# `confirm_estop` ticks the binding while it polls, and since the lifecycle fix `tick()` refuses
+# a transport that was never brought up. These two are standing in for a LIVE robot that
+# is reporting `state`, so they say so — see conftest.mark_transport_live. The estop
+# behaviour of an INERT binding is covered on its own in test_binding_lifecycle.py.
+
 def test_confirm_estop_stopped_when_state_confirms_rest() -> None:
-    b = Vda5050Binding(robot_id="amr-1")
+    b = mark_transport_live(Vda5050Binding(robot_id="amr-1"))
     b.on_state(_state(driving=False, vx=0.0))
     assert confirm_estop(b, "amr-1") == ESTOP_STOPPED
 
 
 def test_confirm_estop_fails_when_robot_still_moving() -> None:
     # Stop commanded but state still shows motion → FAILED, never a false STOPPED.
-    b = Vda5050Binding(robot_id="amr-1")
+    b = mark_transport_live(Vda5050Binding(robot_id="amr-1"))
     b.on_state(_state(driving=True, vx=0.5))
     assert confirm_estop(b, "amr-1", tick_dt=0.0, max_ticks=5) == ESTOP_FAILED
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 
+from conftest import mark_transport_live
+
 from fleet_adapter_vda5050 import profiles
 from fleet_adapter_vda5050.profiles.vda5050 import Vda5050Profile
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
@@ -107,7 +109,10 @@ def test_binding_caches_and_maps_state() -> None:
     assert b.battery_percent("amr-1") == 61
     assert b.latest_battery("amr-1").charging is False
     assert b.latest_hardware("amr-1")[0].status == profiles.STATUS_FAILED
-    assert b.phase_hint("amr-1") == profiles.PHASE_ERROR
+    # phase_hint answers "" for a robot this binding cannot observe, so the
+    # mapped phase is asserted on a binding that CAN. The unobservable answer is pinned
+    # in test_binding_lifecycle.py.
+    assert mark_transport_live(b).phase_hint("amr-1") == profiles.PHASE_ERROR
 
 
 def test_binding_defaults_before_any_state() -> None:

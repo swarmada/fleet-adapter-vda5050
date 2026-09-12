@@ -29,6 +29,7 @@ import grpc
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from swarmada_sdk.safety import (  # noqa: E402
+    ESTOP_FAILED,
     ESTOP_STOPPED,
     FenceDecision,
     FenceGuard,
@@ -84,6 +85,9 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
         self._estop_drilled = False
         self._reconnect_pending = False
         self._active_call = None
+        # Transport-liveness log state: True so the FIRST degrade is announced, and so
+        # the announcement is a transition rather than 5 lines a second.
+        self._transport_was_live = True
 
     # ── ControlStream ────────────────────────────────────────────────────────
 
@@ -99,9 +103,38 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
                 return
             yield msg
 
-    def run_control_stream(self, stub) -> None:
+    def bring_up_robot(self) -> None:
+        """Bring the robot binding up, then spawn the robot on it.
+
+        THE ONE PLACE the adapter drives `RobotBinding.start()`. It is called
+        unconditionally -- no `hasattr`, no `--comms` branch -- because the Protocol
+        declares the lifecycle (robot.py) and a binding with nothing to bring up says so
+        with an explicit no-op.
+
+        `start()` runs BEFORE `spawn()`, and that order is load-bearing rather than
+        stylistic: `spawn` is the first thing the adapter asks OF the robot, and on
+        `Vda5050Binding` nothing can be asked until the three MQTT subscriptions and the
+        broker session exist. Spawning first would be addressing a transport that is not
+        up yet.
+
+        Separate from :meth:`run_control_stream` so the bring-up the shipped entry point
+        performs can be driven WITHOUT a control plane or a gRPC stub -- which is what a
+        harness needs, and the reason it matters is `fleet-adapter-ros2`'s: its R1 harness
+        called `binding.start()` itself, so it exercised a started binding while the
+        adapter did not, and R1 passed every assertion for months against a transport the
+        shipped adapter never opened. A harness that supplies the step under
+        test is not testing it. There is one bring-up implementation and it lives here.
+
+        A failure here is fatal on purpose: `start()` raising stops the run, rather than
+        letting the adapter register and stream plausible telemetry (pose `(0,0,0)`,
+        battery `0`, phase `IDLE`, `is_stopped` permanently False) read off a binding
+        connected to no broker."""
         with self._robot_lock:
+            self._robot.start()
             self._robot.spawn(self._robot_id)
+
+    def run_control_stream(self, stub) -> None:
+        self.bring_up_robot()
         # The edge loop blocks until an endpoint is advertised (C8), so starting it
         # now is safe; it stays idle for zones with no edge node.
         threading.Thread(target=self._edge_loop, daemon=True).start()
@@ -293,6 +326,41 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
             upd.fencing_token = fencing_token
         self._outbox.put(pb.AdapterMessage(action_status=upd))
 
+    def _confirm_estop(self) -> str:
+        """`confirm_estop`, but a BROKEN TRANSPORT still produces an answer.
+
+        `confirm_estop` polls the binding's `tick()` and `is_stopped()`. Since the lifecycle
+        fix, `Vda5050Binding.tick()` raises when its transport was never started — which is
+        correct, and on this path alone it would make things worse if it escaped:
+
+        * `run_safety_stream` and `_edge_loop` call this from inside their response loops,
+          so an escaping exception kills that thread and the control plane gets **no
+          EstopAck at all**. Silence on an estop is strictly less actionable than
+          `FAILED`, which at least says "rest was not confirmed — escalate".
+        * the safety stream is started BEFORE `bring_up_robot()` runs (see `main`), so
+          there is a real window in which an estop can arrive at an un-started binding.
+          Losing the safety thread permanently to a startup race would be a worse defect
+          than the one being fixed.
+
+        So the exception is caught, reported to stderr with its diagnosis intact, and
+        mapped to ESTOP_FAILED. That mapping is not a fudge and not a weakening of C5:
+        FAILED is the TRUE answer, because a binding subscribed to no `state` topic
+        cannot confirm rest, and C5.3 forbids inferring rest from silence. The only thing
+        that changes is that the reason now reaches the operator instead of being lost —
+        previously this returned FAILED with no explanation anywhere, which is how
+        C5.2 / C8.3 / C14.1 were misattributed for weeks on the ros2 adapter.
+
+        Deliberately NOT a blanket `except Exception`: only the transport's own
+        RuntimeError is absorbed. A bug in the safety primitive itself must still crash.
+        """
+        try:
+            return confirm_estop(self._robot, self._robot_id)
+        except RuntimeError as exc:
+            print(f"estop could not be confirmed - the robot binding's transport is not "
+                  f"live, so rest cannot be read from the robot and C5.3 forbids "
+                  f"inferring it: {exc}", file=sys.stderr)
+            return ESTOP_FAILED
+
     def _self_stop(self, robot_id: str) -> None:
         with self._robot_lock:  # C4.2
             self._robot.command_stop(robot_id)
@@ -307,19 +375,97 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
                                      self._current_fencing_token)
         self._current_action = ""
 
+    def _report_transport_not_live(self, detail: str) -> None:
+        """Announce a transport that cannot observe the robot, on the TRANSITION only.
+
+        At a 0.2 s cadence an unconditional log is 5 lines a second, which buries the
+        diagnosis it is trying to deliver. Logged again if the transport recovers, so the
+        operator sees an interval rather than an unbounded complaint."""
+        if self._transport_was_live:
+            self._transport_was_live = False
+            print(f"telemetry DEGRADED to ROBOT_PHASE_OFFLINE: the robot binding cannot "
+                  f"observe the robot, so position and battery are being OMITTED rather "
+                  f"than sent as defaults (C6.2). {detail}", file=sys.stderr)
+
+    def _transport_detail(self) -> str:
+        """The binding's own reason for being unobservable, if it offers one.
+
+        `transport_detail` is deliberately NOT on `RobotBinding`: the adapter degrades
+        identically without it. Only the operator-facing sentence gets shorter, and
+        demanding it of every binding would put a logging convenience in a safety
+        contract."""
+        detail = getattr(self._robot, "transport_detail", None)
+        return detail(self._robot_id) if callable(detail) else ""
+
     def _telemetry_loop(self, stub) -> None:
+        """Stream TelemetryPayload at the registered cadence (C6).
+
+        Every cycle asks the binding whether it can still OBSERVE the robot, and stops
+        claiming a position or a battery the moment it cannot. Two things make that
+        necessary rather than defensive:
+
+        * **It was a C6.2 violation, and this adapter had the evidence in hand.** An
+          un-started binding answers every accessor — `pose()` with the origin,
+          `battery_percent()` with 0 — and this loop published them at full cadence with
+          a fresh `timestamp_ms`. C6.2 says *"never send a defaulted 0/false where the
+          true reading is unknown"*, and a robot "parked at (0,0) on a 0% battery" is
+          indistinguishable from a real one. What makes it this adapter's own fault
+          rather than an oversight is that VDA5050 declares the answer on the
+          `connection` topic and the binding already parsed it into `connection_state()`
+          / `is_online()`: the signal was computed every cycle and read by nobody.
+        * **`tick()` raising is not enough on its own.** It raises ONCE, so the first
+          thread to reach it consumes the signal for all the others — and the safety
+          stream starts before bring-up, so it can be the one that consumes it.
+
+        OFFLINE is reported rather than a gap, deliberately. A gap is ambiguous between a
+        crashed adapter, a network fault and a blind one; OFFLINE is the adapter saying
+        "I am up and I cannot see the robot", in the field built for it, at the cadence
+        the control plane already expects. Proto3 message fields have presence, so
+        omitting `position` and `battery` is expressible and is what C6.2 asks for.
+
+        `self._lease.tick()` keeps running throughout, deliberately: an un-renewed lease
+        must still self-stop during a transport outage (C4), exactly as it does during
+        the scenario stream drop."""
         pb = self._pb
         while not self._shutdown.is_set():
-            self._lease.tick()  # C4 self-stop check
+            self._lease.tick()  # C4 self-stop check — must keep running while degraded
+            x = y = floor = battery = None
             with self._robot_lock:
-                self._robot.tick(_TICK_DT)  # advances the scenario clock too
-                x, y, floor = self._robot.pose(self._robot_id)
-                battery = self._robot.battery_percent(self._robot_id)  # battery-edge curve
+                try:
+                    self._robot.tick(_TICK_DT)  # advances the scenario clock too
+                    live = self._robot.transport_alive()
+                    detail = self._transport_detail() if not live else ""
+                except RuntimeError as exc:
+                    # tick() diagnosing a transport that was never started. Handled
+                    # identically to the predicate answering False, so the outcome does
+                    # not depend on which thread happened to consume the one-shot raise.
+                    live, detail = False, str(exc)
+                if live:
+                    x, y, floor = self._robot.pose(self._robot_id)
+                    battery = self._robot.battery_percent(self._robot_id)  # battery-edge curve
             self._maybe_estop_drill()   # estop-drill: confirmed stop on a timer
             self._maybe_stream_drop()   # comms-flaky: tear the stream down on a timer
             if self._sim is not None and self._sim.telemetry_suppressed():
                 time.sleep(self._telemetry_interval)
                 continue
+            if not live:
+                self._report_transport_not_live(detail)
+                # OFFLINE, with position and battery ABSENT — never defaulted (C6.2).
+                self._outbox.put(pb.AdapterMessage(telemetry=pb.TelemetryPayload(
+                    robot_id=self._robot_id, timestamp_ms=int(time.time() * 1000),
+                    phase=pb.RobotPhase.ROBOT_PHASE_OFFLINE,
+                    current_action=self._current_action,
+                    hardware=self._hardware_updates())))
+                # Task progress is NOT emitted while blind: it derives from the binding's
+                # latest `state`, which is frozen at whatever it held when the transport
+                # stopped. Reporting SUCCEEDED off a frozen snapshot tells the control
+                # plane an order finished when nothing is known about it.
+                time.sleep(self._telemetry_interval)
+                continue
+            if not self._transport_was_live:
+                self._transport_was_live = True
+                print("telemetry RECOVERED: the binding can observe the robot again; "
+                      "position and battery are being sent.", file=sys.stderr)
             phase = (pb.RobotPhase.ROBOT_PHASE_IN_PROGRESS if self._current_action
                      else pb.RobotPhase.ROBOT_PHASE_IDLE)
             self._outbox.put(pb.AdapterMessage(telemetry=pb.TelemetryPayload(  # C6
@@ -416,7 +562,7 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
         # "inferred, not confirmed" case the estop protocol forbids.
         initiated_ms = int(time.time() * 1000)
         with self._robot_lock:
-            state = confirm_estop(self._robot, self._robot_id)  # C5 discipline: never faked
+            state = self._confirm_estop()  # C5 discipline: never faked
         self._current_action = ""  # safe-hold: drop the task, like a real estop
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id, estop_ack=pb.EstopAck(
@@ -464,7 +610,7 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
                 # carries evidence the stop was commanded, not merely asserted (C5.3).
                 initiated_ms = int(time.time() * 1000)
                 with self._robot_lock:
-                    state = confirm_estop(self._robot, self._robot_id)  # C5: confirmed, never inferred
+                    state = self._confirm_estop()  # C5: confirmed, never inferred
                 outbox.put(pb.AdapterSafetyMessage(
                     robot_id=cp.robot_id, estop_ack=pb.EstopAck(
                         estop_id=cp.estop.estop_id,
@@ -498,7 +644,7 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
             if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
                 initiated_ms = int(time.time() * 1000)
                 with self._robot_lock:
-                    state = confirm_estop(self._robot, self._robot_id)
+                    state = self._confirm_estop()  # C8.3: same discipline, same wrapper
                 outbox.put(pb.AdapterEdgeMessage(estop_ack=pb.EstopAck(
                     estop_id=ec.estop.estop_id,
                     stop_initiated_at=initiated_ms,
@@ -561,7 +707,15 @@ def main() -> None:
     channel = grpc.insecure_channel(args.endpoint)
     stub = pb_grpc.FleetAdapterServiceStub(channel)
     threading.Thread(target=adapter.run_safety_stream, args=(stub,), daemon=True).start()  # C1.1
-    adapter.run_control_stream(stub)
+    try:
+        adapter.run_control_stream(stub)
+    finally:
+        # The teardown half of the lifecycle the Protocol now declares. Before the lifecycle fix
+        # there was no `stop()` anywhere in this adapter, so a `--comms vda5050` run left
+        # paho's network thread and the broker session to the interpreter's exit. Calling
+        # it here makes the shutdown explicit at the level that owns the robot; `stop()`
+        # is idempotent and safe when `start()` never ran.
+        robot.stop()
 
 
 if __name__ == "__main__":
