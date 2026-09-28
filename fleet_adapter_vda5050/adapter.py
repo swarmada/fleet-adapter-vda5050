@@ -50,7 +50,35 @@ _TICK_DT = 0.2
 # reports nothing or reports out of range, so this is not optional -- telemetry, heartbeat and
 # emergency stop keep working either way. Bump it only when this adapter is re-qualified against a
 # new contract (`make conformance`), and update the adapters/REGISTRY.md row with it.
-CONTRACT_VERSION = "1.0.0"
+CONTRACT_VERSION = "1.3.0"
+
+# The action catalog this adapter serves (CapabilitiesSnapshot.supported_actions). A VDA5050
+# order drives the vehicle to a node, so that is the one verb it offers; the payload keys are
+# the ones task.goal_from_assign reads. An assignment of any other type -- or of no type -- is
+# declined INVALID_ACTION, never run as the nearest thing the vehicle can do (C19.1, C19.3).
+ACTION_NAVIGATE = "Navigate"
+_NAVIGATE_PARAMS = (("x", "m", "number"), ("y", "m", "number"),
+                    ("theta", "rad", "number"), ("mapId", "", "string"))
+
+# Operating-constraint subjects this adapter can honour (FA-R5). None: nothing on a VDA5050
+# order can switch a camera off or cap a speed per zone, so an assignment carrying ANY
+# constraint is declined OPERATING_CONSTRAINT_UNMET with the subjects named (C17.1). A subject
+# the adapter does not recognise lands in the same refusal (C17.2): an unrecognised rule is
+# not an absent one.
+HONOURED_SUBJECTS: frozenset[str] = frozenset()
+
+
+def supported_actions(pb) -> list:
+    return [pb.SupportedAction(
+        action_type=ACTION_NAVIGATE,
+        params=[pb.ActionParam(name=n, unit=u, kind=k, required=False)
+                for n, u, k in _NAVIGATE_PARAMS],
+        description="VDA5050 order to a node; optional x/y/theta target and mapId, "
+                    "else the destination label")]
+
+
+def unhonourable_subjects(constraints) -> list[str]:
+    return [c.subject for c in constraints if c.subject not in HONOURED_SUBJECTS]
 
 
 class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
@@ -219,6 +247,7 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
             secs = cp.register_ack.telemetry_interval_seconds
             if secs > 0:
                 self._telemetry_interval = max(1.0, min(30.0, float(secs)))
+            self._reconcile_action_state(cp.register_ack)
         elif kind == "heartbeat":
             self._outbox.put(pb.AdapterMessage(
                 heartbeat=pb.HeartbeatResponse(robot_id=cp.heartbeat.robot_id)))
@@ -288,6 +317,20 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_STALE_FENCING_TOKEN))
             return
+        # After the fencing branches on purpose: a superseded command is refused STALE, so
+        # the control plane learns its assignment lost rather than a reason it never lost for.
+        if task.action_type != ACTION_NAVIGATE:  # C19.1 / C19.3
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_INVALID_ACTION,
+                message="unsupported action type: " + (task.action_type or "(empty)")))
+            return
+        unhonourable = unhonourable_subjects(task.operating_constraints)  # C17.1 / C17.2
+        if unhonourable:
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False,
+                rejection=pb.ASSIGN_ACTION_REJECTION_OPERATING_CONSTRAINT_UNMET,
+                unhonourable_subjects=unhonourable))
+            return
         goal = task_map.goal_from_assign(task.destination, task.payload_json)  # FleetTask → order target
         with self._robot_lock:
             self._robot.command_move(self._robot_id, goal.x, goal.y, goal.theta)
@@ -303,6 +346,44 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
         self._current_fencing_token = token
         self._last_task_state = task_map.TASK_RUNNING
         self._emit_action_status(task.action_id, task_map.TASK_RUNNING, token)
+
+    def _reconcile_action_state(self, ack) -> None:
+        """C2.2 / C3.8 -- adopt the control plane's authoritative action state on RegisterAck.
+
+        Across a connectivity gap the control plane is the source of truth: an action may
+        have been cancelled while this adapter was away, and nothing local can say so.
+
+        The fencing token is adopted first and unconditionally. It is the plane's own
+        statement of the current mark, and after a failover the new plane legitimately
+        holds one this adapter never saw; without adopting it, the adapter keeps honouring
+        commands the old plane authorised. ``FenceGuard.adopt`` is monotonic, so a replayed
+        RegisterAck cannot lower the mark.
+        """
+        if not ack.HasField("authoritative_action_state"):
+            return
+        pb = self._pb
+        st = ack.authoritative_action_state
+        if st.fencing_token:
+            self._fence.adopt(self._robot_id, st.fencing_token)
+        phase = st.phase
+        if phase == pb.ROBOT_ACTION_PHASE_IN_PROGRESS:
+            if st.action_id and st.action_id == self._current_action:
+                return  # agrees with local state; keep executing under the same lease
+            phase = pb.ROBOT_ACTION_PHASE_CANCELLED  # divergence is treated as a cancel
+        if phase not in (pb.ROBOT_ACTION_PHASE_CANCELLED, pb.ROBOT_ACTION_PHASE_UNKNOWN,
+                         pb.ROBOT_ACTION_PHASE_IDLE):
+            return
+        with self._robot_lock:
+            self._robot.command_stop(self._robot_id)
+        self._lease.release(self._robot_id)
+        reported = st.action_id or self._current_action
+        self._current_action = ""
+        self._last_task_state = ""
+        self._current_fencing_token = None
+        if reported:
+            state = (task_map.TASK_CANCELLED if phase == pb.ROBOT_ACTION_PHASE_CANCELLED
+                     else task_map.TASK_STOPPED)
+            self._emit_action_status(reported, state, None)
 
     def _on_renew(self, renew, result) -> None:
         pb = self._pb
@@ -539,6 +620,7 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
         pb = self._pb
         self._outbox.put(pb.AdapterMessage(capabilities=pb.CapabilitiesSnapshot(
             robot_id=self._robot_id, hardware=components,
+            supported_actions=supported_actions(pb),
             snapshot_ms=int(time.time() * 1000))))
 
     def _on_scan(self, result) -> None:
@@ -549,6 +631,7 @@ class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
         pb = self._pb
         result.scan.CopyFrom(pb.CapabilitiesSnapshot(
             robot_id=self._robot_id, hardware=self._capability_components(),
+            supported_actions=supported_actions(pb),
             snapshot_ms=int(time.time() * 1000)))
 
     def _maybe_estop_drill(self) -> None:
