@@ -230,7 +230,7 @@ class fleet_adapter_vda5050Adapter:
                 raise RuntimeError(f"handshake rejected: {cp.hello_ack.message}")
             self._outbox.put(pb.AdapterMessage(  # C2.1: register
                 register=pb.RegisterRobot(robot_id=self._robot_id)))
-            self._send_capabilities_snapshot()  # scenario hardware manifest, if any
+            self._send_capabilities_snapshot()  # C12.2: the catalog, and any hardware manifest
             # A fresh ControlStream: the next payload must be a full snapshot (C6.1).
             self._snapshot_pending = True
             if not self._telemetry_started:  # C6: stream telemetry once registered
@@ -613,26 +613,27 @@ class fleet_adapter_vda5050Adapter:
             status=self._hw_status_enum(hs.status), degradation_reason=hs.reason)
             for hs in self._sim.manifest_hardware()]
 
-    def _send_capabilities_snapshot(self) -> None:
-        components = self._capability_components()
-        if not components:
-            return
+    def _capabilities_snapshot(self):
+        """The full CapabilitiesSnapshot: the action catalog, plus the hardware manifest when
+        there is one. The one source for both the snapshot pushed at registration and the
+        scan reply, so the two cannot disagree (C12.2). For a live VDA5050 robot the
+        capability self-description arrives via the factsheet (binding.request_factsheet /
+        factsheet()), so the manifest is empty there -- and the catalog is still sent."""
         pb = self._pb
-        self._outbox.put(pb.AdapterMessage(capabilities=pb.CapabilitiesSnapshot(
-            robot_id=self._robot_id, hardware=components,
+        return pb.CapabilitiesSnapshot(
+            robot_id=self._robot_id, hardware=self._capability_components(),
             supported_actions=supported_actions(pb),
-            snapshot_ms=int(time.time() * 1000))))
+            snapshot_ms=int(time.time() * 1000))
+
+    def _send_capabilities_snapshot(self) -> None:
+        # Pushed on every path, with or without a hardware manifest: the catalog is what the
+        # control plane admits assignments against, and a live robot has one too.
+        self._outbox.put(self._pb.AdapterMessage(capabilities=self._capabilities_snapshot()))
 
     def _on_scan(self, result) -> None:
         """Answer a ScanCapabilities request with a full CapabilitiesSnapshot (§6.10),
-        instead of declining it. The hardware manifest is the same source as the
-        unsolicited snapshot; for a live VDA5050 robot the capability self-description
-        arrives via the factsheet (binding.request_factsheet / factsheet())."""
-        pb = self._pb
-        result.scan.CopyFrom(pb.CapabilitiesSnapshot(
-            robot_id=self._robot_id, hardware=self._capability_components(),
-            supported_actions=supported_actions(pb),
-            snapshot_ms=int(time.time() * 1000)))
+        instead of declining it."""
+        result.scan.CopyFrom(self._capabilities_snapshot())
 
     def _maybe_estop_drill(self) -> None:
         if self._sim is None or self._estop_drilled or not self._sim.estop_due():

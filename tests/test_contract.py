@@ -11,6 +11,7 @@ from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
 from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapter
 from fleet_adapter_vda5050.robot import SimulatedRobot
+from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
 ROBOT = "amr-1"
 
@@ -109,3 +110,20 @@ def test_register_ack_in_progress_for_the_local_action_keeps_it() -> None:
             action_id="act-1", phase=pb.ROBOT_ACTION_PHASE_IN_PROGRESS, fencing_token=1)))
     assert a._current_action == "act-1"
     assert not [m for m in _drain(a._outbox) if m.HasField("action_status")]
+
+
+def test_live_binding_with_no_manifest_still_pushes_the_catalog() -> None:
+    # The live --comms vda5050 path has no hardware manifest. The snapshot pushed at
+    # registration must still carry the catalog, the same one scan answers (C12.2): the
+    # control plane admits assignments against it.
+    a = Adapter(pb, None, Vda5050Binding(robot_id=ROBOT), ROBOT)
+    assert a._capability_components() == []
+    a._send_capabilities_snapshot()
+    msgs = _drain(a._outbox)
+    assert len(msgs) == 1 and msgs[0].HasField("capabilities")
+    pushed = msgs[0].capabilities
+    assert [s.action_type for s in pushed.supported_actions] == ["Navigate"]
+    assert not pushed.hardware
+    scan = pb.CommandResult()
+    a._on_scan(scan)
+    assert pushed.supported_actions == scan.scan.supported_actions
