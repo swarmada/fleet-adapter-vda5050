@@ -22,14 +22,14 @@ safety-complete.
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fleet_adapter_vda5050 import profiles, task
 from fleet_adapter_vda5050.mqtt_client import MqttClient
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 # A robot is CONFIRMED at rest when its reported velocity is within sensor noise and

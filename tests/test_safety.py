@@ -14,9 +14,8 @@ from __future__ import annotations
 
 import json
 
-from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED, confirm_estop
-
 from conftest import mark_transport_live
+from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED, confirm_estop
 
 from fleet_adapter_vda5050 import profiles
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding

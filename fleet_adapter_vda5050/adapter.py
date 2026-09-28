@@ -28,7 +28,7 @@ import grpc
 # `pip install -e .` makes this unnecessary).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from swarmada_sdk.safety import (  # noqa: E402
+from swarmada_sdk.safety import (
     ESTOP_FAILED,
     ESTOP_STOPPED,
     FenceDecision,
@@ -37,8 +37,8 @@ from swarmada_sdk.safety import (  # noqa: E402
     confirm_estop,
 )
 
-from fleet_adapter_vda5050 import task as task_map  # noqa: E402
-from fleet_adapter_vda5050.robot import SimulatedRobot  # noqa: E402
+from fleet_adapter_vda5050 import task as task_map
+from fleet_adapter_vda5050.robot import SimulatedRobot
 
 _TELEMETRY_INTERVAL = 0.2
 _TICK_DT = 0.2
@@ -81,7 +81,7 @@ def unhonourable_subjects(constraints) -> list[str]:
     return [c.subject for c in constraints if c.subject not in HONOURED_SUBJECTS]
 
 
-class fleet_adapter_vda5050Adapter:  # noqa: N801  (generated class name)
+class fleet_adapter_vda5050Adapter:
     def __init__(self, pb, pb_grpc, robot, robot_id: str) -> None:
         self._pb = pb
         self._pb_grpc = pb_grpc
@@ -775,7 +775,10 @@ def main() -> None:
         engine = None
         try:
             from fleet_adapter_vda5050.scenarios import (
-                HardwareFaultOverrides, ScenarioEngine, load_scenario)
+                HardwareFaultOverrides,
+                ScenarioEngine,
+                load_scenario,
+            )
         except ImportError as exc:
             print(f"scenario support unavailable ({exc}); running without a scenario. "
                   f"Install pyyaml to enable --scenario.", file=sys.stderr)
