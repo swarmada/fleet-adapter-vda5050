@@ -28,14 +28,12 @@ from __future__ import annotations
 
 import pytest
 from conftest import mark_transport_live
-
 from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED
 
 from fleet_adapter_vda5050 import profiles
 from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapter
 from fleet_adapter_vda5050.robot import RobotBinding, SimulatedRobot
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
-
 
 # ── the seam: the Protocol declares a lifecycle, and the adapter drives it ────
 
@@ -78,7 +76,7 @@ def test_run_control_stream_brings_the_robot_up() -> None:
         pass
 
     class _Stub:
-        def ControlStream(self, _requests):  # noqa: N802 - mirrors the generated stub
+        def ControlStream(self, _requests):
             raise _Boom
 
     with pytest.raises(_Boom):

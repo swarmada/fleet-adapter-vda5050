@@ -14,9 +14,9 @@ import pytest
 pytest.importorskip("grpc")
 pytest.importorskip("swarmada_sdk")
 
-from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter  # noqa: E402
-from fleet_adapter_vda5050.robot import SimulatedRobot  # noqa: E402
-from fleet_adapter_vda5050.scenarios import ScenarioEngine, load_scenario  # noqa: E402
+from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter
+from fleet_adapter_vda5050.robot import SimulatedRobot
+from fleet_adapter_vda5050.scenarios import ScenarioEngine, load_scenario
 
 
 class _HW:

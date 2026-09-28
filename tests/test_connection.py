@@ -18,7 +18,6 @@ from fleet_adapter_vda5050.profiles import get_profile
 from fleet_adapter_vda5050.profiles.vda5050 import Vda5050Profile
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
-
 # ── comms-profile seam ────────────────────────────────────────────────────────
 
 def test_get_profile_returns_vda5050() -> None:
