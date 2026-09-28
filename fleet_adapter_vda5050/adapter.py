@@ -81,6 +81,33 @@ def unhonourable_subjects(constraints) -> list[str]:
     return [c.subject for c in constraints if c.subject not in HONOURED_SUBJECTS]
 
 
+def zone_constraints_ack(pb, push) -> object:
+    """Answer the zone_constraints push (FA-R7): the operating rules in force where the
+    robot now is. This adapter honours no subject, so the answer is a receipt that says so.
+
+    * An empty set is permission (a robot that has left a restricted region), acknowledged
+      with nothing named -- never read as a lockout.
+    * A set carrying rules is acknowledged with every subject named unhonourable. The
+      robot is already in the zone; naming what it cannot comply with is all it can do, and
+      the control plane can report it but not prevent it.
+    * A set with unresolved zones is incomplete, and the claim fails closed: nothing here
+      acknowledges having applied rules nobody could state. The zones are named, and the
+      subjects that were known are still listed. The robot is not stopped: the push
+      arrives after the crossing and does not make a zone safe (ADR-0059).
+    """
+    subjects = unhonourable_subjects(push.operating_constraints)
+    unresolved = list(push.unresolved_zones)
+    if unresolved:
+        return pb.ZoneConstraintsAck(
+            acknowledged=False, unhonourable_subjects=subjects,
+            message="unresolved zone(s) " + ", ".join(unresolved) + ": their rules are "
+                    "unknown, so this adapter cannot claim to have applied them")
+    return pb.ZoneConstraintsAck(
+        acknowledged=True, unhonourable_subjects=subjects,
+        message=("this adapter honours none of these subjects; the robot is in a zone it "
+                 "cannot comply with") if subjects else "")
+
+
 class fleet_adapter_vda5050Adapter:
     def __init__(self, pb, pb_grpc, robot, robot_id: str) -> None:
         self._pb = pb
@@ -281,6 +308,8 @@ class fleet_adapter_vda5050Adapter:
             self._on_resume(command.resume, result)
         elif which == "scan":
             self._on_scan(result)
+        elif which == "zone_constraints":  # FA-R7, contract 1.3.0
+            result.zone_constraints.CopyFrom(zone_constraints_ack(pb, command.zone_constraints))
         else:
             # C7.1: decline every optional command not implemented.
             result.unsupported = True
