@@ -32,8 +32,14 @@ class _HWComponent:
 
 
 class _CapsSnapshot:
-    def __init__(self, robot_id="", hardware=None, snapshot_ms=0):
+    def __init__(self, robot_id="", hardware=None, supported_actions=None, snapshot_ms=0):
         self.robot_id, self.hardware, self.snapshot_ms = robot_id, hardware or [], snapshot_ms
+        self.supported_actions = supported_actions or []
+
+
+class _Record:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
 
 
 class _EstopAck:
@@ -64,6 +70,7 @@ class _FakePB:
     HardwareStatusUpdate = _HW
     HardwareComponent = _HWComponent
     CapabilitiesSnapshot = _CapsSnapshot
+    SupportedAction = ActionParam = _Record
     EstopAck = _EstopAck
     AdapterSafetyMessage = _SafetyMsg
     AdapterMessage = _Msg
@@ -98,6 +105,7 @@ def test_capabilities_snapshot_carries_the_manifest() -> None:
     msg = adapter._outbox.get_nowait()
     assert {c.name for c in msg.capabilities.hardware} == {"lidar_top", "camera_front"}
     assert all(c.status == _FakePB.HARDWARE_STATUS_HEALTHY for c in msg.capabilities.hardware)
+    assert [s.action_type for s in msg.capabilities.supported_actions] == ["Navigate"]
 
 
 def test_estop_drill_emits_confirmed_ack_once() -> None:
