@@ -16,6 +16,7 @@ timer or from silence. This is what makes emergency stop safe (CONFORMANCE.md C5
 from __future__ import annotations
 
 import math
+import threading
 from typing import Protocol
 
 from fleet_adapter_vda5050 import task
@@ -165,6 +166,9 @@ class SimulatedRobot:
         self._moving: dict[str, bool] = {}
         self._pos: dict[str, tuple[float, float]] = {}
         self._target: dict[str, tuple[float, float] | None] = {}  # the order's target; None: no order
+        # A person's reset at the vehicle, asked for locally (SIGUSR1, see adapter.main) and taken
+        # by the adapter's next tick. Nothing on the wire sets it.
+        self._reset_requested = threading.Event()
         self._engine = engine
         self._elapsed = 0.0                 # seconds since spawn, advanced by tick()
         self._hw_prev: dict[str, str] = {}  # last-reported hardware status (delta base)
@@ -228,6 +232,18 @@ class SimulatedRobot:
                 self._moving[robot_id] = False  # arrived: at rest, the order complete
             else:
                 self._pos[robot_id] = (x + (tx - x) * step / dist, y + (ty - y) * step / dist)
+
+    def request_reset(self) -> None:
+        """A reset at the vehicle: the robot-side half of lifting the local latch an edge stop
+        set. Safe to call from a signal handler: it only raises a flag."""
+        self._reset_requested.set()
+
+    def take_reset(self) -> bool:
+        """True once per reset asked for since the last call."""
+        if self._reset_requested.is_set():
+            self._reset_requested.clear()
+            return True
+        return False
 
     def task_state(self, robot_id: str) -> str:
         """The order's state: RUNNING on the way, SUCCEEDED once at the target, "" with no
