@@ -130,9 +130,9 @@ class FleetAdapterServiceServicer(object):
         action status, command results, heartbeat replies)
         control plane → adapter: ControlPlaneMessage (acks, pushed Commands,
         heartbeat requests)
-        NOTE: Estop/EstopAck travel on SafetyStream, NOT on ControlStream.
-        Command.estop (field 5) and CommandResult.estop (field 6) are retained for
-        wire-format compatibility but are DEPRECATED — see annotations below.
+        NOTE: the stop travels on SafetyStream. Command.estop (field 5) is the stop's
+        fence on ControlStream, in order with AssignActions (contract 1.4.0); its
+        CommandResult.estop (field 6) answer is a receipt that no stop row reads.
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -154,13 +154,14 @@ class FleetAdapterServiceServicer(object):
 
         Invariants:
         * Same mTLS identity and per-robot authorization as ControlStream.
-        * Carries ONLY Estop Commands and EstopAck results (plus optional
-        safety-critical PauseCapabilities / PauseResult).
+        * Carries ONLY the stop latch's messages: Estop and EstopClear down; EstopAck,
+        EstopClearAck, LocalStopReport up (plus optional PauseCapabilities / PauseResult).
         * Permanently empty in steady state — no telemetry, no action commands.
         * EstopLatencyViolation events (RFC-0001 #safety-timing-requirements) are measured on this stream.
         * Adapter MUST open SafetyStream in the same dial step as ControlStream.
-        If SafetyStream cannot be established the adapter MUST NOT declare
-        itself healthy and MUST retry.
+        Both streams MUST be established before the adapter sends AdapterHello;
+        if SafetyStream cannot be established the adapter sends no AdapterHello
+        and MUST retry (RFC-0001 #fleet-adapter-protocol-connection-lifecycle).
         * Estop and EstopAck messages are REUSED — not duplicated — via the
         AdapterSafetyMessage / ControlPlaneSafetyMessage envelopes below.
         """

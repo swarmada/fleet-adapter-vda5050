@@ -15,7 +15,10 @@ timer or from silence. This is what makes emergency stop safe (CONFORMANCE.md C5
 
 from __future__ import annotations
 
+import math
 from typing import Protocol
+
+from fleet_adapter_vda5050 import task
 
 
 class RobotBinding(Protocol):
@@ -154,9 +157,14 @@ class SimulatedRobot:
     when the robot has actually halted.
     """
 
+    # How fast the simulated vehicle drives to its target: the speed the conformance fixture
+    # assumes when it sizes a goal that keeps an action in flight.
+    SPEED_MPS = 0.5
+
     def __init__(self, engine=None) -> None:
         self._moving: dict[str, bool] = {}
         self._pos: dict[str, tuple[float, float]] = {}
+        self._target: dict[str, tuple[float, float] | None] = {}  # the order's target; None: no order
         self._engine = engine
         self._elapsed = 0.0                 # seconds since spawn, advanced by tick()
         self._hw_prev: dict[str, str] = {}  # last-reported hardware status (delta base)
@@ -188,13 +196,17 @@ class SimulatedRobot:
     def spawn(self, robot_id: str) -> None:
         self._moving[robot_id] = False
         self._pos[robot_id] = (0.0, 0.0)
+        self._target[robot_id] = None
 
     def command_move(self, robot_id: str, x: float, y: float, yaw: float = 0.0) -> None:
+        # Driven there by tick(), at SPEED_MPS; yaw ignored by the sim, a real binding honours it.
         self._moving[robot_id] = True
-        self._pos[robot_id] = (x, y)  # yaw ignored by the sim; a real binding honors it
+        self._target[robot_id] = (x, y)
 
     def command_stop(self, robot_id: str) -> None:
-        self._moving[robot_id] = False  # a real robot confirms this via is_stopped
+        # The order ends where the robot is; a real robot confirms this via is_stopped.
+        self._moving[robot_id] = False
+        self._target[robot_id] = None
 
     def command_pause(self, robot_id: str) -> None:
         self._moving[robot_id] = False  # startPause halts; is_stopped confirms it
@@ -203,7 +215,29 @@ class SimulatedRobot:
         self._moving[robot_id] = True   # stopPause resumes the held order
 
     def tick(self, dt: float) -> None:
-        self._elapsed += dt  # advance the scenario clock; still a no-op for real motion
+        self._elapsed += dt  # advance the scenario clock
+        for robot_id, moving in self._moving.items():
+            target = self._target.get(robot_id)
+            if not moving or target is None:
+                continue
+            (x, y), (tx, ty) = self._pos[robot_id], target
+            dist = math.hypot(tx - x, ty - y)
+            step = self.SPEED_MPS * dt
+            if dist <= step:
+                self._pos[robot_id] = target
+                self._moving[robot_id] = False  # arrived: at rest, the order complete
+            else:
+                self._pos[robot_id] = (x + (tx - x) * step / dist, y + (ty - y) * step / dist)
+
+    def task_state(self, robot_id: str) -> str:
+        """The order's state: RUNNING on the way, SUCCEEDED once at the target, "" with no
+        order (none given, or a stop ended it)."""
+        target = self._target.get(robot_id)
+        if target is None:
+            return ""
+        if self._moving.get(robot_id) or self._pos.get(robot_id) != target:
+            return task.TASK_RUNNING
+        return task.TASK_SUCCEEDED
 
     def is_stopped(self, robot_id: str) -> bool:
         return not self._moving.get(robot_id, False)

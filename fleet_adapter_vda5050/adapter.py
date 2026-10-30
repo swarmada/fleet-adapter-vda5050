@@ -38,10 +38,14 @@ from swarmada_sdk.safety import (
 )
 
 from fleet_adapter_vda5050 import task as task_map
+from fleet_adapter_vda5050.latch import StopLatch
+from fleet_adapter_vda5050.retained import Outcome, RetainedOutcomes
 from fleet_adapter_vda5050.robot import SimulatedRobot
 
 _TELEMETRY_INTERVAL = 0.2
-_TICK_DT = 0.2
+# The robot is ticked by the time that passed since its last tick, at most this much at once,
+# so a long gap (a suspended host) is not driven through in one step.
+_MAX_TICK_S = 5.0
 
 
 # The fleet-adapter CONTRACT version this adapter implements (ADR-0032). Distinct from
@@ -50,7 +54,29 @@ _TICK_DT = 0.2
 # reports nothing or reports out of range, so this is not optional -- telemetry, heartbeat and
 # emergency stop keep working either way. Bump it only when this adapter is re-qualified against a
 # new contract (`make conformance`), and update the adapters/REGISTRY.md row with it.
-CONTRACT_VERSION = "1.3.0"
+#
+# 1.4.0 is the stop path (RFC-0001 #fleet-adapter-protocol-the-stop-latch): a stop latches its
+# ID and work is refused ROBOT_UNAVAILABLE until its EstopClear lifts it (latch.py); a command or
+# a clear from a deposed leader is not acted on; work a stop interrupts is never continued; and
+# the last action's terminal outcome is kept until an ActionOutcomeAck names it (retained.py).
+# Each binds only a connection that negotiated 1.4.0; an older control plane sees 1.3.0's
+# behaviour. One gap, as in the reference simulation adapter: an edge stop sets the robot's local
+# latch, which only a reset at the robot lifts, and the simulated vehicle has no reset, so after an
+# edge stop it refuses work until the adapter restarts.
+CONTRACT_VERSION = "1.4.0"
+_TERMINAL = (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED, task_map.TASK_CANCELLED)
+
+
+def _at_least_14(version: str) -> bool:
+    try:
+        major, minor = (int(x) for x in version.split(".")[:2])
+    except ValueError:
+        return False
+    return (major, minor) >= (1, 4)
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 # The action catalog this adapter serves (CapabilitiesSnapshot.supported_actions). A VDA5050
 # order drives the vehicle to a node, so that is the one verb it offers; the payload keys are
@@ -109,7 +135,7 @@ def zone_constraints_ack(pb, push) -> object:
 
 
 class fleet_adapter_vda5050Adapter:
-    def __init__(self, pb, pb_grpc, robot, robot_id: str) -> None:
+    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None) -> None:
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
@@ -124,6 +150,13 @@ class fleet_adapter_vda5050Adapter:
         self._edge_addr: queue.Queue = queue.Queue()  # advertised edge endpoints (C8)
         self._outbox: queue.Queue = queue.Queue()
         self._safety_outbox: queue.Queue = queue.Queue()  # → SafetyStream (acks + drills)
+        # Contract 1.4.0: the stop latch, the retained outcome, and the work a stop interrupted
+        # (action ID -> the fencing token it was assigned with; its re-delivery starts nothing).
+        self._negotiated = ""
+        self._latch = StopLatch()
+        self._retained = RetainedOutcomes(state_dir)
+        self._interrupted: dict[str, int] = {}
+        self._action_tokens: dict[str, int] = {}
         self._shutdown = threading.Event()
         self._telemetry_started = False
         # C6.1: the first TelemetryPayload on any (re)connect must be a FULL
@@ -143,6 +176,8 @@ class fleet_adapter_vda5050Adapter:
         # Transport-liveness log state: True so the FIRST degrade is announced, and so
         # the announcement is a transition rather than 5 lines a second.
         self._transport_was_live = True
+        self._clock = time.monotonic
+        self._last_tick: float | None = None
 
     # ── ControlStream ────────────────────────────────────────────────────────
 
@@ -216,6 +251,7 @@ class fleet_adapter_vda5050Adapter:
                     # enqueues on hello_ack, so the control plane never sees the
                     # re-registration §9.2.5(b) requires.
                     self._outbox = queue.Queue()
+                    self._latch.new_control_stream(self._robot_id)
                     for cp in stub.ControlStream(self._control_requests()):
                         self._handle_control_plane(cp, stub)
                 except grpc.RpcError as exc:
@@ -233,6 +269,7 @@ class fleet_adapter_vda5050Adapter:
         # persisted fencing/lease state (C3/C4) across the outage.
         while not self._shutdown.is_set():
             self._reconnect_pending = False
+            self._latch.new_control_stream(self._robot_id)
             call = stub.ControlStream(self._control_requests())
             self._active_call = call
             try:
@@ -255,6 +292,7 @@ class fleet_adapter_vda5050Adapter:
         if kind == "hello_ack":
             if not cp.hello_ack.accepted:
                 raise RuntimeError(f"handshake rejected: {cp.hello_ack.message}")
+            self._negotiated = cp.hello_ack.negotiated_contract_version
             self._outbox.put(pb.AdapterMessage(  # C2.1: register
                 register=pb.RegisterRobot(robot_id=self._robot_id)))
             self._send_capabilities_snapshot()  # C12.2: the catalog, and any hardware manifest
@@ -275,6 +313,11 @@ class fleet_adapter_vda5050Adapter:
             if secs > 0:
                 self._telemetry_interval = max(1.0, min(30.0, float(secs)))
             self._reconcile_action_state(cp.register_ack)
+            self._send_retained()
+        elif kind == "outcome_ack":
+            oa = cp.outcome_ack
+            if self._retained.acknowledge(self._robot_id, oa.action_id, oa.fencing_token):
+                print(f"retained outcome acknowledged: action={oa.action_id}", file=sys.stderr)
         elif kind == "heartbeat":
             self._outbox.put(pb.AdapterMessage(
                 heartbeat=pb.HeartbeatResponse(robot_id=cp.heartbeat.robot_id)))
@@ -285,12 +328,32 @@ class fleet_adapter_vda5050Adapter:
         pb = self._pb
         result = pb.CommandResult(command_id=command.command_id, robot_id=command.robot_id)
         which = command.WhichOneof("command")
+        if not self._latch.observe_term(self._robot_id, command.leader_term,
+                                        is_stop=which == "estop"):
+            # A deposed leader's command: not acted on, the result left empty.
+            result.stale_leader_term = True
+            self._outbox.put(pb.AdapterMessage(command_result=result))
+            return
+        if which == "estop":
+            # The stop's fence: a stop, answered on the SafetyStream only.
+            self._on_fence(command.estop.estop_id)
+            return
         if which == "assign_action":
             self._on_assign(command.assign_action, result)
         elif which == "renew_lease":
             self._on_renew(command.renew_lease, result)
         elif which == "cancel_action":
             cancelled = self._current_action
+            named = command.cancel_action.action_id
+            if named and cancelled and named != cancelled:
+                # C3.9: a cancel for an action this robot no longer runs (it was preempted in
+                # place, or a stop ended it). That one is stopped already, and stopping the
+                # current one would abort the action that replaced it.
+                result.cancel_action.CopyFrom(pb.CancelActionResult(
+                    acknowledged=True, disposition=pb.CANCEL_DISPOSITION_STOPPED_SAFELY,
+                    cause=command.cancel_action.cause))
+                self._outbox.put(pb.AdapterMessage(command_result=result))
+                return
             with self._robot_lock:
                 self._robot.command_stop(self._robot_id)
             self._lease.release(self._robot_id)
@@ -336,6 +399,21 @@ class fleet_adapter_vda5050Adapter:
 
     def _on_assign(self, task, result) -> None:
         pb = self._pb
+        if task.action_id and self._interrupted.get(task.action_id) == task.fencing_token:
+            # Interrupted work, re-delivered: accepted, and nothing starts. Never refused, since
+            # a refusal says the robot never took that work.
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=True, accepted_fencing_token=task.fencing_token,
+                message="interrupted by a stop; not continued"))
+            return
+        if self._latch.refuses_work(self._robot_id):
+            # Under a stop: refused whatever the fencing token, and the latch reported.
+            ids = sorted(self._latch.latched_ids(self._robot_id))
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
+                message="under a stop: " + (", ".join(ids) if ids else "local latch")))
+            self._report_latch()
+            return
         decision = self._fence.check(
             self._robot_id, task.HasField("fencing_token"), task.fencing_token, task.assignment_id)
         if decision is FenceDecision.MISSING:
@@ -364,6 +442,8 @@ class fleet_adapter_vda5050Adapter:
         with self._robot_lock:
             self._robot.command_move(self._robot_id, goal.x, goal.y, goal.theta)
         self._current_action = task.action_id
+        if task.HasField("fencing_token"):
+            self._action_tokens[task.action_id] = task.fencing_token
         if task.lease_duration_ms:
             self._current_generation = task.lease_generation
             self._lease.grant(self._robot_id, task.lease_duration_ms / 1000.0, task.lease_generation)
@@ -425,16 +505,62 @@ class fleet_adapter_vda5050Adapter:
             renewed=renewed, running=running, current_generation=self._current_generation))
 
     def _emit_action_status(self, action_id: str, state_name: str,
-                          fencing_token: int | None, progress_pct: int = 0) -> None:
+                          fencing_token: int | None, progress_pct: int = 0, *,
+                          message: str = "", end_cause: int = 0) -> None:
         """Send a ActionStatusUpdate (AdapterMessage.action_status). state_name is a
         task.TASK_* name bound here to the proto TaskState enum. When set, the
         executing fencing_token is echoed for superseded-assignment detection (C6.4)."""
         pb = self._pb
+        if fencing_token is None:
+            fencing_token = self._action_tokens.get(action_id)
         upd = pb.ActionStatusUpdate(
             action_id=action_id, state=getattr(pb, state_name), progress_pct=progress_pct)
+        if message:
+            upd.message = message
         if fencing_token is not None:
             upd.fencing_token = fencing_token
+        if end_cause:
+            upd.end_cause = end_cause
+        if state_name in _TERMINAL and action_id in self._action_tokens:
+            # Kept whatever the contract; reported only to a 1.4.0 control plane.
+            self._retained.keep(self._robot_id, Outcome(
+                action_id, state_name, message, self._action_tokens.pop(action_id), end_cause))
         self._outbox.put(pb.AdapterMessage(action_status=upd))
+
+    def _send_retained(self) -> None:
+        """The retained outcome, once the RegisterAck is processed, to a 1.4.0 control plane."""
+        if not _at_least_14(self._negotiated):
+            return
+        out = self._retained.get(self._robot_id)
+        if out is None:
+            return
+        pb = self._pb
+        upd = pb.ActionStatusUpdate(action_id=out.action_id, state=getattr(pb, out.state),
+                                    message=out.message, fencing_token=out.fencing_token,
+                                    retained=True)
+        if out.end_cause:
+            upd.end_cause = out.end_cause
+        self._outbox.put(pb.AdapterMessage(action_status=upd))
+
+    def _interrupt_current(self, why: str) -> None:
+        """Interrupted work: the action ends STOPPED, then FAILED with cause ESTOP, and is never
+        continued. Its re-delivery at the same token is answered accepted, nothing started."""
+        pb = self._pb
+        action = self._current_action
+        if not action:
+            return
+        with self._robot_lock:
+            self._robot.command_stop(self._robot_id)
+        self._lease.release(self._robot_id)
+        self._interrupted[action] = self._action_tokens.get(action, 0)
+        self._current_action = ""
+        self._last_task_state = ""
+        self._current_fencing_token = None
+        self._emit_action_status(action, task_map.TASK_STOPPED, None, message=why,
+                                 end_cause=pb.ACTION_END_CAUSE_ESTOP)
+        self._emit_action_status(action, task_map.TASK_FAILED, None,
+                                 message=f"interrupted: {why}; not continued",
+                                 end_cause=pb.ACTION_END_CAUSE_ESTOP)
 
     def _confirm_estop(self) -> str:
         """`confirm_estop`, but a BROKEN TRANSPORT still produces an answer.
@@ -474,16 +600,26 @@ class fleet_adapter_vda5050Adapter:
     def _self_stop(self, robot_id: str) -> None:
         with self._robot_lock:  # C4.2
             self._robot.command_stop(robot_id)
-        # Report the stop as a TERMINAL action_status before dropping the action.
-        # Without this the control plane sees only silence after the lease lapses,
-        # which is indistinguishable from a robot that merely stopped reporting —
-        # so dual execution cannot be ruled out and C4.2 fails. STOPPED (not
-        # FAILED) because a lease self-stop is a clean commanded stop.
+        # Report the stop, then the action's end, before dropping it. Without them the
+        # control plane sees only silence after the lease lapses, which is
+        # indistinguishable from a robot that merely stopped reporting, so dual execution
+        # cannot be ruled out (C4.2). STOPPED is the commanded stop and not terminal; the
+        # FAILED that follows, with LEASE_EXPIRED, is what tells the control plane the
+        # action ended.
+        pb = self._pb
         stopped = self._current_action
+        self._current_action = ""
+        self._last_task_state = ""
         if stopped:
             self._emit_action_status(stopped, task_map.TASK_STOPPED,
-                                     self._current_fencing_token)
-        self._current_action = ""
+                                     self._current_fencing_token,
+                                     message="assignment lease expired",
+                                     end_cause=pb.ACTION_END_CAUSE_LEASE_EXPIRED)
+            self._emit_action_status(stopped, task_map.TASK_FAILED,
+                                     self._current_fencing_token,
+                                     message="ended by lease expiry; the stop was commanded",
+                                     end_cause=pb.ACTION_END_CAUSE_LEASE_EXPIRED)
+        self._current_fencing_token = None
 
     def _report_transport_not_live(self, detail: str) -> None:
         """Announce a transport that cannot observe the robot, on the TRANSITION only.
@@ -542,7 +678,7 @@ class fleet_adapter_vda5050Adapter:
             x = y = floor = battery = None
             with self._robot_lock:
                 try:
-                    self._robot.tick(_TICK_DT)  # advances the scenario clock too
+                    self._tick_robot()  # advances the scenario clock too
                     live = self._robot.transport_alive()
                     detail = self._transport_detail() if not live else ""
                 except RuntimeError as exc:
@@ -587,14 +723,24 @@ class fleet_adapter_vda5050Adapter:
             self._maybe_emit_task_progress()  # stream order completion / failure (C6.4)
             time.sleep(self._telemetry_interval)
 
+    def _tick_robot(self) -> None:
+        """Advance the robot (and the scenario clock) by the time that passed since the last
+        tick. Not by the telemetry cadence: the loop sleeps for whatever the RegisterAck set,
+        1 s or more, and a fixed step then ran the simulated vehicle slower than the clock.
+        The caller holds the robot lock."""
+        now = self._clock()
+        dt = 0.0 if self._last_tick is None else min(max(now - self._last_tick, 0.0), _MAX_TICK_S)
+        self._last_tick = now
+        self._robot.tick(dt)
+
     def _maybe_emit_task_progress(self) -> None:
         """Stream a TERMINAL task-status transition derived from the robot's order
         state (C6.4). The binding derives SUCCEEDED (the order reached its last node,
         not driving) / FAILED (a FATAL error) from the latest ``state``; on that
         transition the adapter reports it once — echoing the executing fencing token —
         and clears the task. RUNNING is already emitted on assign, so only terminals
-        are streamed. A binding without order state (the $0 SimulatedRobot) is a
-        no-op, so the conformance path is unchanged."""
+        are streamed. The simulated vehicle reports SUCCEEDED once it has driven to
+        its target; a binding without order state is a no-op."""
         if not self._current_action or not hasattr(self._robot, "task_state"):
             return
         with self._robot_lock:
@@ -673,10 +819,10 @@ class fleet_adapter_vda5050Adapter:
         # hardware, so it attests WHEN the stop was issued. C5.3 requires it:
         # reporting STOPPED with nothing attesting a hardware stop is exactly the
         # "inferred, not confirmed" case the estop protocol forbids.
+        self._interrupt_current("estop drill (scenario)")  # like a real estop
         initiated_ms = int(time.time() * 1000)
         with self._robot_lock:
             state = self._confirm_estop()  # C5 discipline: never faked
-        self._current_action = ""  # safe-hold: drop the task, like a real estop
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id, estop_ack=pb.EstopAck(
                 estop_id=f"drill-{self._robot_id}",
@@ -707,29 +853,111 @@ class fleet_adapter_vda5050Adapter:
     # ── SafetyStream (C5) ────────────────────────────────────────────────────
 
     def run_safety_stream(self, stub) -> None:
-        pb = self._pb
-        outbox = self._safety_outbox  # shared so the estop-drill can push an ack too
+        """One SafetyStream at a time, re-opened when it drops. Each that opens is told what
+        is latched first (contract 1.4.0)."""
+        while not self._shutdown.is_set():
+            outbox: queue.Queue = queue.Queue()  # fresh per stream, as the ControlStream's
 
-        def requests() -> Iterator:
-            while True:
-                msg = outbox.get()
-                if msg is None:
+            def requests(_o=outbox) -> Iterator:
+                while True:
+                    msg = _o.get()
+                    if msg is None:
+                        return
+                    yield msg
+
+            self._safety_outbox = outbox
+            self._report_latch()
+            try:
+                for cp in stub.SafetyStream(requests()):
+                    self._on_safety_message(cp)
+            except grpc.RpcError as exc:
+                if self._shutdown.is_set():
                     return
-                yield msg
+                print(f"safety stream dropped ({exc.code()}); reconnecting", file=sys.stderr)
+                time.sleep(0.5)
+                continue
+            finally:
+                outbox.put(None)
+            return
 
-        for cp in stub.SafetyStream(requests()):
-            if cp.WhichOneof("payload") == "estop":
-                # See the drill path: stamped around the hardware stop so the ACK
-                # carries evidence the stop was commanded, not merely asserted (C5.3).
-                initiated_ms = int(time.time() * 1000)
-                with self._robot_lock:
-                    state = self._confirm_estop()  # C5: confirmed, never inferred
-                outbox.put(pb.AdapterSafetyMessage(
-                    robot_id=cp.robot_id, estop_ack=pb.EstopAck(
-                        estop_id=cp.estop.estop_id,
-                        stop_initiated_at=initiated_ms,
-                        state=(pb.ESTOP_STATE_STOPPED if state == ESTOP_STOPPED
-                               else pb.ESTOP_STATE_FAILED))))
+    def _on_safety_message(self, cp) -> None:
+        kind = cp.WhichOneof("payload")
+        if kind == "estop":
+            if _at_least_14(self._negotiated):
+                self._latch.on_estop(self._robot_id, cp.estop.estop_id)
+            self._stop_and_ack(cp.estop.estop_id, self._safety_outbox.put)
+        elif kind == "estop_clear":
+            self._on_clear(cp.estop_clear)
+
+    def _stop_and_ack(self, estop_id: str, send) -> None:
+        """Interrupt the work held, command the stop and answer it: STOPPED only once rest is
+        confirmed, else FAILED. Stamped around the hardware stop so the ack carries evidence
+        the stop was commanded, not merely asserted (C5.3)."""
+        pb = self._pb
+        self._interrupt_current("emergency stop")
+        initiated_ms = _now_ms()
+        with self._robot_lock:
+            state = self._confirm_estop()  # C5: confirmed, never inferred
+        stopped = state == ESTOP_STOPPED
+        self._latch.record_state(self._robot_id, estop_id, "STOPPED" if stopped else "FAILED")
+        ack = pb.EstopAck(estop_id=estop_id, stop_initiated_at=initiated_ms,
+                          state=pb.ESTOP_STATE_STOPPED if stopped else pb.ESTOP_STATE_FAILED)
+        if stopped:
+            ack.confirmed_at_ms = _now_ms()
+        send(pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack))
+
+    def _on_fence(self, estop_id: str) -> None:
+        """The fence (Command.estop) on the current ControlStream: a stop, latched; a clear
+        that came first takes effect with it."""
+        stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
+        if stop:
+            self._stop_and_ack(estop_id, self._safety_outbox.put)
+        if lifted:
+            self._send_clear_ack(estop_id)
+
+    def _on_clear(self, clear) -> None:
+        verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
+                                       clear.ends_local_set)
+        print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
+              file=sys.stderr)
+        if verdict == "ack":
+            self._send_clear_ack(clear.estop_id)
+            if clear.ends_local_set:
+                self._send_local_report()
+
+    def _send_clear_ack(self, estop_id: str) -> None:
+        pb = self._pb
+        self._safety_outbox.put(pb.AdapterSafetyMessage(
+            robot_id=self._robot_id,
+            estop_clear_ack=pb.EstopClearAck(estop_id=estop_id, lifted_at_ms=_now_ms())))
+
+    def _send_local_report(self) -> None:
+        pb = self._pb
+        loc = self._latch.local(self._robot_id)
+        self._safety_outbox.put(pb.AdapterSafetyMessage(
+            robot_id=self._robot_id, local_stop=pb.LocalStopReport(
+                latched=loc.latched, changed_at_ms=loc.changed_at_ms, source="robot",
+                set_id=loc.set_id)))
+
+    def _report_latch(self) -> None:
+        """Every latched stop ID as an EstopAck with the robot's state, and the local latch:
+        on each SafetyStream that opens, and with each refusal under the latch."""
+        pb = self._pb
+        states = {"STOPPING": pb.ESTOP_STATE_STOPPING, "STOPPED": pb.ESTOP_STATE_STOPPED,
+                  "FAILED": pb.ESTOP_STATE_FAILED}
+        for estop_id, state in sorted(self._latch.latched_ids(self._robot_id).items()):
+            self._safety_outbox.put(pb.AdapterSafetyMessage(
+                robot_id=self._robot_id, estop_ack=pb.EstopAck(
+                    estop_id=estop_id, state=states.get(state, pb.ESTOP_STATE_STOPPING),
+                    message="latched")))
+        self._send_local_report()
+
+    def _edge_stop(self, estop_id: str, send) -> None:
+        """An edge stop: the robot's local latch is set (reported at once), then the same
+        confirmed stop as any other, answered on the EdgeStream."""
+        self._latch.set_local(self._robot_id)
+        self._send_local_report()
+        self._stop_and_ack(estop_id, lambda msg: send(msg.estop_ack))
 
     # ── EdgeStream (C8) ──────────────────────────────────────────────────────
 
@@ -755,14 +983,8 @@ class fleet_adapter_vda5050Adapter:
 
         for ec in estub.EdgeStream(requests()):
             if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
-                initiated_ms = int(time.time() * 1000)
-                with self._robot_lock:
-                    state = self._confirm_estop()  # C8.3: same discipline, same wrapper
-                outbox.put(pb.AdapterEdgeMessage(estop_ack=pb.EstopAck(
-                    estop_id=ec.estop.estop_id,
-                    stop_initiated_at=initiated_ms,
-                    state=(pb.ESTOP_STATE_STOPPED if state == ESTOP_STOPPED
-                           else pb.ESTOP_STATE_FAILED))))
+                self._edge_stop(ec.estop.estop_id,
+                                lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
 
 
 def main() -> None:
@@ -788,6 +1010,10 @@ def main() -> None:
                     help="hardware-fault: seconds until the component degrades (default: 30)")
     ap.add_argument("--recover-at", type=float, default=90.0,
                     help="hardware-fault: seconds until the component recovers (default: 90)")
+    ap.add_argument("--state-dir", default="",
+                    help="where the last action's terminal outcome is kept until the control "
+                         "plane acknowledges it (contract 1.4.0), so a restart does not lose "
+                         "it. Unset: kept in memory only, and a restart loses it")
     args = ap.parse_args()
 
     from fleet_adapter.v1 import fleet_adapter_pb2 as pb
@@ -817,7 +1043,11 @@ def main() -> None:
                 component=args.fault_component, fault_at=args.fault_at, recover_at=args.recover_at))
             engine = ScenarioEngine(scenario)
         robot = SimulatedRobot(engine)  # $0 skeleton; scenario-driven when an engine is set
-    adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id)
+    adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id,
+                                           state_dir=args.state_dir or None)
+    print("retained outcome: " + (f"kept in {args.state_dir}" if args.state_dir else
+                                  "kept in memory only (no --state-dir): a restart loses it"),
+          file=sys.stderr)
 
     # TODO(deploy): use grpc.secure_channel with mTLS credentials (C1.3).
     channel = grpc.insecure_channel(args.endpoint)

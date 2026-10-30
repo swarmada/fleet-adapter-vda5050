@@ -1,0 +1,22 @@
+# Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
+# SPDX-License-Identifier: Apache-2.0
+#
+# What the image installs, resolved for CPython 3.12 on linux x86_64 and aarch64 (the same set on
+# both): the versions this adapter's tests and its conformance run at contract 1.4.0 used. Each pin
+# lists the hashes of that version's wheels for those two platforms only. The image installs it
+# with: pip install --require-hashes -r requirements.txt
+#
+# Not here: paho-mqtt, the transport for --comms vda5050. The image serves --comms simulated.
+grpcio==1.84.0 \
+    --hash=sha256:b44f0a0fc7bc6677d38cc80bca1a32814ce6c8f200fb8b3c1a61c9d77eaefbf3 \
+    --hash=sha256:fbdbcd06986ede3ce584083b1dc2afe6808e8943e5cf50ad11183c03aceda25a
+protobuf==7.36.2 \
+    --hash=sha256:89f23aa53c24553a2416fd4fd1ec06f74fa42b14b546d8883128813f775bbfd2 \
+    --hash=sha256:bdb3a345d48db958e6ce1f18e508beb0cc981d64f24088427549c866cd039f1e \
+    --hash=sha256:e11e1f0180583a2af89db6a2ecd9e8dc40aa6d2988ca175bfd0e6d12ea72d74e
+pyyaml==6.0.3 \
+    --hash=sha256:9149cad251584d5fb4981be1ecde53a1ca46c891a79788c0df828d2f166bda28 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc \
+    --hash=sha256:d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8

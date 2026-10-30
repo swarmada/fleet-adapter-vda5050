@@ -78,6 +78,7 @@ the `--comms simulated` path and existing setups are unaffected.
 | 7 | Pause / resume → VDA5050 `startPause` / `stopPause` instantActions | beyond C1–C8 | ✅ done |
 | 8 | Scan / capabilities → VDA5050 `factsheet` (`factsheetRequest` + parse) | beyond C1–C8 | ✅ done |
 | 9 | Task completion streaming → `state` order progress → `SUCCEEDED` / `FAILED` | beyond C1–C8 | ✅ done |
+| 10 | Contract 1.4.0 stop path: stop latch (`latch.py`), `EstopClear` → `EstopClearAck`, leader term, interrupted work, retained outcome until `ActionOutcomeAck` (`retained.py`, `--state-dir`) | contract 1.4.0 | ✅ **CONFORMANT** at 1.4.0 — 50 passed, 0 failed, 1 advisory (a SHOULD), 20 skipped (`--comms simulated`). The simulated vehicle drives to its target at 0.5 m/s, so an order ends. Gap: an edge stop sets the local latch, which only a reset at the robot lifts; the simulated vehicle has none, so it refuses work until the adapter restarts |
 
 **Beyond the safety+task subset.** In addition to C1–C8, the adapter now:
 
