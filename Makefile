@@ -17,5 +17,5 @@ test:            ## Run the safety-wiring + comms-profile tests
 	pytest tests/ -v
 
 conformance:     ## Drive this adapter against the Swarmada conformance harness.
-	@echo "Point the published harness at:  $(PYTHON) -m fleet_adapter_vda5050.adapter --endpoint localhost:{port}"
+	@echo "Point the published harness at:  $(PYTHON) -m fleet_adapter_vda5050.adapter --endpoint localhost:{port} --insecure"
 	@echo "See the Swarmada adapters/conformance/README.md for running the harness."

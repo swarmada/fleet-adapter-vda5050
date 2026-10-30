@@ -36,4 +36,4 @@ jobs:
           python -m adapters.conformance \
             --stub-path proto \
             --adapter-name fleet-adapter-vda5050 \
-            --adapter-cmd 'python3 ${{ github.workspace }}/fleet_adapter_vda5050/adapter.py --endpoint localhost:{port} --comms simulated'
+            --adapter-cmd 'python3 ${{ github.workspace }}/fleet_adapter_vda5050/adapter.py --endpoint localhost:{port} --comms simulated --insecure'

@@ -10,13 +10,16 @@
 # own (fleet_adapter/v1, contract 1.4.0). The third-party versions are the ones the adapter's tests
 # and conformance run used, pinned with hashes in requirements.txt.
 #
-# Run, with a writable directory for the retained outcome (contract 1.4.0: the last action's
-# terminal outcome is kept until the control plane acknowledges it, across a restart):
+# Run, with the adapter's mutual-TLS files mounted at /tls (ca.crt: the CA the control plane's
+# certificate is signed by; tls.crt and tls.key: this adapter's client certificate and key) and a
+# writable directory for the retained outcome (contract 1.4.0: the last action's terminal outcome
+# is kept until the control plane acknowledges it, across a restart):
 #
-#   docker run -v <data>:/data fleet-adapter-vda5050:dev --endpoint <control plane>:9090 \
-#     --robot-id <robot> --comms simulated --state-dir /data
+#   docker run -v <tls>:/tls:ro -v <data>:/data fleet-adapter-vda5050:dev \
+#     --endpoint <control plane>:9090 --robot-id <robot>
 #
-# Nothing in the image holds a site value or a key.
+# Without the three files the adapter refuses to start. --insecure (no TLS) exists for local tests
+# only and is never the default. Nothing in the image holds a site value or a key.
 
 # The base image, pinned by digest: the multi-arch index of python:3.12-slim as read from Docker Hub
 # on 2026-10-15. Moving it is a deliberate change: read the new index digest
@@ -64,4 +67,5 @@ ENV PYTHONPATH=/app/proto \
 USER 65532:65532
 VOLUME ["/data"]
 ENTRYPOINT ["fleet-adapter-vda5050"]
-CMD ["--comms", "simulated", "--state-dir", "/data"]
+CMD ["--comms", "simulated", "--state-dir", "/data", \
+     "--tls-ca", "/tls/ca.crt", "--tls-cert", "/tls/tls.crt", "--tls-key", "/tls/tls.key"]
