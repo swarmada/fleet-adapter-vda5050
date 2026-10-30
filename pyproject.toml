@@ -31,6 +31,11 @@ fleet-adapter-vda5050 = "fleet_adapter_vda5050.adapter:main"
 [tool.setuptools.packages.find]
 include = ["fleet_adapter_vda5050*"]
 
+# The scenario presets --scenario names (healthy-fleet is the default): without them an
+# installed adapter, the image's, stops at start-up on an unknown scenario.
+[tool.setuptools.package-data]
+"fleet_adapter_vda5050.scenarios" = ["presets/*.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 

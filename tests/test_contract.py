@@ -40,7 +40,7 @@ def _assign(a: Adapter, token: int, action_type: str = adapter_mod.ACTION_NAVIGA
 
 
 def test_declares_the_current_contract_version() -> None:
-    assert adapter_mod.CONTRACT_VERSION == "1.3.0"
+    assert adapter_mod.CONTRACT_VERSION == "1.4.0"
 
 
 def test_scan_declares_the_navigate_catalog() -> None:
