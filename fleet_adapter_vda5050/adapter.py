@@ -135,7 +135,7 @@ def zone_constraints_ack(pb, push) -> object:
 
 
 class fleet_adapter_vda5050Adapter:
-    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None) -> None:
+    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None) -> None:
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
@@ -152,6 +152,9 @@ class fleet_adapter_vda5050Adapter:
         self._safety_outbox: queue.Queue = queue.Queue()  # → SafetyStream (acks + drills)
         # Contract 1.4.0: the stop latch, the retained outcome, and the work a stop interrupted
         # (action ID -> the fencing token it was assigned with; its re-delivery starts nothing).
+        # How a channel is opened, ControlStream and EdgeStream alike: mutual TLS, or plaintext
+        # only when --insecure said so (main builds it). None dials nothing.
+        self._dial = dial
         self._negotiated = ""
         self._latch = StopLatch()
         self._retained = RetainedOutcomes(state_dir)
@@ -961,11 +964,16 @@ class fleet_adapter_vda5050Adapter:
 
     # ── EdgeStream (C8) ──────────────────────────────────────────────────────
 
+    def _dial_edge(self, addr: str):
+        """The edge node, dialled as the control plane is: same credentials, same rule."""
+        if self._dial is None:
+            raise RuntimeError(f"no dialler configured; not dialling edge node {addr}")
+        return self._dial(addr)
+
     def _edge_loop(self) -> None:
         pb = self._pb
         addr = self._edge_addr.get()  # blocks until an edge endpoint is advertised (C8.1)
-        # TODO(deploy): use grpc.secure_channel with mTLS, same discipline as ControlStream.
-        estub = self._pb_grpc.EdgeServiceStub(grpc.insecure_channel(addr))
+        estub = self._pb_grpc.EdgeServiceStub(self._dial_edge(addr))
         outbox: queue.Queue = queue.Queue()
         # C8.2: tee one PositionFrame so the edge node has a pose to evaluate, fire-and-forget.
         with self._robot_lock:
@@ -987,7 +995,38 @@ class fleet_adapter_vda5050Adapter:
                                 lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
 
 
-def main() -> None:
+def dialler(args, ap):
+    """How this adapter opens a channel: mutual TLS from three files (the CA the control plane's
+    certificate is signed by, this adapter's client certificate, and its key), or plaintext only
+    with --insecure, which is for local tests. Anything else refuses to start (ap.error exits 2)
+    before a robot is brought up or a channel opened: there is no insecure default."""
+    files = {"--tls-ca": args.tls_ca, "--tls-cert": args.tls_cert, "--tls-key": args.tls_key}
+    if args.insecure:
+        if any(files.values()) or args.tls_server_name:
+            ap.error("--insecure and the --tls-* flags together: give the three TLS files, or "
+                     "--insecure for a local test, not both")
+        print("INSECURE: --insecure was given, so the ControlStream, SafetyStream and EdgeStream "
+              "carry no TLS and no client identity. For local tests only.", file=sys.stderr)
+        return lambda target: grpc.insecure_channel(target)
+    missing = [flag for flag, path in files.items() if not path]
+    if missing:
+        ap.error("mutual TLS needs --tls-ca, --tls-cert and --tls-key (missing: "
+                 + ", ".join(missing) + "); --insecure dials without TLS, for local tests only")
+    data = {}
+    for flag, path in files.items():
+        try:
+            data[flag] = pathlib.Path(path).expanduser().read_bytes()
+        except OSError as err:
+            ap.error(f"{flag} {path}: {err.strerror or err}")
+    creds = grpc.ssl_channel_credentials(root_certificates=data["--tls-ca"],
+                                         private_key=data["--tls-key"],
+                                         certificate_chain=data["--tls-cert"])
+    options = ([("grpc.ssl_target_name_override", args.tls_server_name)]
+               if args.tls_server_name else [])
+    return lambda target: grpc.secure_channel(target, creds, options=options)
+
+
+def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="VDA5050 Fleet Adapter")
     ap.add_argument("--endpoint", default="localhost:9090")
     ap.add_argument("--robot-id", default="robot-conformance-1")
@@ -1014,7 +1053,18 @@ def main() -> None:
                     help="where the last action's terminal outcome is kept until the control "
                          "plane acknowledges it (contract 1.4.0), so a restart does not lose "
                          "it. Unset: kept in memory only, and a restart loses it")
-    args = ap.parse_args()
+    ap.add_argument("--tls-ca", default="",
+                    help="the CA certificate (PEM) the control plane's server certificate is "
+                         "signed by")
+    ap.add_argument("--tls-cert", default="", help="this adapter's client certificate (PEM)")
+    ap.add_argument("--tls-key", default="", help="this adapter's client key (PEM)")
+    ap.add_argument("--tls-server-name", default="",
+                    help="the name to check the server certificate against, when it is not the "
+                         "endpoint's host")
+    ap.add_argument("--insecure", action="store_true",
+                    help="dial without TLS. For local tests only; never the default")
+    args = ap.parse_args(argv)
+    dial = dialler(args, ap)
 
     from fleet_adapter.v1 import fleet_adapter_pb2 as pb
     from fleet_adapter.v1 import fleet_adapter_pb2_grpc as pb_grpc
@@ -1044,13 +1094,12 @@ def main() -> None:
             engine = ScenarioEngine(scenario)
         robot = SimulatedRobot(engine)  # $0 skeleton; scenario-driven when an engine is set
     adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id,
-                                           state_dir=args.state_dir or None)
+                                           state_dir=args.state_dir or None, dial=dial)
     print("retained outcome: " + (f"kept in {args.state_dir}" if args.state_dir else
                                   "kept in memory only (no --state-dir): a restart loses it"),
           file=sys.stderr)
 
-    # TODO(deploy): use grpc.secure_channel with mTLS credentials (C1.3).
-    channel = grpc.insecure_channel(args.endpoint)
+    channel = dial(args.endpoint)
     stub = pb_grpc.FleetAdapterServiceStub(channel)
     threading.Thread(target=adapter.run_safety_stream, args=(stub,), daemon=True).start()  # C1.1
     try:
