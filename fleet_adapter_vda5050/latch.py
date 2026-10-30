@@ -11,9 +11,9 @@ No work is given to a robot under a stop. Per robot this keeps:
   lifted, so a clear that overtakes its fence is kept until the fence arrives;
 * the cleared IDs, so a clear sent again is acknowledged again and a late fence is ignored;
 * the highest leader term seen;
-* the local latch an edge stop sets, under a fresh 128-bit set ID. It is lifted only by a reset
-  at the robot, which the simulated vehicle has none of, and an EstopClear naming its set ends
-  only the wait for the clear.
+* the local latch an edge stop sets, under a fresh 128-bit set ID. A reset at the robot lifts the
+  local latch (reset_local); an EstopClear naming its set ends the wait for the clear. Work is
+  refused until both have happened, in either order.
 
 Everything lives in this process, as the latch section allows ("An adapter process that
 restarts holds none of them"). What a latch does to the work held is the adapter's; this module
@@ -148,6 +148,17 @@ class StopLatch:
             r.local_set_id = secrets.token_hex(16)
             r.local_changed_ms = _now_ms()
             return LocalLatch(True, r.local_set_id, r.local_changed_ms)
+
+    def reset_local(self, robot_id: str) -> LocalLatch | None:
+        """A reset at the robot: the local latch is no longer set. The set, if its clear has not
+        arrived, still waits for it. None when the latch was not set."""
+        with self._lock:
+            r = self._r(robot_id)
+            if not r.local_set:
+                return None
+            r.local_set = False
+            r.local_changed_ms = _now_ms()
+            return LocalLatch(False, r.local_set_id, r.local_changed_ms)
 
     # ── what the adapter asks ────────────────────────────────────────────────
 

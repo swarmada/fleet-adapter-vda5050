@@ -15,8 +15,10 @@ Run:  python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090
 from __future__ import annotations
 
 import argparse
+import os
 import pathlib
 import queue
+import signal
 import sys
 import threading
 import time
@@ -60,9 +62,10 @@ _MAX_TICK_S = 5.0
 # a clear from a deposed leader is not acted on; work a stop interrupts is never continued; and
 # the last action's terminal outcome is kept until an ActionOutcomeAck names it (retained.py).
 # Each binds only a connection that negotiated 1.4.0; an older control plane sees 1.3.0's
-# behaviour. One gap, as in the reference simulation adapter: an edge stop sets the robot's local
-# latch, which only a reset at the robot lifts, and the simulated vehicle has no reset, so after an
-# edge stop it refuses work until the adapter restarts.
+# behaviour. An edge stop sets the robot's local latch: the simulated vehicle's reset (SIGUSR1, a
+# local command at the vehicle) lifts it, and work resumes once the EstopClear that ends its set
+# has arrived too. The reference control plane at v0.4 sends no such clear (RFC-0001, the
+# edge-stop report's Not-met note), so there, after an edge stop, work stays refused.
 CONTRACT_VERSION = "1.4.0"
 _TERMINAL = (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED, task_map.TASK_CANCELLED)
 
@@ -735,6 +738,22 @@ class fleet_adapter_vda5050Adapter:
         dt = 0.0 if self._last_tick is None else min(max(now - self._last_tick, 0.0), _MAX_TICK_S)
         self._last_tick = now
         self._robot.tick(dt)
+        take_reset = getattr(self._robot, "take_reset", None)
+        if take_reset is not None and take_reset():
+            self._reset_at_robot()
+
+    def _reset_at_robot(self) -> None:
+        """A person reset the vehicle: its local latch is lifted, and reported. Reached only from
+        the robot side (the binding's take_reset), never from a message on any stream."""
+        loc = self._latch.reset_local(self._robot_id)
+        if loc is None:
+            print("reset at the vehicle: the local latch was not set; nothing changed",
+                  file=sys.stderr)
+            return
+        print("reset at the vehicle: the local latch is lifted"
+              + (f"; set {loc.set_id} still waits for the EstopClear that ends it, and work stays "
+                 "refused until then" if loc.set_id else ""), file=sys.stderr)
+        self._send_local_report()
 
     def _maybe_emit_task_progress(self) -> None:
         """Stream a TERMINAL task-status transition derived from the robot's order
@@ -1095,6 +1114,12 @@ def main(argv: list[str] | None = None) -> None:
         robot = SimulatedRobot(engine)  # $0 skeleton; scenario-driven when an engine is set
     adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id,
                                            state_dir=args.state_dir or None, dial=dial)
+    if args.comms == "simulated":
+        # The simulated vehicle's reset: a local command at the vehicle, never a message.
+        signal.signal(signal.SIGUSR1, lambda signum, frame: robot.request_reset())
+        print(f"reset at the vehicle (lifts the local latch an edge stop set): send SIGUSR1 to "
+              f"process {os.getpid()} (kill -USR1 {os.getpid()}; in a container, "
+              f"docker kill --signal=USR1 <container>)", file=sys.stderr)
     print("retained outcome: " + (f"kept in {args.state_dir}" if args.state_dir else
                                   "kept in memory only (no --state-dir): a restart loses it"),
           file=sys.stderr)
