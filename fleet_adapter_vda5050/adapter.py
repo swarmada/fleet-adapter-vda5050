@@ -138,7 +138,10 @@ def zone_constraints_ack(pb, push) -> object:
 
 
 class fleet_adapter_vda5050Adapter:
-    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None) -> None:
+    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None, namespace: str = "") -> None:
+        # The namespace in AdapterHello: empty takes it from the client certificate, the control
+        # plane's binding. A name that differs from the certificate's is refused.
+        self._namespace = namespace
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
@@ -192,7 +195,7 @@ class fleet_adapter_vda5050Adapter:
         yield pb.AdapterMessage(hello=pb.AdapterHello(  # C1.2
             vendor="vda5050", adapter_version="0.1.0",
             protocol_version="fleet_adapter.v1", contract_version=CONTRACT_VERSION,
-            namespace="default"))
+            namespace=self._namespace))
         while True:
             msg = self._outbox.get()
             if msg is None:
@@ -1068,6 +1071,9 @@ def main(argv: list[str] | None = None) -> None:
                     help="hardware-fault: seconds until the component degrades (default: 30)")
     ap.add_argument("--recover-at", type=float, default=90.0,
                     help="hardware-fault: seconds until the component recovers (default: 90)")
+    ap.add_argument("--namespace", default="",
+                    help="the namespace to declare in AdapterHello (default: none, so the control plane takes "
+                         "it from this adapter's client certificate)")
     ap.add_argument("--state-dir", default="",
                     help="where the last action's terminal outcome is kept until the control "
                          "plane acknowledges it (contract 1.4.0), so a restart does not lose "
@@ -1113,7 +1119,8 @@ def main(argv: list[str] | None = None) -> None:
             engine = ScenarioEngine(scenario)
         robot = SimulatedRobot(engine)  # $0 skeleton; scenario-driven when an engine is set
     adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id,
-                                           state_dir=args.state_dir or None, dial=dial)
+                                           state_dir=args.state_dir or None, dial=dial,
+                                           namespace=args.namespace)
     if args.comms == "simulated":
         # The simulated vehicle's reset: a local command at the vehicle, never a message.
         signal.signal(signal.SIGUSR1, lambda signum, frame: robot.request_reset())
