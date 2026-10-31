@@ -16,6 +16,7 @@ timer or from silence. This is what makes emergency stop safe (CONFORMANCE.md C5
 from __future__ import annotations
 
 import math
+import sys
 import threading
 from typing import Protocol
 
@@ -172,6 +173,8 @@ class SimulatedRobot:
         self._engine = engine
         self._elapsed = 0.0                 # seconds since spawn, advanced by tick()
         self._hw_prev: dict[str, str] = {}  # last-reported hardware status (delta base)
+        self._order: dict[str, str] = {}    # the action behind the current order, for the log lines
+        self._logged: dict[str, tuple] = {} # robot -> (seen, at): the last VDA_STATE line's values and time
 
     # ── RobotBinding contract (safety-critical; scenario never weakens it) ───────
 
@@ -232,6 +235,30 @@ class SimulatedRobot:
                 self._moving[robot_id] = False  # arrived: at rest, the order complete
             else:
                 self._pos[robot_id] = (x + (tx - x) * step / dist, y + (ty - y) * step / dist)
+        for robot_id in self._moving:
+            self._log_state(robot_id)
+
+    def note_order(self, robot_id: str, action: str) -> None:
+        """Log an order the vehicle has taken. Log only: changes nothing the model does."""
+        self._order[robot_id] = action
+        x, y = self._target.get(robot_id) or self._pos.get(robot_id, (0.0, 0.0))
+        print(f"VDA_ORDER robot={robot_id} order={action} x={x:.2f} y={y:.2f}", file=sys.stderr, flush=True)
+
+    def _log_state(self, robot_id: str) -> None:
+        """VDA_STATE: once a second while driving, and at each change. These lines stand for the
+        model's values; they are not VDA5050 messages. `stopped` is the value the adapter uses."""
+        stopped = self.is_stopped(robot_id)
+        driving = bool(self._moving.get(robot_id))
+        order = self._order.get(robot_id, "-") if self._target.get(robot_id) is not None else "-"
+        seen = (order, driving, stopped)
+        last = self._logged.get(robot_id)
+        if last is not None and last[0] == seen and not (driving and self._elapsed - last[1] >= 1.0):
+            return
+        self._logged[robot_id] = (seen, self._elapsed)
+        x, y = self._pos[robot_id]
+        print(f"VDA_STATE robot={robot_id} order={order} driving={str(driving).lower()} x={x:.2f} y={y:.2f} "
+              f"speed={self.SPEED_MPS if driving else 0.0:.2f} stopped={str(stopped).lower()}",
+              file=sys.stderr, flush=True)
 
     def request_reset(self) -> None:
         """A reset at the vehicle: the robot-side half of lifting the local latch an edge stop

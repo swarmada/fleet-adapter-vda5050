@@ -450,6 +450,8 @@ class fleet_adapter_vda5050Adapter:
         goal = task_map.goal_from_assign(task.destination, task.payload_json)  # FleetTask → order target
         with self._robot_lock:
             self._robot.command_move(self._robot_id, goal.x, goal.y, goal.theta)
+            if hasattr(self._robot, "note_order"):      # the simulated vehicle's log line
+                self._robot.note_order(self._robot_id, task.action_id)
         self._current_action = task.action_id
         if task.HasField("fencing_token"):
             self._action_tokens[task.action_id] = task.fencing_token
