@@ -101,6 +101,9 @@ class StateSnapshot:
     order_id: str = ""
     order_update_id: int = 0
     active_nodes: int = 0                         # nodeStates still to be reached (0 = arrived)
+    # actionStates not yet ended (WAITING, INITIALIZING, RUNNING or PAUSED): work the vehicle
+    # can still do or resume, which a cancelOrder would cancel.
+    active_actions: int = 0
     map_id: str = ""
 
 

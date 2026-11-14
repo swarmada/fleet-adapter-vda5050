@@ -126,6 +126,12 @@ class RobotBinding(Protocol):
     def command_stop(self, robot_id: str) -> None:
         """Command a safe stop. NOT a confirmation — that is `is_stopped`."""
 
+    def command_estop(self, robot_id: str) -> None:
+        """Command an emergency stop: halt at once and end the order, so the interrupted work
+        cannot be resumed (VDA5050: startPause, then cancelOrder). NOT a confirmation — that
+        is `is_stopped`. Declared rather than discovered, as the lifecycle is: the adapter
+        calls it on every estop, whatever the binding."""
+
     def command_pause(self, robot_id: str) -> None:
         """Pause the robot's activity (VDA5050 startPause) — a REQUEST; confirmation
         that it has halted comes only from `is_stopped`. Keeps the order so it can
@@ -214,6 +220,10 @@ class SimulatedRobot:
         # The order ends where the robot is; a real robot confirms this via is_stopped.
         self._moving[robot_id] = False
         self._target[robot_id] = None
+
+    def command_estop(self, robot_id: str) -> None:
+        # The simulated vehicle stops at once, so its emergency stop is its stop.
+        self.command_stop(robot_id)
 
     def command_pause(self, robot_id: str) -> None:
         self._moving[robot_id] = False  # startPause halts; is_stopped confirms it

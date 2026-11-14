@@ -57,11 +57,14 @@ class Vda5050Binding:
         self._header_id = 0                        # monotonic per-topic dedup key
         self._order_seq = 0                        # generates a unique orderId per task
         self._current_order_id = ""
+        self._last_order_id = ""                   # the last order published; a stop does not clear it
         self._pending_order: str | None = None     # last order JSON built (test seam)
         self._last_action: str | None = None       # last instantAction JSON built (test seam)
         self._action_seq = 0                       # generates a unique actionId per stop
         self._has_state = False                    # True once a state message has arrived
         self._holding = False                      # a stop has been commanded; hold until a new order
+        self._estop_paused = False                 # an estop paused the vehicle; stopPause before the next order
+        self._suppressed_stops = 0                 # cancelOrders not sent: nothing to cancel (test seam)
         self._started = False                      # True once the broker is connected
         self._never_started_raised = False          # tick()'s never-started diagnosis is one-shot
         self._mqtt = MqttClient(mqtt_host, mqtt_port, client_id=f"swarmada-{robot_id}")
@@ -151,12 +154,25 @@ class Vda5050Binding:
 
     def command_move(self, robot_id: str, x: float, y: float, yaw: float = 0.0) -> None:
         """Build a VDA5050 order for the target and publish it (when connected).
-        Without a broker the order is only cached, so the encoding is testable at $0."""
+        Without a broker the order is only cached, so the encoding is testable at $0.
+
+        After an estop the vehicle is held in pause mode (:meth:`command_estop`). The first
+        order after it is preceded by a ``stopPause``. On a contract 1.4.0 connection the
+        adapter sends an order only once the stop is cleared (the stop latch refuses work until
+        then), so lifting the pause here is the clear taking effect. Below 1.4.0 there is no
+        latch: the next order the control plane sends lifts it, as the order after a
+        ``cancelOrder`` always drove."""
+        with self._lock:
+            unpause = self._estop_paused
+            self._estop_paused = False
+        if unpause:
+            self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
         with self._lock:
             start_pos, map_id = self._state.position, self._state.map_id
             self._order_seq += 1
             order_id = f"{robot_id}-order-{self._order_seq}"
             self._current_order_id = order_id
+            self._last_order_id = order_id
             self._header_id += 1
             header_id = self._header_id
             self._holding = False  # a new order releases a prior stop-hold
@@ -188,8 +204,22 @@ class Vda5050Binding:
         """Publish a VDA5050 ``cancelOrder`` instantAction (abort the active order +
         hold). This is a REQUEST — confirmation that the robot is at rest comes only
         from :meth:`is_stopped` (state). Shared by confirmed estop (C5) and lease
-        self-stop (C4). NB: never ``stopPause``, which would RESUME motion."""
+        self-stop (C4). NB: never ``stopPause``, which would RESUME motion.
+
+        Not sent when there is nothing to cancel (:meth:`_nothing_to_cancel_locked`): the
+        vehicle would answer it with a ``noOrderToCancel`` warning, which the adapter reports
+        as a degraded component. The hold is taken either way. An estop always sends it
+        (:meth:`command_estop`)."""
+        self._cancel_order(robot_id, always=False)
+
+    def _cancel_order(self, robot_id: str, *, always: bool) -> None:
         with self._lock:
+            if not always and self._nothing_to_cancel_locked():
+                self._current_order_id = ""
+                self._pending_order = None
+                self._holding = True
+                self._suppressed_stops += 1
+                return
             self._current_order_id = ""
             self._pending_order = None
             self._holding = True
@@ -205,6 +235,54 @@ class Vda5050Binding:
         if self._started:  # pragma: no cover — requires paho + a broker
             self._mqtt.publish(self._topics.instant_actions, payload)
 
+    def command_estop(self, robot_id: str) -> None:
+        """An emergency stop: ``startPause``, then ``cancelOrder``.
+
+        VDA 5050 lets ``cancelOrder`` stop "immediately or on the next node", so on its own a
+        stop could still drive on to the next node. ``startPause`` stops driving without
+        reaching the next node. Sending it first halts the vehicle at once; the ``cancelOrder``
+        then ends the order, so the interrupted work cannot be continued by a ``stopPause``.
+        The vehicle stays paused until the next order (:meth:`command_move`).
+
+        Never pause alone: a paused order is work the vehicle can resume. A REQUEST, as
+        :meth:`command_stop` is; rest is confirmed only by :meth:`is_stopped`."""
+        with self._lock:
+            self._estop_paused = True
+        self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "estop-pause")
+        # Always, even when the last state shows nothing to cancel: that state can be up to a
+        # publish interval old, and a paused order the cancel missed would be resumed by the
+        # next stopPause. A noOrderToCancel warning is the price of a stop.
+        self._cancel_order(robot_id, always=True)
+
+    def _nothing_to_cancel_locked(self) -> bool:
+        """True only when a ``cancelOrder`` can change nothing, read from the vehicle's own
+        ``state``. The caller holds the lock. All of these must hold:
+
+        * the vehicle can be observed (broker session up, the robot ONLINE) and has reported
+          a ``state``;
+        * that state is at rest (not driving, velocity within noise) -- never a skip while
+          the vehicle may be moving;
+        * it lists no node still to be reached, so no order is in progress on it, and no
+          action that has not ended (an action can run, or wait to resume, at rest on the
+          last node, and a cancelOrder cancels it);
+        * and no order this binding published is still outstanding: none was ever sent, or
+          the vehicle reports the last one sent, ended. A stop does not end it here: an order
+          is outstanding until the vehicle says so, so a cancelOrder that crossed the order on
+          the way does not make a later stop look unnecessary."""
+        if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
+            return False
+        st = self._state
+        linear, angular = st.velocity
+        at_rest = (not st.driving) and linear <= _EPS_LINEAR and angular <= _EPS_ANGULAR
+        if not at_rest or st.active_nodes or st.active_actions:
+            return False
+        return not self._last_order_id or st.order_id == self._last_order_id
+
+    def suppressed_stops(self, robot_id: str) -> int:
+        """cancelOrders not sent because there was nothing to cancel (test seam)."""
+        with self._lock:
+            return self._suppressed_stops
+
     def command_pause(self, robot_id: str) -> None:
         """Publish a VDA5050 ``startPause`` instantAction — pauses the active order
         WITHOUT aborting it, so it can later resume. A REQUEST; the physical halt is
@@ -213,7 +291,10 @@ class Vda5050Binding:
         self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "pause")
 
     def command_resume(self, robot_id: str) -> None:
-        """Publish a VDA5050 ``stopPause`` instantAction — resumes a paused order."""
+        """Publish a VDA5050 ``stopPause`` instantAction — resumes a paused order. The adapter
+        refuses a resume while a stop is latched, so this never lifts an estop's pause early."""
+        with self._lock:
+            self._estop_paused = False
         self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
 
     def _publish_action(self, robot_id: str, action_type: str, tag: str) -> None:

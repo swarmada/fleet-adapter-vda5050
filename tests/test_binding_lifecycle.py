@@ -254,6 +254,9 @@ def test_the_wrapper_does_not_swallow_a_bug_in_the_safety_primitive() -> None:
         def command_stop(self, robot_id: str) -> None:
             raise TypeError("command_stop is not callable like that")
 
+        def command_estop(self, robot_id: str) -> None:
+            raise TypeError("command_estop is not callable like that")
+
     a = Adapter(None, None, _Broken(), "amr-1")
     with pytest.raises(TypeError):
         a._confirm_estop()
