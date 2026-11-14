@@ -72,7 +72,7 @@ the `--comms simulated` path and existing setups are unaffected.
 | 1 | MQTT client + VDA5050 `connection`/state handling → handshake | C1 | ✅ done |
 | 2 | Telemetry: VDA5050 `state` → protocol telemetry (numeric-only) | C6 | ✅ done |
 | 3 | Task: FleetTask → VDA5050 `order`; status from `state`; decline optionals | C2/C7 | ✅ done |
-| 4 | Safety: confirmed estop → `stopPause` safe-hold; fencing; lease self-stop | C3/C4/C5 | ✅ done |
+| 4 | Safety: confirmed estop → `startPause`, then `cancelOrder`; fencing; lease self-stop | C3/C4/C5 | ✅ done |
 | 5 | Comms-profile seam ready for `iso21423` | — | ✅ (seam in place) |
 | 6 | `make conformance` until C1–C8 pass | C1–C8 | ✅ **CONFORMANT** — 14 passed, 0 failed, 2 skipped (`--comms simulated`); 38 unit tests pass. See `../../REGISTRY.md`. |
 | 7 | Pause / resume → VDA5050 `startPause` / `stopPause` instantActions | beyond C1–C8 | ✅ done |
@@ -105,6 +105,30 @@ VDA5050 concept is handled; the rest is honestly declined.
 Safety is **never faked**: `is_stopped` is CONFIRMED from the robot's `state`
 (velocity ≈ 0 / not driving), never inferred from a timer or from silence
 (CONFORMANCE.md C5).
+
+### Stops and pauses on a VDA 5050 vehicle
+
+- **An emergency stop** is `startPause`, then `cancelOrder`. VDA 5050 2.0.0 lets
+  `cancelOrder` stop "immediately or on the next node"; `startPause` means "no more AGV
+  driving movements - reaching next node is not necessary". The pause halts the vehicle,
+  and the cancel ends the order, which a pause alone leaves resumable.
+- **After the stop is cleared**, the first order is preceded by a `stopPause`, and the
+  vehicle drives again. On a contract 1.4.0 connection the stop latch refuses work until
+  the clear; below 1.4.0 the next order lifts the pause.
+- **Any other stop** (a cancel, a lapsed lease, the reconcile at registration) is
+  `cancelOrder`. It is not sent when the vehicle's own `state` says there is nothing to
+  cancel: at rest, no node left, no action that has not ended, and no order the adapter
+  sent still outstanding. An emergency stop always sends it.
+- **A pause at the vehicle.** When the vehicle reports `paused` and the adapter did not
+  pause it (by its button, or by an earlier adapter process), work is refused
+  `ROBOT_UNAVAILABLE` with "paused at the vehicle". The adapter never sends the
+  `stopPause` that would release a pause it did not set.
+- **The remaining case.** A vehicle does not report who paused it. A pause button pressed
+  while the adapter's own estop pause is in force looks like that pause, and the
+  `stopPause` before the first order after the clear releases it. VDA 5050 2.0.0 says
+  `stopPause` "can also restart vehicles that were stopped with a hardware button that
+  triggered startPause (if configured)". Whoever clears the stop clears it for the
+  vehicle as it stands.
 
 ## Development
 

@@ -36,9 +36,9 @@ ROBOT = "amr-1"
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
-def _state(driving=False, vx=0.0, order_id="", nodes=0, actions=()) -> str:
+def _state(driving=False, vx=0.0, order_id="", nodes=0, actions=(), paused=False) -> str:
     return json.dumps({
-        "driving": driving, "velocity": {"vx": vx, "vy": 0.0, "omega": 0.0},
+        "driving": driving, "velocity": {"vx": vx, "vy": 0.0, "omega": 0.0}, "paused": paused,
         "orderId": order_id, "nodeStates": [{"nodeId": f"n{i}"} for i in range(nodes)],
         "actionStates": [{"actionId": f"a{i}", "actionStatus": st}
                          for i, st in enumerate(actions)]})
@@ -536,3 +536,89 @@ def test_below_the_mark_unregistered_work_is_still_stale_and_without_a_token_mis
 def test_profiles_names_used_here_are_the_wire_names() -> None:
     assert (profiles.ACTION_START_PAUSE, profiles.ACTION_STOP_PAUSE,
             profiles.ACTION_CANCEL_ORDER) == ("startPause", "stopPause", "cancelOrder")
+
+
+# ── a pause at the vehicle: refused work ─────────────────────────────────────
+
+def test_the_paused_field_is_read_only_when_it_is_true() -> None:
+    parse = profiles.get_profile("vda5050").parse_state
+    assert parse(json.dumps({"paused": True})).paused is True
+    for value in (False, "true", 1, None):
+        assert parse(json.dumps({"paused": value})).paused is False
+    assert parse("{}").paused is False
+
+
+def test_a_pause_this_binding_did_not_set_is_a_pause_at_the_vehicle() -> None:
+    b = _live_binding()
+    b.on_state(_state(paused=True))
+    assert b.paused_at_vehicle(ROBOT)
+
+
+def test_its_own_estop_pause_and_a_swarmada_pause_are_not() -> None:
+    b = _live_binding()
+    b.on_state(_state(paused=True))
+    b.command_estop(ROBOT)
+    assert not b.paused_at_vehicle(ROBOT)
+    b = _live_binding()
+    b.on_state(_state(paused=True))
+    b.command_pause(ROBOT)
+    assert not b.paused_at_vehicle(ROBOT)
+    b.command_resume(ROBOT)  # resumed, and the vehicle still reports paused: not ours now
+    assert b.paused_at_vehicle(ROBOT)
+
+
+def test_a_vehicle_that_cannot_be_observed_is_not_reported_paused() -> None:
+    b = _live_binding()
+    b.on_state(_state(paused=True))
+    b.on_connection(json.dumps({"connectionState": "OFFLINE"}))
+    assert not b.paused_at_vehicle(ROBOT)
+
+
+def test_work_is_refused_while_the_vehicle_is_paused_at_the_vehicle() -> None:
+    b = _live_binding()
+    b.on_state(_state(paused=True))
+    a = mark_registered(Adapter(pb, None, b, ROBOT))
+    r = _assign(a, "act-1", 5)
+    assert not r.accepted
+    assert r.rejection == pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE
+    assert r.message == "paused at the vehicle"
+    assert _wire(b) == []                # no order, and no stopPause to release it
+    assert a._fence.highest(ROBOT) == 0  # and the fencing mark is where it was
+    b.on_state(_state(paused=False))     # released at the vehicle
+    assert _assign(a, "act-1", 5).accepted
+    assert _wire(b) == ["order"]
+
+
+def test_after_its_own_estop_the_paused_vehicle_takes_work_and_is_unpaused() -> None:
+    b = _live_binding()
+    b.on_state(_state(driving=True, vx=0.8, order_id="x", nodes=2))
+    b.command_estop(ROBOT)
+    b.on_state(_state(order_id="x", paused=True))  # halted, paused, order cancelled
+    a = mark_registered(Adapter(pb, None, b, ROBOT))
+    assert _assign(a, "act-1", 5).accepted
+    assert _wire(b) == ["startPause", "cancelOrder", "stopPause", "order"]
+
+
+def test_documented_a_pause_pressed_during_its_own_estop_pause_is_released_after_the_clear() -> (
+        None):
+    """The remaining case, pinned so that a change to it is deliberate. VDA5050 does not say
+    who paused a vehicle; a button pressed while this binding's estop pause is in force looks
+    like that pause, and the stopPause before the first order after the clear releases it
+    (VDA5050 2.0.0: stopPause "can also restart vehicles that were stopped with a hardware
+    button that triggered startPause (if configured)")."""
+    b = _live_binding()
+    b.on_state(_state())
+    b.command_estop(ROBOT)
+    b.on_state(_state(paused=True))  # the estop's pause, and now also the button: one flag
+    assert not b.paused_at_vehicle(ROBOT)
+    b.published.clear()
+    b.command_move(ROBOT, 1.0, 0.0)
+    assert _wire(b) == ["stopPause", "order"]
+
+
+def test_a_binding_without_paused_at_vehicle_takes_work() -> None:
+    class _Older(SimulatedRobot):
+        paused_at_vehicle = None
+
+    a = _adapter(_Older())
+    assert _assign(a, "act-1", 5).accepted

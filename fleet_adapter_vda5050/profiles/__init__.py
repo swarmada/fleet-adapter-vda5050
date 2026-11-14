@@ -104,6 +104,9 @@ class StateSnapshot:
     # actionStates not yet ended (WAITING, INITIALIZING, RUNNING or PAUSED): work the vehicle
     # can still do or resume, which a cancelOrder would cancel.
     active_actions: int = 0
+    # The vehicle reports it is in pause mode (VDA5050 state.paused): by a startPause, or by a
+    # button on the vehicle. VDA5050 does not say which.
+    paused: bool = False
     map_id: str = ""
 
 

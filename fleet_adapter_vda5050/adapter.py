@@ -551,14 +551,15 @@ class fleet_adapter_vda5050Adapter:
                 message="under a stop: " + (", ".join(ids) if ids else "local latch")))
             self._report_latch()
             return
-        if (not self._registered and task.HasField("fencing_token")
+        unavailable = self._unavailable()
+        if (unavailable and task.HasField("fencing_token")
                 and task.fencing_token > self._fence.highest(self._robot_id)):
-            # C13.2 for a token the fence would accept. Refused BEFORE the fence's check,
-            # which raises the high-water mark on acceptance: work the robot never took must
-            # not make a later assignment at that token look stale.
+            # Refused BEFORE the fence's check, which raises the high-water mark on acceptance:
+            # work the robot never took must not make a later assignment at that token look
+            # stale.
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
-                message="this robot's registration was not accepted on this session"))
+                message=unavailable))
             return
         # Below or at the mark, or with no token, the check changes nothing: STALE, MISSING or
         # an identical re-delivery.
@@ -572,13 +573,11 @@ class fleet_adapter_vda5050Adapter:
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_STALE_FENCING_TOKEN))
             return
-        # C13.2: a robot not under management on this session (its registration refused, or
-        # not yet accepted) runs no work. After the fencing branches, so a stale token is still
-        # refused STALE.
-        if not self._registered:
+        # After the fencing branches, so a stale token is still refused STALE.
+        if unavailable:
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
-                message="this robot's registration was not accepted on this session"))
+                message=unavailable))
             return
         # After the fencing branches on purpose: a superseded command is refused STALE, so
         # the control plane learns its assignment lost rather than a reason it never lost for.
@@ -621,6 +620,25 @@ class fleet_adapter_vda5050Adapter:
         self._current_fencing_token = token
         self._last_task_state = task_map.TASK_RUNNING
         self._emit_action_status(task.action_id, task_map.TASK_RUNNING, token)
+
+    def _unavailable(self) -> str:
+        """Why the robot can take no work now, or "" when it can.
+
+        * C13.2: it is not under management on this session (its registration refused, or
+          not yet accepted).
+        * It is paused at the vehicle: the vehicle reports a pause this adapter did not set,
+          by its own button or by an earlier adapter process. An order would wait paused for
+          as long as its lease is renewed, and the adapter does not release a pause it did not
+          set. A pause pressed during this adapter's own estop pause is not seen here: the
+          stopPause sent before the first order after the clear releases it (VDA5050 2.0.0:
+          stopPause "can also restart vehicles that were stopped with a hardware button")."""
+        if not self._registered:
+            return "this robot's registration was not accepted on this session"
+        paused = getattr(self._robot, "paused_at_vehicle", None)  # a binding written before it
+        with self._robot_lock:
+            if paused is not None and paused(self._robot_id):
+                return "paused at the vehicle"
+        return ""
 
     def _reconcile_action_state(self, ack) -> None:
         """C2.2 / C3.8 -- adopt the control plane's authoritative action state on RegisterAck.

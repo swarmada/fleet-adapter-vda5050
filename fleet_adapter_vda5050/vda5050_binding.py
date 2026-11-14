@@ -64,6 +64,7 @@ class Vda5050Binding:
         self._has_state = False                    # True once a state message has arrived
         self._holding = False                      # a stop has been commanded; hold until a new order
         self._estop_paused = False                 # an estop paused the vehicle; stopPause before the next order
+        self._pause_requested = False              # a Swarmada pause (command_pause) is in force
         self._suppressed_stops = 0                 # cancelOrders not sent: nothing to cancel (test seam)
         self._started = False                      # True once the broker is connected
         self._never_started_raised = False          # tick()'s never-started diagnosis is one-shot
@@ -161,7 +162,14 @@ class Vda5050Binding:
         adapter sends an order only once the stop is cleared (the stop latch refuses work until
         then), so lifting the pause here is the clear taking effect. Below 1.4.0 there is no
         latch: the next order the control plane sends lifts it, as the order after a
-        ``cancelOrder`` always drove."""
+        ``cancelOrder`` always drove.
+
+        VDA5050 2.0.0: stopPause "can also restart vehicles that were stopped with a hardware
+        button that triggered startPause (if configured)", and a vehicle does not report which
+        of the two paused it. So a pause pressed on the vehicle while this binding's own estop
+        pause is in force is released by this stopPause, once the stop is cleared. A pause
+        pressed when this binding has none in force is refused work instead
+        (:meth:`paused_at_vehicle`)."""
         with self._lock:
             unpause = self._estop_paused
             self._estop_paused = False
@@ -278,6 +286,19 @@ class Vda5050Binding:
             return False
         return not self._last_order_id or st.order_id == self._last_order_id
 
+    def paused_at_vehicle(self, robot_id: str) -> bool:
+        """True when the vehicle reports it is paused and this binding did not pause it (no
+        estop pause and no Swarmada pause in force): a pause at the vehicle, by its button, or
+        one an earlier adapter process set and this one does not know of. The adapter refuses
+        work then. An order would wait paused, its action RUNNING for as long as its lease is
+        renewed, and this binding will not send the stopPause that releases a pause it did not
+        set. Read from the last ``state`` while the vehicle can be observed; False otherwise."""
+        with self._lock:
+            if not (self._started and self._connection == profiles.CONN_ONLINE
+                    and self._has_state):
+                return False
+            return self._state.paused and not (self._estop_paused or self._pause_requested)
+
     def suppressed_stops(self, robot_id: str) -> int:
         """cancelOrders not sent because there was nothing to cancel (test seam)."""
         with self._lock:
@@ -288,6 +309,8 @@ class Vda5050Binding:
         WITHOUT aborting it, so it can later resume. A REQUEST; the physical halt is
         confirmed only via :meth:`is_stopped` (state). Distinct from command_stop,
         which uses ``cancelOrder`` (abort + hold)."""
+        with self._lock:
+            self._pause_requested = True
         self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "pause")
 
     def command_resume(self, robot_id: str) -> None:
@@ -295,6 +318,7 @@ class Vda5050Binding:
         refuses a resume while a stop is latched, so this never lifts an estop's pause early."""
         with self._lock:
             self._estop_paused = False
+            self._pause_requested = False
         self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
 
     def _publish_action(self, robot_id: str, action_type: str, tag: str) -> None:

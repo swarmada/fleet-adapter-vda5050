@@ -108,6 +108,7 @@ class Vda5050Profile:
             order_update_id=int(_num(obj.get("orderUpdateId")) or 0),
             active_nodes=len(node_states) if isinstance(node_states, list) else 0,
             active_actions=_active_actions(obj.get("actionStates")),
+            paused=obj.get("paused") is True,
             map_id=str(ap.get("mapId", "")) if isinstance(ap, dict) else "",
         )
 
