@@ -17,11 +17,16 @@ instantAction (confirmed-stop safe-hold), and ``startPause`` / ``stopPause``
 instantActions (pause / resume the active order). ``is_stopped`` is CONFIRMED from
 ``state`` (not driving + velocity ≈ 0), never inferred — the binding is
 safety-complete.
+
+A new order while the vehicle still has one is a preemption: ``cancelOrder`` first, and the
+new order once the vehicle reports the old one gone (:meth:`Vda5050Binding.command_move`).
 """
 
 from __future__ import annotations
 
+import sys
 import threading
+import time
 from datetime import UTC, datetime
 
 from fleet_adapter_vda5050 import profiles, task
@@ -37,6 +42,12 @@ def _now_iso() -> str:
 _EPS_LINEAR = 0.01   # m/s
 _EPS_ANGULAR = 0.01  # rad/s
 
+# How long a preempting order waits for the vehicle to end the order before it. VDA5050 lets
+# the vehicle stop "on the next node" and finish actions it cannot interrupt, and its state
+# can be a publish interval old (vda-5050-lib's default is 30 s). Past this the new order is
+# dropped and its action FAILED.
+_PREEMPT_TIMEOUT_S = 60.0
+
 
 class Vda5050Binding:
     """VDA5050 implementation of ``RobotBinding`` (see robot.py)."""
@@ -44,13 +55,18 @@ class Vda5050Binding:
     def __init__(self, robot_id: str = "robot-conformance-1",
                  manufacturer: str = "swarmada", serial: str = "amr-1",
                  profile_name: str = "vda5050",
-                 mqtt_host: str = "localhost", mqtt_port: int = 1883) -> None:
+                 mqtt_host: str = "localhost", mqtt_port: int = 1883,
+                 preempt_timeout_s: float = _PREEMPT_TIMEOUT_S, clock=time.monotonic) -> None:
         self._robot_id = robot_id
         self._manufacturer = manufacturer
         self._serial = serial
         self._profile = profiles.get_profile(profile_name)
         self._topics = self._profile.topics(manufacturer, serial)
         self._lock = threading.Lock()
+        # Serialises every order and instantAction this binding publishes, with the decision
+        # to send it. Taken before _lock, never after, and never held while waiting: the
+        # estop's pause and cancel cannot fall either side of a held order going out.
+        self._publish_lock = threading.RLock()
         self._connection = profiles.CONN_OFFLINE  # until the robot reports ONLINE
         self._state = profiles.StateSnapshot()    # latest parsed telemetry
         self._factsheet = profiles.FactsheetInfo() # latest parsed factsheet (capabilities)
@@ -62,10 +78,22 @@ class Vda5050Binding:
         self._last_action: str | None = None       # last instantAction JSON built (test seam)
         self._action_seq = 0                       # generates a unique actionId per stop
         self._has_state = False                    # True once a state message has arrived
+        self._states_seen = 0                      # state messages received
         self._holding = False                      # a stop has been commanded; hold until a new order
         self._estop_paused = False                 # an estop paused the vehicle; stopPause before the next order
         self._pause_requested = False              # a Swarmada pause (command_pause) is in force
         self._suppressed_stops = 0                 # cancelOrders not sent: nothing to cancel (test seam)
+        # A preemption in progress (command_move): the order held, the cancelOrder sent for
+        # the order before it, and when the hold gives up.
+        self._held: tuple[str, float, float, float] | None = None  # (orderId, x, y, yaw)
+        self._held_cancel_id = ""
+        self._held_deadline = 0.0
+        self._open_cancel_id = ""                  # the last cancelOrder sent, if no order since
+        self._open_cancel_at = 0                   # _states_seen when it was sent
+        self._preempt_timeout_s = preempt_timeout_s
+        self._clock = clock
+        self._failed_order_id = ""                 # a held order that timed out
+        self._failed_detail = ""
         self._started = False                      # True once the broker is connected
         self._never_started_raised = False          # tick()'s never-started diagnosis is one-shot
         self._mqtt = MqttClient(mqtt_host, mqtt_port, client_id=f"swarmada-{robot_id}")
@@ -86,9 +114,20 @@ class Vda5050Binding:
 
     def on_state(self, payload) -> None:
         snapshot = self._profile.parse_state(payload)  # latest-wins telemetry
-        with self._lock:
-            self._state = snapshot
-            self._has_state = True
+        with self._publish_lock:
+            with self._lock:
+                self._state = snapshot
+                self._has_state = True
+                self._states_seen += 1
+            self._service_hold()
+
+    def _service_hold(self) -> None:
+        """Send a held order whose wait is over, or time the hold out (:meth:`_take_held_locked`)."""
+        with self._publish_lock:
+            with self._lock:
+                release = self._take_held_locked()
+            if release is not None:
+                self._send_order(self._robot_id, *release)
 
     def on_factsheet(self, payload) -> None:
         info = self._profile.parse_factsheet(payload)  # capabilities self-description
@@ -157,12 +196,26 @@ class Vda5050Binding:
         """Build a VDA5050 order for the target and publish it (when connected).
         Without a broker the order is only cached, so the encoding is testable at $0.
 
+        **Preemption.** VDA5050 has a vehicle reject an order with a new orderId while an order
+        is active, unless it stitches onto that order's base. So when the vehicle may still
+        have an order (:meth:`_order_active_locked`), this sends a ``cancelOrder`` and holds
+        the new order. It goes out on the first ``state`` that shows the old order gone
+        (:meth:`_take_held_locked`), from the vehicle's position then. A second order while one
+        is held replaces it; the cancel already sent serves both, as does a stop's cancel still
+        in progress when the order comes. A stop or an estop drops it
+        (:meth:`_cancel_order`). If no such state comes within the preemption timeout, the
+        order is dropped and :meth:`task_state` answers FAILED, so the action ends rather than
+        running to its timeout on an orderId the vehicle never took; the adapter then commands a
+        stop, which cancels whatever is left of the order before.
+
         After an estop the vehicle is held in pause mode (:meth:`command_estop`). The first
-        order after it is preceded by a ``stopPause``. On a contract 1.4.0 connection the
-        adapter sends an order only once the stop is cleared (the stop latch refuses work until
-        then), so lifting the pause here is the clear taking effect. Below 1.4.0 there is no
-        latch: the next order the control plane sends lifts it, as the order after a
-        ``cancelOrder`` always drove.
+        order after it is preceded by a ``stopPause``, sent with the order itself (a held order
+        keeps the pause until it goes out), unless a Swarmada pause is in force
+        (:meth:`_send_order`). On a contract 1.4.0 connection the adapter sends an
+        order only once the stop is cleared (the stop latch refuses work until then), so
+        lifting the pause here is the clear taking effect. Below 1.4.0 there is no latch: the
+        next order the control plane sends lifts it, as the order after a ``cancelOrder``
+        always drove.
 
         VDA5050 2.0.0: stopPause "can also restart vehicles that were stopped with a hardware
         button that triggered startPause (if configured)", and a vehicle does not report which
@@ -170,17 +223,60 @@ class Vda5050Binding:
         pause is in force is released by this stopPause, once the stop is cleared. A pause
         pressed when this binding has none in force is refused work instead
         (:meth:`paused_at_vehicle`)."""
+        with self._publish_lock:
+            with self._lock:
+                self._order_seq += 1
+                order_id = f"{robot_id}-order-{self._order_seq}"
+                self._current_order_id = order_id
+                held = self._held is not None
+                preempt = held or self._order_active_locked()
+                if preempt:
+                    self._held = (order_id, x, y, yaw)
+                    self._pending_order = None
+                open_cancel = self._cancel_in_progress_locked()
+            if not preempt:
+                self._send_order(robot_id, order_id, x, y, yaw)
+                return
+            if held:
+                return  # the cancelOrder already sent ends the order this one waits on
+            cancel_id = open_cancel or self._send_cancel(robot_id, "preempt")
+            with self._lock:
+                self._held_cancel_id = cancel_id
+                self._held_deadline = self._clock() + self._preempt_timeout_s
+
+    def _cancel_in_progress_locked(self) -> str:
+        """The actionId of a stop's cancelOrder still in progress, or "". It ends the order as
+        well, and a second cancel would only be refused, with a noOrderToCancel warning. In
+        progress means the vehicle lists it as not ended, or no state has come since it was
+        sent. Not merely "not reported ended": a vehicle drops an ended instantAction from
+        its state after a few publishes, and a cancel taken as pending long after it ended
+        would leave every later preemption waiting on nothing. The caller holds the lock."""
+        cid = self._open_cancel_id
+        if cid and (cid in self._state.active_action_ids
+                    or self._states_seen == self._open_cancel_at):
+            return cid
+        return ""
+
+    def _send_order(self, robot_id: str, order_id: str, x: float, y: float, yaw: float) -> None:
+        """Publish the order now, with the start node at the vehicle's position now. The caller
+        holds the publish lock.
+
+        Before it: a ``stopPause`` if an estop paused the vehicle, unless a Swarmada pause is in
+        force. Then the pause stays: a ``startPause`` goes first instead, since a vehicle may
+        leave pause mode on a cancelOrder (vda-5050-lib's virtual AGV does), and only a
+        Swarmada resume lifts that pause."""
         with self._lock:
+            pause = self._pause_requested
             unpause = self._estop_paused
             self._estop_paused = False
-        if unpause:
+        if pause:  # before the estop's stopPause: a Swarmada pause stays
+            self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "pause")
+        elif unpause:
             self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
         with self._lock:
             start_pos, map_id = self._state.position, self._state.map_id
-            self._order_seq += 1
-            order_id = f"{robot_id}-order-{self._order_seq}"
-            self._current_order_id = order_id
             self._last_order_id = order_id
+            self._open_cancel_id = ""
             self._header_id += 1
             header_id = self._header_id
             self._holding = False  # a new order releases a prior stop-hold
@@ -196,6 +292,57 @@ class Vda5050Binding:
         if self._started:  # pragma: no cover — requires paho + a broker
             self._mqtt.publish(self._topics.order, payload)
 
+    def _order_active_locked(self) -> bool:
+        """True when the vehicle may still have an order a new one would be rejected behind:
+        its last ``state`` lists a node still to be reached or an action that has not ended,
+        or it does not yet report the last order this binding sent (that order may be on
+        its way). The caller holds the lock. False when the vehicle cannot be observed or has
+        reported no state: there is nothing to wait on then, and the order goes out as
+        before."""
+        if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
+            return False
+        st = self._state
+        if st.active_nodes or st.active_actions:
+            return True
+        return bool(self._last_order_id) and st.order_id != self._last_order_id
+
+    def _take_held_locked(self) -> tuple[str, float, float, float] | None:
+        """The held order, taken, when the last ``state`` shows the order before it gone; or
+        None. The caller holds both locks. Gone means the vehicle reports the preemption's
+        cancelOrder ended (FINISHED, or refused with an error naming it), with no node left,
+        no action that has not ended, and not driving. Only the cancel's own end counts, and
+        only the vehicle can report it, so no state that crossed the cancel on the way can
+        release the order. MQTT orders one client's messages per topic only; were the held
+        order to overtake its cancel on another topic, the cancel would end it.
+
+        A vehicle that does not list instantActions in its state (VDA5050 2.0.0 has it list
+        them) never reports the cancel ended: the hold times out and the action fails.
+
+        Also where the hold times out, on a state or on :meth:`tick`."""
+        if self._held is None:
+            return None
+        st = self._state
+        gone = (self._held_cancel_id in st.ended_actions
+                and not st.active_nodes and not st.active_actions and not st.driving)
+        if gone:
+            held, self._held, self._held_cancel_id = self._held, None, ""
+            return held
+        if self._clock() >= self._held_deadline:
+            order_id = self._held[0]
+            self._held, self._held_cancel_id = None, ""
+            self._open_cancel_id = ""  # not waited on again: the next preemption sends its own
+            self._failed_order_id = order_id
+            self._failed_detail = (
+                f"preempted, but the vehicle did not report its previous order ended within "
+                f"{self._preempt_timeout_s:g} s; order {order_id} was not sent")
+            print(f"vda5050: {self._failed_detail}", file=sys.stderr)
+        return None
+
+    def held_order(self, robot_id: str) -> str:
+        """The orderId of the order held for a preemption, or "" (test seam)."""
+        with self._lock:
+            return self._held[0] if self._held is not None else ""
+
     def pending_order(self, robot_id: str) -> str | None:
         """The last order JSON built by :meth:`command_move` (test seam)."""
         with self._lock:
@@ -206,7 +353,17 @@ class Vda5050Binding:
         latest robot ``state`` — the task-status stream source (C6.4)."""
         with self._lock:
             snapshot, order_id = self._state, self._current_order_id
+            if order_id and order_id == self._failed_order_id:
+                return task.TASK_FAILED  # a preempting order the vehicle never got
         return task.task_state_from_snapshot(snapshot, order_id)
+
+    def task_detail(self, robot_id: str) -> str:
+        """Why :meth:`task_state` answers FAILED for the current order, when this binding knows;
+        "" otherwise."""
+        with self._lock:
+            if self._current_order_id and self._current_order_id == self._failed_order_id:
+                return self._failed_detail
+            return ""
 
     def command_stop(self, robot_id: str) -> None:
         """Publish a VDA5050 ``cancelOrder`` instantAction (abort the active order +
@@ -217,31 +374,38 @@ class Vda5050Binding:
         Not sent when there is nothing to cancel (:meth:`_nothing_to_cancel_locked`): the
         vehicle would answer it with a ``noOrderToCancel`` warning, which the adapter reports
         as a degraded component. The hold is taken either way. An estop always sends it
-        (:meth:`command_estop`)."""
+        (:meth:`command_estop`). An order held for a preemption is dropped either way."""
         self._cancel_order(robot_id, always=False)
 
     def _cancel_order(self, robot_id: str, *, always: bool) -> None:
-        with self._lock:
-            if not always and self._nothing_to_cancel_locked():
+        with self._publish_lock:
+            with self._lock:
                 self._current_order_id = ""
                 self._pending_order = None
                 self._holding = True
-                self._suppressed_stops += 1
-                return
-            self._current_order_id = ""
-            self._pending_order = None
-            self._holding = True
-            self._action_seq += 1
-            self._header_id += 1
-            header_id, action_id = self._header_id, f"{robot_id}-stop-{self._action_seq}"
-        payload = self._profile.encode_instant_action(
-            header_id=header_id, action_type=profiles.ACTION_CANCEL_ORDER,
-            action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
-            timestamp=_now_iso())
-        with self._lock:
-            self._last_action = payload
-        if self._started:  # pragma: no cover — requires paho + a broker
-            self._mqtt.publish(self._topics.instant_actions, payload)
+                self._held, self._held_cancel_id = None, ""  # a stop ends a preemption too
+                if not always and self._nothing_to_cancel_locked():
+                    self._suppressed_stops += 1
+                    return
+            self._send_cancel(robot_id, "stop")
+
+    def _send_cancel(self, robot_id: str, tag: str) -> str:
+        """Publish a ``cancelOrder`` and return its actionId."""
+        with self._publish_lock:
+            with self._lock:
+                self._action_seq += 1
+                self._header_id += 1
+                header_id, action_id = self._header_id, f"{robot_id}-{tag}-{self._action_seq}"
+            payload = self._profile.encode_instant_action(
+                header_id=header_id, action_type=profiles.ACTION_CANCEL_ORDER,
+                action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
+                timestamp=_now_iso())
+            with self._lock:
+                self._last_action = payload
+                self._open_cancel_id, self._open_cancel_at = action_id, self._states_seen
+            if self._started:  # pragma: no cover — requires paho + a broker
+                self._mqtt.publish(self._topics.instant_actions, payload)
+            return action_id
 
     def command_estop(self, robot_id: str) -> None:
         """An emergency stop: ``startPause``, then ``cancelOrder``.
@@ -253,14 +417,18 @@ class Vda5050Binding:
         The vehicle stays paused until the next order (:meth:`command_move`).
 
         Never pause alone: a paused order is work the vehicle can resume. A REQUEST, as
-        :meth:`command_stop` is; rest is confirmed only by :meth:`is_stopped`."""
-        with self._lock:
-            self._estop_paused = True
-        self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "estop-pause")
-        # Always, even when the last state shows nothing to cancel: that state can be up to a
-        # publish interval old, and a paused order the cancel missed would be resumed by the
-        # next stopPause. A noOrderToCancel warning is the price of a stop.
-        self._cancel_order(robot_id, always=True)
+        :meth:`command_stop` is; rest is confirmed only by :meth:`is_stopped`.
+
+        Under the publish lock, so an order held for a preemption goes out before both or not
+        at all (the cancel drops it)."""
+        with self._publish_lock:
+            with self._lock:
+                self._estop_paused = True
+            self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "estop-pause")
+            # Always, even when the last state shows nothing to cancel: that state can be up to
+            # a publish interval old, and a paused order the cancel missed would be resumed by
+            # the next stopPause. A noOrderToCancel warning is the price of a stop.
+            self._cancel_order(robot_id, always=True)
 
     def _nothing_to_cancel_locked(self) -> bool:
         """True only when a ``cancelOrder`` can change nothing, read from the vehicle's own
@@ -322,18 +490,19 @@ class Vda5050Binding:
         self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
 
     def _publish_action(self, robot_id: str, action_type: str, tag: str) -> None:
-        with self._lock:
-            self._action_seq += 1
-            self._header_id += 1
-            header_id, action_id = self._header_id, f"{robot_id}-{tag}-{self._action_seq}"
-        payload = self._profile.encode_instant_action(
-            header_id=header_id, action_type=action_type,
-            action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
-            timestamp=_now_iso())
-        with self._lock:
-            self._last_action = payload
-        if self._started:  # pragma: no cover — requires paho + a broker
-            self._mqtt.publish(self._topics.instant_actions, payload)
+        with self._publish_lock:
+            with self._lock:
+                self._action_seq += 1
+                self._header_id += 1
+                header_id, action_id = self._header_id, f"{robot_id}-{tag}-{self._action_seq}"
+            payload = self._profile.encode_instant_action(
+                header_id=header_id, action_type=action_type,
+                action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
+                timestamp=_now_iso())
+            with self._lock:
+                self._last_action = payload
+            if self._started:  # pragma: no cover — requires paho + a broker
+                self._mqtt.publish(self._topics.instant_actions, payload)
 
     def last_action(self, robot_id: str) -> str | None:
         """The last instantAction JSON built by :meth:`command_stop` / pause / resume
@@ -366,6 +535,7 @@ class Vda5050Binding:
         cycle. Raising would turn a robot state the protocol has a field for into an
         exception. Never-started has no field, no message and no failed operation to raise
         from, which is exactly why it needs one."""
+        self._service_hold()  # a preemption that has waited too long times out here too
         with self._lock:
             report = not self._started and not self._never_started_raised
             if report:

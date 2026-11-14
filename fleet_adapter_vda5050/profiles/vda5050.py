@@ -108,6 +108,8 @@ class Vda5050Profile:
             order_update_id=int(_num(obj.get("orderUpdateId")) or 0),
             active_nodes=len(node_states) if isinstance(node_states, list) else 0,
             active_actions=_active_actions(obj.get("actionStates")),
+            ended_actions=_ended_actions(obj.get("actionStates"), obj.get("errors")),
+            active_action_ids=_active_action_ids(obj.get("actionStates")),
             paused=obj.get("paused") is True,
             map_id=str(ap.get("mapId", "")) if isinstance(ap, dict) else "",
         )
@@ -279,6 +281,43 @@ def _active_actions(states) -> int:
         return 1
     return sum(1 for st in states
                if not isinstance(st, dict) or st.get("actionStatus") in _ACTION_NOT_ENDED)
+
+
+def _active_action_ids(states) -> frozenset[str]:
+    """The actionIds ``actionStates`` lists as not ended."""
+    if not isinstance(states, list):
+        return frozenset()
+    return frozenset(st["actionId"] for st in states
+                     if isinstance(st, dict) and st.get("actionStatus") in _ACTION_NOT_ENDED
+                     and isinstance(st.get("actionId"), str))
+
+
+# actionStatus values of an action that has ended.
+_ACTION_ENDED = frozenset({"FINISHED", "FAILED"})
+
+
+def _ended_actions(states, errors) -> frozenset[str]:
+    """The actionIds that have ended: listed in ``actionStates`` as FINISHED or FAILED, or named
+    by an ``actionId`` error reference. VDA5050 2.0.0 (6.6.3.2): a cancelOrder with no order to
+    cancel "must report as failed", with a noOrderToCancel error whose references carry the
+    actionId, and a vehicle may report only the error. The ids are read here and go no further
+    than the binding; the references stay off the control plane (see :func:`_hardware`)."""
+    out: set[str] = set()
+    if isinstance(states, list):
+        for st in states:
+            if (isinstance(st, dict) and st.get("actionStatus") in _ACTION_ENDED
+                    and isinstance(st.get("actionId"), str)):
+                out.add(st["actionId"])
+    if isinstance(errors, list):
+        for e in errors:
+            refs = e.get("errorReferences") if isinstance(e, dict) else None
+            if not isinstance(refs, list):
+                continue
+            for r in refs:
+                if (isinstance(r, dict) and r.get("referenceKey") == "actionId"
+                        and isinstance(r.get("referenceValue"), str)):
+                    out.add(r["referenceValue"])
+    return frozenset(out)
 
 
 def _phase(obj: dict) -> str:
