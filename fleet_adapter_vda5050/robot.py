@@ -140,6 +140,11 @@ class RobotBinding(Protocol):
     def command_resume(self, robot_id: str) -> None:
         """Resume a paused robot (VDA5050 stopPause)."""
 
+    def paused_at_vehicle(self, robot_id: str) -> bool:
+        """True when the robot reports a pause this binding did not set (a button on the
+        vehicle, say): the adapter then refuses work, ROBOT_UNAVAILABLE. A binding whose robot
+        has no pause of its own answers False."""
+
     def tick(self, dt: float) -> None:
         """Advance any internal model by dt seconds (no-op for a real robot)."""
 
@@ -230,6 +235,9 @@ class SimulatedRobot:
 
     def command_resume(self, robot_id: str) -> None:
         self._moving[robot_id] = True   # stopPause resumes the held order
+
+    def paused_at_vehicle(self, robot_id: str) -> bool:
+        return False  # the simulated vehicle has no pause button
 
     def tick(self, dt: float) -> None:
         self._elapsed += dt  # advance the scenario clock
