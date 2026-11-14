@@ -190,14 +190,19 @@ class fleet_adapter_vda5050Adapter:
 
     # ── ControlStream ────────────────────────────────────────────────────────
 
-    def _control_requests(self) -> Iterator:
+    def _control_requests(self, outbox: queue.Queue | None = None) -> Iterator:
+        """The session's requests: the hello, then what is put on ITS outbox. The outbox is
+        bound when the session opens, so a dying session's generator cannot take a message
+        put on the next session's outbox (a lost RegisterRobot, C2.4)."""
         pb = self._pb
+        if outbox is None:
+            outbox = self._outbox
         yield pb.AdapterMessage(hello=pb.AdapterHello(  # C1.2
             vendor="vda5050", adapter_version="0.1.0",
             protocol_version="fleet_adapter.v1", contract_version=CONTRACT_VERSION,
             namespace=self._namespace))
         while True:
-            msg = self._outbox.get()
+            msg = outbox.get()
             if msg is None:
                 return
             yield msg
@@ -259,9 +264,10 @@ class fleet_adapter_vda5050Adapter:
                     # with a shared queue it swallows the RegisterRobot the NEW session
                     # enqueues on hello_ack, so the control plane never sees the
                     # re-registration §9.2.5(b) requires.
-                    self._outbox = queue.Queue()
+                    outbox: queue.Queue = queue.Queue()
+                    self._outbox = outbox
                     self._latch.new_control_stream(self._robot_id)
-                    for cp in stub.ControlStream(self._control_requests()):
+                    for cp in stub.ControlStream(self._control_requests(outbox)):
                         self._handle_control_plane(cp, stub)
                 except grpc.RpcError as exc:
                     if self._shutdown.is_set():
@@ -278,8 +284,12 @@ class fleet_adapter_vda5050Adapter:
         # persisted fencing/lease state (C3/C4) across the outage.
         while not self._shutdown.is_set():
             self._reconnect_pending = False
+            # A fresh outbox per session, as above: what the dropped session left queued is
+            # not sent ahead of the new session's RegisterRobot.
+            outbox = queue.Queue()
+            self._outbox = outbox
             self._latch.new_control_stream(self._robot_id)
-            call = stub.ControlStream(self._control_requests())
+            call = stub.ControlStream(self._control_requests(outbox))
             self._active_call = call
             try:
                 for cp in call:
