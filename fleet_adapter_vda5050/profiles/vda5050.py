@@ -107,6 +107,7 @@ class Vda5050Profile:
             order_id=str(obj.get("orderId", "")),
             order_update_id=int(_num(obj.get("orderUpdateId")) or 0),
             active_nodes=len(node_states) if isinstance(node_states, list) else 0,
+            active_actions=_active_actions(obj.get("actionStates")),
             map_id=str(ap.get("mapId", "")) if isinstance(ap, dict) else "",
         )
 
@@ -262,6 +263,21 @@ def _velocity(vel) -> tuple[float, float]:
     vx, vy = _num(vel.get("vx")) or 0.0, _num(vel.get("vy")) or 0.0
     omega = _num(vel.get("omega")) or 0.0
     return (math.hypot(vx, vy), abs(omega))
+
+
+# actionStatus values of an action that has not ended (VDA5050 2.0.0, actionStates).
+_ACTION_NOT_ENDED = frozenset({"WAITING", "INITIALIZING", "RUNNING", "PAUSED"})
+
+
+def _active_actions(states) -> int:
+    """How many ``actionStates`` have not ended. A malformed list counts as one, so a state
+    the profile cannot read never looks like a vehicle with nothing to cancel."""
+    if states is None:
+        return 0
+    if not isinstance(states, list):
+        return 1
+    return sum(1 for st in states
+               if not isinstance(st, dict) or st.get("actionStatus") in _ACTION_NOT_ENDED)
 
 
 def _phase(obj: dict) -> str:
