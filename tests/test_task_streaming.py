@@ -35,9 +35,13 @@ class _Binding:
 
     def __init__(self, state: str) -> None:
         self._state = state
+        self.stops = 0
 
     def task_state(self, robot_id: str) -> str:
         return self._state
+
+    def command_stop(self, robot_id: str) -> None:
+        self.stops += 1
 
 
 def _adapter(binding) -> Adapter:
@@ -64,6 +68,7 @@ def test_streams_succeeded_once_then_clears() -> None:
     assert upd.action_id == "t1" and upd.state == _Pb.ACTION_STATE_SUCCEEDED
     assert upd.progress_pct == 100 and upd.fencing_token == 5  # C6.4 token echoed
     assert a._current_action == ""  # terminal → task cleared
+    assert a._robot.stops == 0      # a finished order needs no stop
 
     # A second poll must not re-emit (the task is done).
     a._maybe_emit_task_progress()
@@ -78,6 +83,7 @@ def test_streams_failed() -> None:
     a._maybe_emit_task_progress()
     msgs = _drain(a._outbox)
     assert msgs[0].action_status.state == _Pb.ACTION_STATE_FAILED
+    assert a._robot.stops == 1  # nothing of a failed action goes on
 
 
 def test_running_is_not_streamed() -> None:

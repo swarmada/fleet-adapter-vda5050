@@ -130,6 +130,34 @@ Safety is **never faked**: `is_stopped` is CONFIRMED from the robot's `state`
   triggered startPause (if configured)". Whoever clears the stop clears it for the
   vehicle as it stands.
 
+### A new order while the vehicle has one
+
+A VDA 5050 vehicle rejects an order with a new `orderId` while an order is active, unless
+the new order extends the active order's base. So when work replaces work in place (a
+higher-priority action preempting a running one), the adapter does not send the new order
+at once:
+
+- It sends `cancelOrder` and holds the new order. The vehicle "may still have an order"
+  when its last `state` lists a node or an action that has not ended, or does not yet
+  report the last order the adapter sent.
+- The held order goes out once the vehicle reports that cancel ended (`FINISHED`, or
+  refused with a `noOrderToCancel` error naming it), with no node and no action left and
+  not driving. It starts from where the vehicle stopped. Only the cancel's own end counts:
+  MQTT keeps one client's messages in order per topic only, and an order that overtook its
+  cancel would be ended by it.
+- A cancel from a stop is waited on while the vehicle lists it as running, or before any
+  `state` since it was sent. Otherwise the preemption sends its own.
+- A second order while one is held replaces it. A stop or an emergency stop drops it.
+- After an emergency stop, the `stopPause` goes out with the held order, not before. While
+  a Swarmada pause is in force, the order goes out with a `startPause` instead, and only a
+  Swarmada resume lifts the pause. Some vehicles leave pause mode on a `cancelOrder`.
+- If the cancel is not reported ended within 60 seconds, the order is dropped and its
+  action ends `FAILED`, with the reason in its message. A vehicle that does not list
+  instant actions in its `state` ends here.
+- When an action ends `FAILED`, the adapter stops the vehicle: a held order is dropped,
+  and what is left of the order before it is cancelled. No `cancelOrder` is sent when the
+  vehicle shows nothing to cancel.
+
 ## Development
 
 ```bash

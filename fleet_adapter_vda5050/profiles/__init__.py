@@ -104,6 +104,12 @@ class StateSnapshot:
     # actionStates not yet ended (WAITING, INITIALIZING, RUNNING or PAUSED): work the vehicle
     # can still do or resume, which a cancelOrder would cancel.
     active_actions: int = 0
+    # actionIds the vehicle reports ended (FINISHED or FAILED), or named in an error's
+    # references: an instantAction it refused, such as a cancelOrder with no order to cancel.
+    # Read inside the adapter only; never sent to the control plane.
+    ended_actions: frozenset[str] = frozenset()
+    # actionIds listed as not ended (the ids behind active_actions). Inside the adapter only.
+    active_action_ids: frozenset[str] = frozenset()
     # The vehicle reports it is in pause mode (VDA5050 state.paused): by a startPause, or by a
     # button on the vehicle. VDA5050 does not say which.
     paused: bool = False

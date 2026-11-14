@@ -975,8 +975,10 @@ class fleet_adapter_vda5050Adapter:
         action = self._current_action
         if not action or not hasattr(self._robot, "task_state"):
             return
+        detail = getattr(self._robot, "task_detail", None)  # why it failed, if the binding knows
         with self._robot_lock:
             state = self._robot.task_state(self._robot_id)
+            message = detail(self._robot_id) if detail is not None else ""
         if state not in (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED):
             return
         with self._action_lock:
@@ -984,12 +986,18 @@ class fleet_adapter_vda5050Adapter:
                 return  # ended or replaced meanwhile: the state read was not this action's
             token = self._current_fencing_token
             self._take_current()             # terminal: the order is complete/failed
+            if state == task_map.TASK_FAILED:
+                # Nothing of a failed action may go on: the order before a preemption that timed
+                # out, or a held order still to go out, would run with no action and no lease.
+                # Not sent when the vehicle shows nothing to cancel.
+                with self._robot_lock:
+                    self._robot.command_stop(self._robot_id)
             # The lease ends with the action. Left running, it lapsed some 30 s later and the
             # self-stop sent the idle vehicle a cancelOrder it answered with a warning.
             self._lease.release(self._robot_id)
             self._emit_action_status(
                 action, state, token,
-                progress_pct=100 if state == task_map.TASK_SUCCEEDED else 0)
+                progress_pct=100 if state == task_map.TASK_SUCCEEDED else 0, message=message)
 
     # ── Scenario mapping (proto only; schedule/state live on the binding) ────────
 
