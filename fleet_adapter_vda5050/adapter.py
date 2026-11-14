@@ -49,6 +49,17 @@ _TELEMETRY_INTERVAL = 0.2
 # so a long gap (a suspended host) is not driven through in one step.
 _MAX_TICK_S = 5.0
 
+# The provisioning loop (C2.1; RFC-0001 #fleet-adapter-protocol-connection-lifecycle). A register
+# refused NOT_ADMITTED is answered by announcing the robot (discover), and register is sent again
+# every interval I until it is accepted. The DiscoverAck's ttl_seconds sets I = min(ttl/2, 300);
+# with no TTL, I is 60 s. The loop waits this long for the DiscoverAck before it picks I.
+_PROVISIONING_INTERVAL_S = 60.0
+_DISCOVER_ACK_WAIT_S = 5.0
+
+
+def _provisioning_interval(ttl_seconds: int) -> float:
+    return min(ttl_seconds / 2.0, 300.0) if ttl_seconds > 0 else _PROVISIONING_INTERVAL_S
+
 
 # The fleet-adapter CONTRACT version this adapter implements (ADR-0032). Distinct from
 # adapter_version (this build) and protocol_version (the wire package identity, not a semver, which
@@ -168,6 +179,17 @@ class fleet_adapter_vda5050Adapter:
         self._action_tokens: dict[str, int] = {}
         self._shutdown = threading.Event()
         self._telemetry_started = False
+        # True only between an ACCEPTED RegisterAck and the end of that ControlStream session.
+        # A robot whose registration was refused, or not yet answered, is not under management
+        # on this session, and no work is accepted for it (C13.2).
+        self._registered = False
+        # The ControlStream session, counted. The provisioning loop registers again only on the
+        # session that was refused; a newer session registers on its own (C2.4).
+        self._session = 0
+        # The provisioning loop: the latest DiscoverAck's ttl_seconds, and an event set when a
+        # DiscoverAck arrives, which the loop waits on before it picks its interval.
+        self._discover_ttl = 0
+        self._discover_acked = threading.Event()
         # C6.1: the first TelemetryPayload on any (re)connect must be a FULL
         # snapshot, not a resumed delta — otherwise a reconnected control plane
         # inherits a stale hardware picture it cannot detect.
@@ -266,7 +288,7 @@ class fleet_adapter_vda5050Adapter:
                     # re-registration §9.2.5(b) requires.
                     outbox: queue.Queue = queue.Queue()
                     self._outbox = outbox
-                    self._latch.new_control_stream(self._robot_id)
+                    self._new_session()
                     for cp in stub.ControlStream(self._control_requests(outbox)):
                         self._handle_control_plane(cp, stub)
                 except grpc.RpcError as exc:
@@ -288,7 +310,7 @@ class fleet_adapter_vda5050Adapter:
             # not sent ahead of the new session's RegisterRobot.
             outbox = queue.Queue()
             self._outbox = outbox
-            self._latch.new_control_stream(self._robot_id)
+            self._new_session()
             call = stub.ControlStream(self._control_requests(outbox))
             self._active_call = call
             try:
@@ -305,6 +327,12 @@ class fleet_adapter_vda5050Adapter:
             self._await_reconnect()
         self._shutdown.set()
 
+    def _new_session(self) -> None:
+        """A ControlStream session opens: nothing is registered on it yet."""
+        self._session += 1
+        self._registered = False
+        self._latch.new_control_stream(self._robot_id)
+
     def _handle_control_plane(self, cp, stub) -> None:
         pb = self._pb
         kind = cp.WhichOneof("payload")
@@ -314,13 +342,23 @@ class fleet_adapter_vda5050Adapter:
             self._negotiated = cp.hello_ack.negotiated_contract_version
             self._outbox.put(pb.AdapterMessage(  # C2.1: register
                 register=pb.RegisterRobot(robot_id=self._robot_id)))
-            self._send_capabilities_snapshot()  # C12.2: the catalog, and any hardware manifest
             # A fresh ControlStream: the next payload must be a full snapshot (C6.1).
             self._snapshot_pending = True
             if not self._telemetry_started:  # C6: stream telemetry once registered
                 self._telemetry_started = True
                 threading.Thread(target=self._telemetry_loop, args=(stub,), daemon=True).start()
         elif kind == "register_ack":
+            ack = cp.register_ack
+            if not ack.accepted:
+                self._on_register_refused(ack)
+                return
+            self._registered = True
+            # Registered: the catalog, and any hardware manifest (C12.2), and a full snapshot
+            # next (C6.1). Sent here rather than at the hello, because a robot admitted through
+            # the provisioning loop had no Robot when the hello came, and what was sent for it
+            # then was not kept.
+            self._send_capabilities_snapshot()
+            self._snapshot_pending = True
             for e in cp.register_ack.edge_endpoints:  # C8.1: dial each advertised edge node
                 self._edge_addr.put(e.address)
             # C2.3 — adopt the per-robot cadence the control plane returned. Only a
@@ -333,6 +371,13 @@ class fleet_adapter_vda5050Adapter:
                 self._telemetry_interval = max(1.0, min(30.0, float(secs)))
             self._reconcile_action_state(cp.register_ack)
             self._send_retained()
+        elif kind == "discover_ack":
+            # Announced. The robot is not under management until a register is accepted.
+            da = cp.discover_ack
+            if not da.accepted:
+                print(f"announce refused robot={self._robot_id}: {da.message}", file=sys.stderr)
+            self._discover_ttl = da.ttl_seconds
+            self._discover_acked.set()
         elif kind == "outcome_ack":
             oa = cp.outcome_ack
             if self._retained.acknowledge(self._robot_id, oa.action_id, oa.fencing_token):
@@ -342,6 +387,50 @@ class fleet_adapter_vda5050Adapter:
                 heartbeat=pb.HeartbeatResponse(robot_id=cp.heartbeat.robot_id)))
         elif kind == "command":
             self._handle_command(cp.command)
+
+    def _on_register_refused(self, ack) -> None:
+        """A refused register (RFC-0001 #fleet-adapter-protocol-the-stop-latch, "A refused
+        register"): the robot is not under management on this session, so the work held for it
+        is stopped as interrupted work and no new work is accepted (C13.2). Telemetry and the
+        SafetyStream carry on; an estop is honoured regardless (C14.1).
+
+        Only NOT_ADMITTED -- no Robot exists for this robot yet -- is answered by announcing it
+        (discover) and registering again each provisioning interval (C2.1). Any other refusal
+        is not: announcing would be reaching for a robot the control plane said this adapter
+        may not touch."""
+        pb = self._pb
+        self._registered = False
+        self._interrupt_current("registration refused")
+        if ack.rejection != pb.REGISTRATION_REJECTION_NOT_ADMITTED:
+            # By number when this build does not know the code: proto3 enums are open, and a
+            # name lookup that raised here would end the control stream and the process.
+            code = (pb.RegistrationRejection.Name(ack.rejection)
+                    if ack.rejection in pb.RegistrationRejection.values() else ack.rejection)
+            print(f"register refused robot={self._robot_id} ({code}): {ack.message}",
+                  file=sys.stderr)
+            return
+        self._discover_acked.clear()
+        self._outbox.put(pb.AdapterMessage(discover=pb.DiscoverRobot(
+            robot_id=self._robot_id, hardware=self._capability_components())))
+        threading.Thread(target=self._provisioning_iteration,
+                         args=(self._session, self._outbox), daemon=True).start()
+        print(f"NOT_ADMITTED robot={self._robot_id}; announced for operator admission (C2.1)",
+              file=sys.stderr)
+
+    def _provisioning_iteration(self, session: int, outbox: queue.Queue) -> None:
+        """Register again after the provisioning interval, on the session that was refused.
+
+        The interval is the DiscoverAck's (min(ttl/2, 300)), or 60 s when none arrives with a
+        TTL. A session that has been replaced, or a robot admitted meanwhile, ends the loop: the
+        new session registers on its own. A register refused NOT_ADMITTED again starts the next
+        iteration."""
+        self._discover_acked.wait(_DISCOVER_ACK_WAIT_S)
+        if self._shutdown.wait(_provisioning_interval(self._discover_ttl)):
+            return
+        if self._registered or session != self._session:
+            return
+        outbox.put(self._pb.AdapterMessage(
+            register=self._pb.RegisterRobot(robot_id=self._robot_id)))
 
     def _handle_command(self, command) -> None:
         pb = self._pb
@@ -442,6 +531,14 @@ class fleet_adapter_vda5050Adapter:
         if decision is FenceDecision.STALE:
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_STALE_FENCING_TOKEN))
+            return
+        # C13.2: a robot not under management on this session (its registration refused, or
+        # not yet accepted) runs no work. After the fencing branches, so a stale token is still
+        # refused STALE.
+        if not self._registered:
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
+                message="this robot's registration was not accepted on this session"))
             return
         # After the fencing branches on purpose: a superseded command is refused STALE, so
         # the control plane learns its assignment lost rather than a reason it never lost for.

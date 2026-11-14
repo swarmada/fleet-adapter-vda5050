@@ -16,6 +16,8 @@ retained outcome of #fleet-adapter-protocol-reconnect-action-state-reconciliatio
 
 from __future__ import annotations
 
+from conftest import mark_registered
+
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
 from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapter
@@ -45,7 +47,7 @@ def _adapter(contract: str = "1.4.0", state_dir=None) -> Adapter:
     a._handle_control_plane(pb.ControlPlaneMessage(hello_ack=pb.HelloAck(
         accepted=True, negotiated_contract_version=contract)), None)
     _drain(a._outbox)
-    return a
+    return mark_registered(a)
 
 
 def _drain(q) -> list:
