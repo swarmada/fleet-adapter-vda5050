@@ -10,6 +10,7 @@ ran until its lease lapsed. It moves at 0.5 m/s, the speed the conformance fixtu
 from __future__ import annotations
 
 import pytest
+from conftest import mark_registered
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
@@ -62,7 +63,7 @@ def test_a_pause_holds_and_a_resume_carries_on() -> None:
 
 def test_the_adapter_reports_the_order_succeeded_once_and_clears_it() -> None:
     r = _robot()
-    a = Adapter(pb, None, r, ROBOT)
+    a = mark_registered(Adapter(pb, None, r, ROBOT))
     res = pb.CommandResult()
     a._on_assign(pb.AssignAction(action_id="act-1", action_type=adapter_mod.ACTION_NAVIGATE,
                                  fencing_token=5, assignment_id="as-5",

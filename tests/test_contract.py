@@ -7,6 +7,8 @@ honour (C17), and the authoritative action state a RegisterAck hands it (C2.2, C
 
 from __future__ import annotations
 
+from conftest import mark_registered
+
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
 from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapter
@@ -19,7 +21,7 @@ ROBOT = "amr-1"
 def _adapter() -> Adapter:
     robot = SimulatedRobot()
     robot.spawn(ROBOT)
-    return Adapter(pb, None, robot, ROBOT)
+    return mark_registered(Adapter(pb, None, robot, ROBOT))
 
 
 def _drain(q) -> list:

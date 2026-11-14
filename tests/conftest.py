@@ -65,3 +65,19 @@ def mark_transport_live(binding):
     binding._connection = profiles.CONN_ONLINE
     binding.published = published
     return binding
+
+
+# ── "the robot is registered on this session" fixture ───────────────────────
+
+def mark_registered(adapter):
+    """Put ``adapter`` in the state an ACCEPTED RegisterAck leaves it in, and return it.
+
+    Work is accepted only for a robot whose registration was accepted on the current
+    ControlStream session (C13.2), so a unit test that assigns work to an adapter it built
+    by hand has to say the robot is registered. This sets that one flag and nothing else:
+    an accepted RegisterAck also reconciles the action state and re-sends a retained
+    outcome, which tests of those paths drive through ``_handle_control_plane`` themselves.
+    The registration paths are tested in test_provisioning.py.
+    """
+    adapter._registered = True
+    return adapter
