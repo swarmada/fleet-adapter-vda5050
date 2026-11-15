@@ -302,14 +302,16 @@ _ACTION_NOT_ENDED = frozenset({"WAITING", "INITIALIZING", "RUNNING", "PAUSED"})
 
 
 def _active_actions(states) -> int:
-    """How many ``actionStates`` have not ended. A malformed list counts as one, so a state
-    the profile cannot read never looks like a vehicle with nothing to cancel."""
+    """How many ``actionStates`` have not ended: any entry not reported FINISHED or FAILED.
+    An entry with no actionStatus, or one this profile does not know (say, lowercase), is
+    not taken as ended, so a state the profile cannot read never looks like a vehicle with
+    nothing to cancel. A malformed list counts as one."""
     if states is None:
         return 0
     if not isinstance(states, list):
         return 1
     return sum(1 for st in states
-               if not isinstance(st, dict) or st.get("actionStatus") in _ACTION_NOT_ENDED)
+               if not isinstance(st, dict) or st.get("actionStatus") not in _ACTION_ENDED)
 
 
 # Lengths the vehicle's own words are cut to, after control characters are stripped.

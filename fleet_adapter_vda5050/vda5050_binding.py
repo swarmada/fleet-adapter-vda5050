@@ -109,6 +109,7 @@ class Vda5050Binding:
         self._recent_states: deque[tuple[int, str]] = deque(maxlen=_STATE_DEDUP_WINDOW)
         self._unidentified_reported = False        # a state with no headerId or timestamp, logged once
         self._repeat_reported = False              # a dropped repeat, logged once
+        self._lists_missing_reported = False       # a state without nodeStates or actionStates, logged once
         # The actionId of this binding's latest startPause, until a stopPause goes out: its
         # FINISHED confirms the pause (:meth:`is_stopped`).
         self._start_pause_id = ""
@@ -172,6 +173,7 @@ class Vda5050Binding:
         key = ((snapshot.header_id, snapshot.timestamp)
                if snapshot.header_id is not None and snapshot.timestamp else None)
         report = warn = False
+        missing: list[str] = []
         with self._publish_lock:
             with self._lock:
                 repeat = key is not None and key in self._recent_states
@@ -193,6 +195,11 @@ class Vda5050Binding:
                             self._pause_acked = True
                     elif not self._unidentified_reported:
                         self._unidentified_reported = report = True
+                    if not snapshot.lists_reported and not self._lists_missing_reported:
+                        self._lists_missing_reported = True
+                        missing = [name for name, ok in (
+                            ("nodeStates", snapshot.node_states_reported),
+                            ("actionStates", snapshot.action_states_reported)) if not ok]
             if repeat:
                 if warn:
                     print(f"vda5050: warning: a state with headerId {key[0]} and timestamp "
@@ -201,6 +208,13 @@ class Vda5050Binding:
                           "for two different states loses the second. Logged once.",
                           file=sys.stderr)
                 return
+            if missing:
+                print(f"vda5050: error: a state from the vehicle has no {' or '.join(missing)} "
+                      "list (or is not a VDA 5050 state at all), so what it has left to do is "
+                      "unknown. Until a state has both "
+                      "lists, every stop sends its cancelOrder, an order waits behind a cancel "
+                      "for a state with both (and fails when its hold times out), and no task "
+                      "is marked done. Logged once.", file=sys.stderr)
             if report:
                 print("vda5050: error: a state from the vehicle has no integer headerId or no "
                       "timestamp, so a redelivered state cannot be told from a new one. Such "
@@ -225,7 +239,8 @@ class Vda5050Binding:
         has reported that cancel ended (FINISHED, FAILED, or refused by an error naming it;
         kept once seen, since a vehicle drops an ended instantAction from its state after a few
         publishes); and it now reports the last order sent as its own, with a node or an action
-        left. Sends a cancelOrder.
+        left, or without a nodeStates or actionStates list (unknown is not nothing left). Sends
+        a cancelOrder.
 
         How it happens: the cancel reached the vehicle before the order (MQTT orders one
         client's messages per topic only) and found nothing to cancel; or the vehicle rejected
@@ -241,7 +256,7 @@ class Vda5050Binding:
                     self._stop_cancel_ended = True
                 late = (self._holding and self._stop_cancel_ended and not self._recancelled
                         and self._held is None and bool(last) and st.order_id == last
-                        and bool(st.active_nodes or st.active_actions))
+                        and not st.nothing_left)  # a missing list: work may be left
                 if late:
                     self._recancelled = True
             if late:
@@ -545,14 +560,16 @@ class Vda5050Binding:
     def _order_active_locked(self) -> bool:
         """True when the vehicle may still have an order a new one would be rejected behind:
         its last ``state`` lists a node still to be reached or an action that has not ended,
-        or it does not yet report the last order this binding sent (that order may be on
-        its way) and has not reported rejecting it. The caller holds the lock. False when the vehicle cannot be observed or has
+        or leaves out its nodeStates or actionStates list (what is left is unknown), or it
+        does not yet report the last order this binding sent (that order may be on its way)
+        and has not reported rejecting it. The caller holds the lock. False when the vehicle
+        cannot be observed or has
         reported no state: there is nothing to wait on then, and the order goes out as
         before."""
         if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
             return False
         st = self._state
-        if st.active_nodes or st.active_actions:
+        if not st.nothing_left:  # a node, an action not ended, or a list not reported
             return True
         return (bool(self._last_order_id) and st.order_id != self._last_order_id
                 and not self._rejected_locked(self._last_order_id))
@@ -581,8 +598,8 @@ class Vda5050Binding:
     def _take_held_locked(self) -> tuple[str, float, float, float] | None:
         """The held order, taken, when the last ``state`` shows the order before it gone; or
         None. The caller holds both locks. Gone means the vehicle reports the preemption's
-        cancelOrder ended (FINISHED, or refused with an error naming it), with no node left,
-        no action that has not ended, and not driving. Only the cancel's own end counts, and
+        cancelOrder ended (FINISHED, or refused with an error naming it), with both lists
+        reported, no node left, no action that has not ended, and not driving. Only the cancel's own end counts, and
         only the vehicle can report it, so no state that crossed the cancel on the way can
         release the order. MQTT orders one client's messages per topic only; were the held
         order to overtake its cancel on another topic, the cancel would end it.
@@ -595,7 +612,7 @@ class Vda5050Binding:
             return None
         st = self._state
         gone = (self._held_cancel_id in st.ended_actions
-                and not st.active_nodes and not st.active_actions and not st.driving)
+                and st.nothing_left and not st.driving)
         if gone:
             held, self._held, self._held_cancel_id = self._held, None, ""
             return held
@@ -723,9 +740,10 @@ class Vda5050Binding:
           a ``state``;
         * that state is at rest (not driving, velocity within noise) -- never a skip while
           the vehicle may be moving;
-        * it lists no node still to be reached, so no order is in progress on it, and no
-          action that has not ended (an action can run, or wait to resume, at rest on the
-          last node, and a cancelOrder cancels it);
+        * it carries both lists (``StateSnapshot.nothing_left``: a list left out is unknown,
+          not empty), and lists no node still to be reached, so no order is in progress on
+          it, and no action that has not ended (an action can run, or wait to resume, at rest
+          on the last node, and a cancelOrder cancels it);
         * and no order this binding published is still outstanding: none was ever sent, or
           the vehicle reports the last one sent, ended. A stop does not end it here: an order
           is outstanding until the vehicle says so, so a cancelOrder that crossed the order on
@@ -738,7 +756,7 @@ class Vda5050Binding:
         st = self._state
         linear, angular = st.velocity
         at_rest = (not st.driving) and linear <= _EPS_LINEAR and angular <= _EPS_ANGULAR
-        if not at_rest or st.active_nodes or st.active_actions:
+        if not at_rest or not st.nothing_left:  # a list not reported is not "nothing"
             return False
         return not self._last_order_id or st.order_id == self._last_order_id
 
@@ -840,8 +858,7 @@ class Vda5050Binding:
             return False
         if st.paused or (bool(pause_id) and pause_id in st.finished_actions):
             return True
-        return (acked and st.node_states_reported and st.action_states_reported
-                and not st.active_nodes and not st.active_actions
+        return (acked and st.nothing_left
                 and st.operating_mode in _ORDER_DRIVEN_MODES
                 and (not last_order or st.order_id == last_order))
 

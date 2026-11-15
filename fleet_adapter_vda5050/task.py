@@ -94,13 +94,15 @@ def task_state_from_snapshot(snapshot: StateSnapshot, current_order_id: str) -> 
 
     * a FATAL error (phase ERROR) → FAILED;
     * the robot's active order matches ours and it has reached the last node
-      (no active nodeStates, not driving) → SUCCEEDED;
+      (a nodeStates list, empty, and not driving) → SUCCEEDED; a state without the
+      list is not known to have arrived;
     * otherwise the order is still in flight → RUNNING.
     """
     if snapshot.phase == PHASE_ERROR:
         return TASK_FAILED
     arrived = (current_order_id
                and snapshot.order_id == current_order_id
+               and snapshot.node_states_reported  # no nodeStates list: not known to have arrived
                and snapshot.active_nodes == 0
                and not snapshot.driving)
     return TASK_SUCCEEDED if arrived else TASK_RUNNING

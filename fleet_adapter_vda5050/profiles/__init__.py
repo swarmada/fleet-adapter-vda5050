@@ -133,6 +133,18 @@ class StateSnapshot:
     node_states_reported: bool = False
     action_states_reported: bool = False
 
+    @property
+    def lists_reported(self) -> bool:
+        """The state carries both a ``nodeStates`` and an ``actionStates`` list (VDA5050 2.0.0
+        requires both). Without one, what is left for the vehicle to do is unknown."""
+        return self.node_states_reported and self.action_states_reported
+
+    @property
+    def nothing_left(self) -> bool:
+        """Known to have nothing left: both lists reported, no node still to be reached, and
+        no action that has not ended. A missing list is unknown, never empty."""
+        return self.lists_reported and not self.active_nodes and not self.active_actions
+
 
 @dataclass(frozen=True)
 class ProfileTopics:

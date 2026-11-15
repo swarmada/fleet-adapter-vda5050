@@ -75,7 +75,8 @@ def test_task_state_running_until_arrived() -> None:
 
 
 def test_task_state_succeeded_when_last_node_reached() -> None:
-    snap = profiles.StateSnapshot(order_id="o1", active_nodes=0, driving=False)
+    snap = profiles.StateSnapshot(order_id="o1", active_nodes=0, driving=False,
+                                  node_states_reported=True)
     assert task.task_state_from_snapshot(snap, "o1") == task.TASK_SUCCEEDED
 
 

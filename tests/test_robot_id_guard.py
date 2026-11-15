@@ -381,7 +381,8 @@ def test_after_an_unserved_stop_with_no_registration_the_first_order_lifts_the_p
     from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
     b = mark_transport_live(Vda5050Binding(robot_id=ROBOT, boot="b0"))
-    b.on_state(json.dumps({"orderId": "", "driving": False, "paused": False}))
+    b.on_state(json.dumps({"orderId": "", "driving": False, "paused": False,
+                           "nodeStates": [], "actionStates": []}))
     a = Adapter(pb, None, b, ROBOT)
     a._telemetry_started = True
     a._handle_control_plane(pb.ControlPlaneMessage(hello_ack=pb.HelloAck(
@@ -389,7 +390,8 @@ def test_after_an_unserved_stop_with_no_registration_the_first_order_lifts_the_p
     assert not a._registered
     a._on_safety_message(pb.ControlPlaneSafetyMessage(
         robot_id=OTHER, estop=pb.Estop(estop_id="s-10")))
-    b.on_state(json.dumps({"orderId": "", "driving": False, "paused": True}))  # halted, paused
+    b.on_state(json.dumps({"orderId": "", "driving": False, "paused": True,
+                           "nodeStates": [], "actionStates": []}))  # halted, paused
     a._handle_control_plane(pb.ControlPlaneMessage(
         register_ack=pb.RegisterAck(accepted=True)), None)
     assert _assign_ours(a).accepted
