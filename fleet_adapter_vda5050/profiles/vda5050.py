@@ -119,7 +119,8 @@ class Vda5050Profile:
     def parse_factsheet(self, payload: bytes | str) -> FactsheetInfo:
         """VDA5050 ``factsheet`` → :class:`FactsheetInfo`: the AGV's type identity
         (``typeSpecification``) and the action types it supports
-        (``protocolFeatures.agvActions``). A malformed message degrades to an empty
+        (``protocolFeatures.agvActions``), and the id length it takes
+        (``protocolLimits.maxStringLens.idLen``). A malformed message degrades to an empty
         info (unknown), never a false-capable reading."""
         obj = _load(payload)
         ts = obj.get("typeSpecification")
@@ -138,6 +139,7 @@ class Vda5050Profile:
             series=str(ts.get("seriesName", "")),
             agv_class=str(ts.get("agvClass", "")),
             actions=actions,
+            id_len=_id_len(obj.get("protocolLimits")),
         )
 
     def encode_order(self, header_id: int, order_id: str, order_update_id: int,
@@ -201,6 +203,16 @@ def _load(payload: bytes | str) -> dict:
     except (ValueError, UnicodeDecodeError, AttributeError):
         return {}
     return obj if isinstance(obj, dict) else {}
+
+
+def _id_len(limits) -> int | None:
+    """``protocolLimits.maxStringLens.idLen`` as a positive integer, or None when it is
+    missing or not one (VDA5050 2.0.0: uint32; 0 is read as no limit stated)."""
+    lens = limits.get("maxStringLens") if isinstance(limits, dict) else None
+    v = lens.get("idLen") if isinstance(lens, dict) else None
+    if isinstance(v, bool) or not isinstance(v, int) or v <= 0:
+        return None
+    return v
 
 
 def _num(v) -> float | None:

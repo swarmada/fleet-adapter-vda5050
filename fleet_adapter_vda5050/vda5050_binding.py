@@ -79,6 +79,7 @@ class Vda5050Binding:
         # order would carry the id of the previous process's first order, and a rejection the
         # vehicle still shows for that one would look like a rejection of the new one.
         self._boot = boot if boot is not None else secrets.token_hex(4)
+        self._id_len_reported: int | None = None   # the idLen an over-long orderId was logged for
         self._current_order_id = ""
         self._last_order_id = ""                   # the last order published; a stop does not clear it
         self._pending_order: str | None = None     # last order JSON built (test seam)
@@ -174,6 +175,28 @@ class Vda5050Binding:
         info = self._profile.parse_factsheet(payload)  # capabilities self-description
         with self._lock:
             self._factsheet = info
+            self._check_id_len_locked(self._order_id_locked(self._order_seq + 1))
+
+    def _order_id_locked(self, seq: int) -> str:
+        """The orderId of order number ``seq``. The caller holds the lock."""
+        return f"{self._robot_id}-{self._boot}-order-{seq}"
+
+    def _check_id_len_locked(self, order_id: str) -> None:
+        """Log an error when ``order_id`` is longer than the vehicle's factsheet allows
+        (``protocolLimits.maxStringLens.idLen``): the vehicle would reject every order. The
+        orderId is the longest id this binding makes (an actionId is at most the robot id and
+        13 characters, before its number). Checked when a factsheet arrives, against the next
+        orderId, and again on each order sent, since the id grows a digit as orders mount.
+        Logged once for each limit. Nothing is refused here: the vehicle's rejection then ends
+        the action FAILED with its reason. The caller holds the lock."""
+        limit = self._factsheet.id_len
+        if limit is None or len(order_id) <= limit or self._id_len_reported == limit:
+            return
+        self._id_len_reported = limit
+        print(f"vda5050: error: the vehicle's factsheet limits ids to {limit} characters "
+              f"(protocolLimits.maxStringLens.idLen), and orderId {order_id} has "
+              f"{len(order_id)}; the vehicle will reject its orders. Use a shorter robot id.",
+              file=sys.stderr)
 
     def factsheet(self, robot_id: str) -> profiles.FactsheetInfo:
         """The latest parsed ``factsheet`` (the AGV's capability self-description)."""
@@ -267,7 +290,7 @@ class Vda5050Binding:
         with self._publish_lock:
             with self._lock:
                 self._order_seq += 1
-                order_id = f"{robot_id}-{self._boot}-order-{self._order_seq}"
+                order_id = self._order_id_locked(self._order_seq)
                 self._current_order_id = order_id
                 held = self._held is not None
                 preempt = held or self._order_active_locked()
@@ -315,6 +338,7 @@ class Vda5050Binding:
         elif unpause:
             self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
         with self._lock:
+            self._check_id_len_locked(order_id)
             start_pos, map_id = self._state.position, self._state.map_id
             self._last_order_id = order_id
             self._open_cancel_id = ""

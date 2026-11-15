@@ -147,6 +147,9 @@ class FactsheetInfo:
     series: str = ""
     agv_class: str = ""
     actions: list[str] = field(default_factory=list)  # supported protocolFeatures.agvActions
+    # protocolLimits.maxStringLens.idLen: the longest orderId, actionId, nodeId, edgeId or mapId
+    # the vehicle takes. None when the factsheet does not say.
+    id_len: int | None = None
 
 
 @runtime_checkable
