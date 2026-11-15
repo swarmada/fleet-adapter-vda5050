@@ -293,7 +293,9 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 --comms vda505
 
 - **The file** is YAML. `nodes` maps a node id to `[x, y]`, in metres, in the map frame the
   vehicle reports its position in. `edges` lists undirected `[a, b]` pairs, each weighted by
-  its length. Other keys are ignored.
+  its length. An optional `map_id` names the map the lanes are drawn on. When it's given and
+  the vehicle reports another `mapId`, the adapter logs an error, once for each pair of maps;
+  orders still go out. Other keys are ignored.
 - **The order** is one released base: the start node at the vehicle's position, each lane node
   on the shortest path, and the goal, with an edge between each pair. A lane node keeps its id
   and names no heading; the goal keeps the assignment's heading. A lane node within 0.05 m of

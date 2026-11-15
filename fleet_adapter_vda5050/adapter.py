@@ -1489,8 +1489,9 @@ def main(argv: list[str] | None = None) -> None:
                 graph = RouteGraph.load(args.route_graph)
             except ValueError as exc:
                 ap.error(str(exc))
+            on_map = f", map {graph.map_id}" if graph.map_id else ""
             print(f"route graph {args.route_graph}: {len(graph.node_ids)} nodes, "
-                  f"{graph.edge_count} edges", file=sys.stderr)
+                  f"{graph.edge_count} edges{on_map}", file=sys.stderr)
         robot = Vda5050Binding(robot_id=args.robot_id,
                                manufacturer=args.manufacturer, serial=args.serial,
                                mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
