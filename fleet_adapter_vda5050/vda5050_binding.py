@@ -24,6 +24,7 @@ new order once the vehicle reports the old one gone (:meth:`Vda5050Binding.comma
 
 from __future__ import annotations
 
+import secrets
 import sys
 import threading
 import time
@@ -56,7 +57,8 @@ class Vda5050Binding:
                  manufacturer: str = "swarmada", serial: str = "amr-1",
                  profile_name: str = "vda5050",
                  mqtt_host: str = "localhost", mqtt_port: int = 1883,
-                 preempt_timeout_s: float = _PREEMPT_TIMEOUT_S, clock=time.monotonic) -> None:
+                 preempt_timeout_s: float = _PREEMPT_TIMEOUT_S, clock=time.monotonic,
+                 boot: str | None = None) -> None:
         self._robot_id = robot_id
         self._manufacturer = manufacturer
         self._serial = serial
@@ -72,6 +74,11 @@ class Vda5050Binding:
         self._factsheet = profiles.FactsheetInfo() # latest parsed factsheet (capabilities)
         self._header_id = 0                        # monotonic per-topic dedup key
         self._order_seq = 0                        # generates a unique orderId per task
+        # In every orderId, so ids are unique across adapter processes. A vehicle reports a
+        # rejection until it accepts a new order; without this, a restarted adapter's first
+        # order would carry the id of the previous process's first order, and a rejection the
+        # vehicle still shows for that one would look like a rejection of the new one.
+        self._boot = boot if boot is not None else secrets.token_hex(4)
         self._current_order_id = ""
         self._last_order_id = ""                   # the last order published; a stop does not clear it
         self._pending_order: str | None = None     # last order JSON built (test seam)
@@ -80,6 +87,9 @@ class Vda5050Binding:
         self._has_state = False                    # True once a state message has arrived
         self._states_seen = 0                      # state messages received
         self._holding = False                      # a stop has been commanded; hold until a new order
+        self._recancelled = False                  # this stop's one late cancel has been sent
+        self._stop_cancel_id = ""                  # the cancelOrder the last stop sent
+        self._stop_cancel_ended = False            # ...and the vehicle has reported it ended
         self._estop_paused = False                 # an estop paused the vehicle; stopPause before the next order
         self._pause_requested = False              # a Swarmada pause (command_pause) is in force
         self._suppressed_stops = 0                 # cancelOrders not sent: nothing to cancel (test seam)
@@ -120,6 +130,37 @@ class Vda5050Binding:
                 self._has_state = True
                 self._states_seen += 1
             self._service_hold()
+            self._cancel_late_order()
+
+    def _cancel_late_order(self) -> None:
+        """Once per stop: the vehicle has taken the order this binding stopped, after the stop's
+        cancelOrder ended. Since the stop, no order has been sent and none is held; the vehicle
+        has reported that cancel ended (FINISHED, FAILED, or refused by an error naming it;
+        kept once seen, since a vehicle drops an ended instantAction from its state after a few
+        publishes); and it now reports the last order sent as its own, with a node or an action
+        left. Sends a cancelOrder.
+
+        How it happens: the cancel reached the vehicle before the order (MQTT orders one
+        client's messages per topic only) and found nothing to cancel; or the vehicle rejected
+        the order, then took it when it was delivered again (QoS 1, after a reconnect). The
+        action is ended and its lease released, so without this the vehicle would drive an
+        order nothing supervises. Not on a state that merely crossed the cancel: the cancel
+        must be reported ended first. Once only: a vehicle that refuses a cancel while it runs
+        the order is not answered with a cancel on every state."""
+        with self._publish_lock:
+            with self._lock:
+                st, last = self._state, self._last_order_id
+                if self._stop_cancel_id and self._stop_cancel_id in st.ended_actions:
+                    self._stop_cancel_ended = True
+                late = (self._holding and self._stop_cancel_ended and not self._recancelled
+                        and self._held is None and bool(last) and st.order_id == last
+                        and bool(st.active_nodes or st.active_actions))
+                if late:
+                    self._recancelled = True
+            if late:
+                print(f"vda5050: the vehicle is running order {last}, which was stopped; "
+                      "cancelling it again", file=sys.stderr)
+                self._send_cancel(self._robot_id, "stop")
 
     def _service_hold(self) -> None:
         """Send a held order whose wait is over, or time the hold out (:meth:`_take_held_locked`)."""
@@ -226,7 +267,7 @@ class Vda5050Binding:
         with self._publish_lock:
             with self._lock:
                 self._order_seq += 1
-                order_id = f"{robot_id}-order-{self._order_seq}"
+                order_id = f"{robot_id}-{self._boot}-order-{self._order_seq}"
                 self._current_order_id = order_id
                 held = self._held is not None
                 preempt = held or self._order_active_locked()
@@ -296,7 +337,7 @@ class Vda5050Binding:
         """True when the vehicle may still have an order a new one would be rejected behind:
         its last ``state`` lists a node still to be reached or an action that has not ended,
         or it does not yet report the last order this binding sent (that order may be on
-        its way). The caller holds the lock. False when the vehicle cannot be observed or has
+        its way) and has not reported rejecting it. The caller holds the lock. False when the vehicle cannot be observed or has
         reported no state: there is nothing to wait on then, and the order goes out as
         before."""
         if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
@@ -304,7 +345,29 @@ class Vda5050Binding:
         st = self._state
         if st.active_nodes or st.active_actions:
             return True
-        return bool(self._last_order_id) and st.order_id != self._last_order_id
+        return (bool(self._last_order_id) and st.order_id != self._last_order_id
+                and not self._rejected_locked(self._last_order_id))
+
+    def _rejected_locked(self, order_id: str) -> tuple[str, str] | None:
+        """``(errorType, errorDescription)`` when the vehicle rejected ``order_id``, or None.
+        The caller holds the lock.
+
+        Rejected: this binding sent that order (it is the last one sent; a held order has not
+        been), the vehicle's last ``state`` carries an error naming its orderId, and the vehicle
+        does not report it as its own. An error naming the order the vehicle has taken is about
+        running it, not a rejection. The error type is not matched, so a type the vehicle
+        chose itself still counts. VDA5050 2.0.0 6.6.4 has the vehicle report a rejection until
+        it accepts a new order.
+
+        Only an ``orderId`` reference counts. A headerId alone is not attributed: header ids
+        restart with this process. This binding never sends an order update (every order has
+        a new orderId and orderUpdateId 0), so an orderUpdateId cannot name a rejection here."""
+        if not order_id or order_id != self._last_order_id:
+            return None
+        st = self._state
+        if st.order_id == order_id:
+            return None
+        return st.order_errors.get(order_id)
 
     def _take_held_locked(self) -> tuple[str, float, float, float] | None:
         """The held order, taken, when the last ``state`` shows the order before it gone; or
@@ -351,19 +414,26 @@ class Vda5050Binding:
     def task_state(self, robot_id: str) -> str:
         """The protocol TaskState (name) for the current order, derived from the
         latest robot ``state`` — the task-status stream source (C6.4)."""
-        with self._lock:
-            snapshot, order_id = self._state, self._current_order_id
-            if order_id and order_id == self._failed_order_id:
-                return task.TASK_FAILED  # a preempting order the vehicle never got
-        return task.task_state_from_snapshot(snapshot, order_id)
+        return self.task_outcome(robot_id)[0]
 
     def task_detail(self, robot_id: str) -> str:
         """Why :meth:`task_state` answers FAILED for the current order, when this binding knows;
         "" otherwise."""
+        return self.task_outcome(robot_id)[1]
+
+    def task_outcome(self, robot_id: str) -> tuple[str, str]:
+        """:meth:`task_state` and :meth:`task_detail` read under one lock, from one ``state``:
+        read apart, a state arriving between them could give FAILED with no reason."""
         with self._lock:
-            if self._current_order_id and self._current_order_id == self._failed_order_id:
-                return self._failed_detail
-            return ""
+            snapshot, order_id = self._state, self._current_order_id
+            if order_id and order_id == self._failed_order_id:
+                return task.TASK_FAILED, self._failed_detail  # a preempting order never sent
+            rejected = self._rejected_locked(order_id)
+            if rejected is not None:
+                why = ": ".join(part for part in rejected if part)
+                return task.TASK_FAILED, (f"the vehicle rejected order {order_id}"
+                                          + (f": {why}" if why else ""))
+        return task.task_state_from_snapshot(snapshot, order_id), ""
 
     def command_stop(self, robot_id: str) -> None:
         """Publish a VDA5050 ``cancelOrder`` instantAction (abort the active order +
@@ -383,11 +453,15 @@ class Vda5050Binding:
                 self._current_order_id = ""
                 self._pending_order = None
                 self._holding = True
+                self._recancelled = False  # a new stop: its own late cancel, if it comes to that
+                self._stop_cancel_id, self._stop_cancel_ended = "", False
                 self._held, self._held_cancel_id = None, ""  # a stop ends a preemption too
                 if not always and self._nothing_to_cancel_locked():
                     self._suppressed_stops += 1
                     return
-            self._send_cancel(robot_id, "stop")
+            cancel_id = self._send_cancel(robot_id, "stop")
+            with self._lock:
+                self._stop_cancel_id = cancel_id
 
     def _send_cancel(self, robot_id: str, tag: str) -> str:
         """Publish a ``cancelOrder`` and return its actionId."""
@@ -444,7 +518,10 @@ class Vda5050Binding:
         * and no order this binding published is still outstanding: none was ever sent, or
           the vehicle reports the last one sent, ended. A stop does not end it here: an order
           is outstanding until the vehicle says so, so a cancelOrder that crossed the order on
-          the way does not make a later stop look unnecessary."""
+          the way does not make a later stop look unnecessary. Nor does a rejection: that the
+          vehicle rejected an order is read from an error naming it (:meth:`_rejected_locked`),
+          and VDA5050 lets any error name an order. The stop after a rejection sends its
+          cancelOrder, at the price of a noOrderToCancel warning."""
         if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
             return False
         st = self._state

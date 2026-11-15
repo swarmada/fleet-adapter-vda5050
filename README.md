@@ -158,6 +158,36 @@ at once:
   and what is left of the order before it is cancelled. No `cancelOrder` is sent when the
   vehicle shows nothing to cancel.
 
+### An order the vehicle rejects
+
+A VDA 5050 vehicle that rejects an order keeps reporting its previous `orderId`, with a
+warning until it accepts a new order (VDA 5050 2.0.0 6.6.4).
+
+- The adapter counts the last order it sent as rejected when an error in the vehicle's
+  `state` names that order's `orderId` in its references and the vehicle does not report
+  that order as its own. The error type is not matched. Errors are read as vda-5050-lib's
+  master controller reads them: an error about another topic is skipped, and so is one about
+  an action, unless it is an `orderError`.
+- The action ends `FAILED` with `EXECUTION_FAILURE` and the vehicle's reason in its message.
+  The reason is the vehicle's own `errorType` and `errorDescription`, with control characters
+  removed and cut to length. Every `FAILED` from the vehicle's state carries
+  `EXECUTION_FAILURE`, including a FATAL error and a preemption that timed out.
+- A rejected order is not waited on: the next order goes out at once. The stop after the
+  `FAILED` still sends its `cancelOrder`. VDA 5050 lets any error name an order, so a
+  rejection is read from the vehicle's errors, not known; the price is a `noOrderToCancel`
+  warning.
+- **An order taken after it was stopped.** If the vehicle reports a stop's `cancelOrder`
+  ended and then runs the order the adapter stopped, the adapter sends one more
+  `cancelOrder`. That happens when the cancel overtakes the order, or when a rejected order
+  is delivered again and taken.
+- Each `orderId` carries a token unique to the adapter process. A rejection the vehicle still
+  reports from an earlier process can then not be taken for one of this process's orders.
+- **Not detected:** a rejection whose error names only the `headerId`. Header ids restart
+  with the adapter process, so an old error could be taken for a new order. That action ends
+  at its lease or the control plane's timeout.
+- The adapter never sends an order update. Every order has a new `orderId` and
+  `orderUpdateId` 0, so no rule for a rejected update is needed.
+
 ## Development
 
 ```bash

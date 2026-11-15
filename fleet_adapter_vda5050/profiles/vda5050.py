@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import math
+import unicodedata
 
 from fleet_adapter_vda5050.profiles import (
     CONN_BROKEN,
@@ -110,6 +111,7 @@ class Vda5050Profile:
             active_actions=_active_actions(obj.get("actionStates")),
             ended_actions=_ended_actions(obj.get("actionStates"), obj.get("errors")),
             active_action_ids=_active_action_ids(obj.get("actionStates")),
+            order_errors=_order_errors(obj.get("errors")),
             paused=obj.get("paused") is True,
             map_id=str(ap.get("mapId", "")) if isinstance(ap, dict) else "",
         )
@@ -281,6 +283,54 @@ def _active_actions(states) -> int:
         return 1
     return sum(1 for st in states
                if not isinstance(st, dict) or st.get("actionStatus") in _ACTION_NOT_ENDED)
+
+
+# Lengths the vehicle's own words are cut to, after control characters are stripped.
+_ERROR_TYPE_MAX = 64
+_ERROR_TEXT_MAX = 200
+
+
+def clean_text(value, limit: int) -> str:
+    """Vehicle-supplied text made safe to pass on: not a string gives ""; every control,
+    format, surrogate, private-use or unassigned character (Unicode category C) becomes a space;
+    runs of whitespace, line and paragraph separators among them (``str.split``), become one
+    space; then the text is cut to ``limit`` characters. A newline or a terminal escape in an
+    errorDescription can then not forge a line in a log, and a bidirectional override cannot
+    reorder what an operator reads."""
+    if not isinstance(value, str):
+        return ""
+    text = "".join(" " if unicodedata.category(ch)[0] == "C" else ch for ch in value)
+    return " ".join(text.split())[:limit]
+
+
+def _order_errors(errors) -> dict[str, tuple[str, str]]:
+    """Each orderId named by an error's ``orderId`` reference, with that error's type and
+    description, cleaned (:func:`clean_text`). The first error naming an order wins.
+
+    Skipped as vda-5050-lib's own master controller skips them (``_dispatchState``): an error
+    whose ``topic`` reference is not ``order``, and one with an ``actionId`` reference unless
+    its type is ``orderError`` (6.6.4.2: an order with actions the vehicle cannot perform).
+    Those are about an action, not about taking the order."""
+    out: dict[str, tuple[str, str]] = {}
+    if not isinstance(errors, list):
+        return out
+    for e in errors:
+        refs = e.get("errorReferences") if isinstance(e, dict) else None
+        if not isinstance(refs, list):
+            continue
+        refs = [r for r in refs if isinstance(r, dict)]
+        keys = {r.get("referenceKey"): r.get("referenceValue") for r in refs}
+        if "topic" in keys and keys["topic"] != "order":
+            continue
+        if "actionId" in keys and e.get("errorType") != "orderError":
+            continue
+        for r in refs:
+            if (r.get("referenceKey") == "orderId"
+                    and isinstance(r.get("referenceValue"), str) and r["referenceValue"]):
+                out.setdefault(r["referenceValue"], (
+                    clean_text(e.get("errorType"), _ERROR_TYPE_MAX),
+                    clean_text(e.get("errorDescription"), _ERROR_TEXT_MAX)))
+    return out
 
 
 def _active_action_ids(states) -> frozenset[str]:

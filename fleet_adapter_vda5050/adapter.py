@@ -975,10 +975,14 @@ class fleet_adapter_vda5050Adapter:
         action = self._current_action
         if not action or not hasattr(self._robot, "task_state"):
             return
-        detail = getattr(self._robot, "task_detail", None)  # why it failed, if the binding knows
+        outcome = getattr(self._robot, "task_outcome", None)  # the state and why, read together
+        detail = getattr(self._robot, "task_detail", None)
         with self._robot_lock:
-            state = self._robot.task_state(self._robot_id)
-            message = detail(self._robot_id) if detail is not None else ""
+            if outcome is not None:
+                state, message = outcome(self._robot_id)
+            else:
+                state = self._robot.task_state(self._robot_id)
+                message = detail(self._robot_id) if detail is not None else ""
         if state not in (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED):
             return
         with self._action_lock:
@@ -995,9 +999,12 @@ class fleet_adapter_vda5050Adapter:
             # The lease ends with the action. Left running, it lapsed some 30 s later and the
             # self-stop sent the idle vehicle a cancelOrder it answered with a warning.
             self._lease.release(self._robot_id)
+            failed = state == task_map.TASK_FAILED
             self._emit_action_status(
-                action, state, token,
-                progress_pct=100 if state == task_map.TASK_SUCCEEDED else 0, message=message)
+                action, state, token, progress_pct=0 if failed else 100, message=message,
+                # Rejected, a FATAL error, or a preemption that timed out: the robot could not
+                # complete it.
+                end_cause=self._pb.ACTION_END_CAUSE_EXECUTION_FAILURE if failed else 0)
 
     # ── Scenario mapping (proto only; schedule/state live on the binding) ────────
 

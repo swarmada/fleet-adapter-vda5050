@@ -93,14 +93,25 @@ def test_task_state_running_for_a_different_order() -> None:
 # ── binding: command_move builds an order with monotonic ids ──────────────────
 
 def test_binding_command_move_builds_order_and_bumps_ids() -> None:
-    b = Vda5050Binding(robot_id="amr-1", manufacturer="acme", serial="agv-7")
+    b = Vda5050Binding(robot_id="amr-1", manufacturer="acme", serial="agv-7", boot="b0")
     b.command_move("amr-1", 3.0, 4.0, 1.0)
     first = json.loads(b.pending_order("amr-1"))
-    assert first["orderId"] == "amr-1-order-1" and first["headerId"] == 1
+    assert first["orderId"] == "amr-1-b0-order-1" and first["headerId"] == 1
     b.command_move("amr-1", 6.0, 7.0)
     second = json.loads(b.pending_order("amr-1"))
-    assert second["orderId"] == "amr-1-order-2"       # fresh orderId per task
+    assert second["orderId"] == "amr-1-b0-order-2"    # fresh orderId per task
     assert second["headerId"] == 2                    # monotonic headerId (dedup key)
+
+
+def test_order_ids_differ_between_adapter_processes() -> None:
+    """A vehicle reports a rejection until it accepts a new order: a restarted adapter's first
+    order must not carry the id of the previous process's first order."""
+    ids = set()
+    for _ in range(20):
+        b = Vda5050Binding(robot_id="amr-1")
+        b.command_move("amr-1", 1.0, 0.0)
+        ids.add(json.loads(b.pending_order("amr-1"))["orderId"])
+    assert len(ids) == 20
 
 
 def test_binding_order_uses_current_pose_as_start_node() -> None:

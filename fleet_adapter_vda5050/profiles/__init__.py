@@ -110,6 +110,11 @@ class StateSnapshot:
     ended_actions: frozenset[str] = frozenset()
     # actionIds listed as not ended (the ids behind active_actions). Inside the adapter only.
     active_action_ids: frozenset[str] = frozenset()
+    # Each orderId an error's references name, with that error's (errorType, errorDescription):
+    # how a vehicle reports an order it rejected (VDA5050 2.0.0 6.6.4, 8.1). The text is the
+    # vehicle's, stripped of control characters and cut to length. Inside the adapter only,
+    # except as the reason on the action it ends.
+    order_errors: dict[str, tuple[str, str]] = field(default_factory=dict)
     # The vehicle reports it is in pause mode (VDA5050 state.paused): by a startPause, or by a
     # button on the vehicle. VDA5050 does not say which.
     paused: bool = False
