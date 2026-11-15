@@ -114,7 +114,10 @@ class Vda5050Profile:
             active_action_ids=_active_action_ids(obj.get("actionStates")),
             order_errors=_order_errors(obj.get("errors")),
             paused=obj.get("paused") is True,
-            map_id=str(ap.get("mapId", "")) if isinstance(ap, dict) else "",
+            # A mapId that is not a string (null, a number) is no map id: never sent back
+            # in an order as "None".
+            map_id=(ap["mapId"] if isinstance(ap, dict) and isinstance(ap.get("mapId"), str)
+                    else ""),
             header_id=_header_id(obj.get("headerId")),
             timestamp=obj["timestamp"] if isinstance(obj.get("timestamp"), str) else "",
             finished_actions=_finished_actions(obj.get("actionStates")),

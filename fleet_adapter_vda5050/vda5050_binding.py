@@ -110,6 +110,7 @@ class Vda5050Binding:
         self._unidentified_reported = False        # a state with no headerId or timestamp, logged once
         self._repeat_reported = False              # a dropped repeat, logged once
         self._lists_missing_reported = False       # a state without nodeStates or actionStates, logged once
+        self._map_mismatch_reported: set[tuple[str, str]] = set()  # (graph's, vehicle's), each logged once
         # The actionId of this binding's latest startPause, until a stopPause goes out: its
         # FINISHED confirms the pause (:meth:`is_stopped`).
         self._start_pause_id = ""
@@ -174,6 +175,7 @@ class Vda5050Binding:
                if snapshot.header_id is not None and snapshot.timestamp else None)
         report = warn = False
         missing: list[str] = []
+        other_map: str | None = None  # the vehicle's map, when it is not the graph's
         with self._publish_lock:
             with self._lock:
                 repeat = key is not None and key in self._recent_states
@@ -195,6 +197,12 @@ class Vda5050Binding:
                             self._pause_acked = True
                     elif not self._unidentified_reported:
                         self._unidentified_reported = report = True
+                    graph_map = self._graph.map_id if self._graph is not None else None
+                    pair = (graph_map or "", snapshot.map_id)
+                    if (graph_map and snapshot.map_id and snapshot.map_id != graph_map
+                            and pair not in self._map_mismatch_reported):
+                        self._map_mismatch_reported.add(pair)
+                        other_map = snapshot.map_id
                     if not snapshot.lists_reported and not self._lists_missing_reported:
                         self._lists_missing_reported = True
                         missing = [name for name, ok in (
@@ -208,6 +216,11 @@ class Vda5050Binding:
                           "for two different states loses the second. Logged once.",
                           file=sys.stderr)
                 return
+            if other_map is not None:
+                print(f"vda5050: error: the route graph is for map {self._graph.map_id!r} and "
+                      f"the vehicle reports map {other_map!r}; orders follow the graph's lanes "
+                      "in the frame the vehicle reports its position in. Logged once for each "
+                      "pair of maps.", file=sys.stderr)
             if missing:
                 print(f"vda5050: error: a state from the vehicle has no {' or '.join(missing)} "
                       "list (or is not a VDA 5050 state at all), so what it has left to do is "

@@ -10,7 +10,8 @@ position onto the graph, the shortest path along it, and the goal.
 
 The file is YAML. ``nodes`` maps a node id to ``[x, y]`` in metres, in the map frame the
 vehicle reports its position in; ``edges`` lists undirected ``[a, b]`` pairs, each weighted by
-its length. Other top-level keys are ignored.
+its length. An optional ``map_id`` names the map the lanes are drawn on: a vehicle that reports
+another ``mapId`` is logged as an error (vda5050_binding.py). Other top-level keys are ignored.
 
 * **The goal is a lane node.** The adapter refuses a goal farther than :data:`NODE_TOLERANCE_M`
   from every node (:meth:`RouteGraph.nearest`), so the last leg never leaves the lanes.
@@ -85,7 +86,10 @@ def _segment_distance(p: tuple[float, float], a: tuple[float, float],
 
 
 class RouteGraph:
-    def __init__(self, nodes: dict, edges: list) -> None:
+    def __init__(self, nodes: dict, edges: list, map_id: str | None = None) -> None:
+        if map_id is not None and not (isinstance(map_id, str) and map_id):
+            raise ValueError(f"route graph: map_id is {map_id!r}, not a non-empty string")
+        self._map_id = map_id
         if not isinstance(nodes, dict) or not nodes:
             raise ValueError("route graph: no nodes")
         if not isinstance(edges, list):
@@ -166,7 +170,15 @@ class RouteGraph:
             raise ValueError(f"route graph {path}: {exc}") from exc
         if not isinstance(doc, dict):
             raise ValueError(f"route graph {path}: not a mapping with nodes and edges")  # noqa: TRY004 (one error for a bad file)
-        return cls(doc.get("nodes") or {}, doc.get("edges") or [])
+        map_id = doc.get("map_id")
+        if "map_id" in doc and map_id is None:  # "map_id:" with no value is not "no map id"
+            raise ValueError(f"route graph {path}: map_id is given with no value")
+        return cls(doc.get("nodes") or {}, doc.get("edges") or [], map_id)
+
+    @property
+    def map_id(self) -> str | None:
+        """The map the lanes are drawn on, when the file names one."""
+        return self._map_id
 
     @property
     def node_ids(self) -> list[str]:
