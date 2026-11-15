@@ -42,6 +42,28 @@ every telemetry publish and reports `ROBOT_PHASE_OFFLINE` with `position` and `b
 **omitted** rather than defaulted when the answer is False — proto3 message-field presence
 is what makes "unknown" distinguishable from "0" on the wire (C6.2).
 
+The same holds while the vehicle is online:
+
+- **Where the position comes from.** It's the `agvPosition` of the latest `state` or
+  `visualization` that carried one. A vehicle may send `visualization` more often than its
+  `state` (vda-5050-lib: every second when asked), so the map shows it moving between states.
+  `visualization` feeds this position only; stops, orders and tasks read the `state`. A
+  `visualization` older than the position already reported, by the vehicle's own timestamps,
+  isn't applied: MQTT keeps each topic in order, not the two together.
+- **An unknown position is left out.** When the vehicle hasn't reported a position, or reports
+  `positionInitialized: false` or a reading that isn't a finite number, no `position` is sent:
+  never the origin. A message with no `agvPosition` leaves the last position as it was. When
+  the vehicle leaves `ONLINE`, its position and battery count as unknown until it reports
+  again. The edge node's `PositionFrame` follows the same rules, stamped with the adapter's
+  clock.
+- **The rest of the reading.** The heading (`yaw`) is sent from `theta` when the vehicle gives
+  one, and left out otherwise. The `floor` is 0, since VDA 5050 has no floors. The position is
+  in the map frame the vehicle reports, sent as the zone frame; the `mapId` isn't sent.
+- **The battery** is left out while the `state` has no charge reading, never sent as 0%.
+- **How often.** A frame goes out every `telemetry_interval_seconds` the control plane sets.
+  For a map that moves each second, set the Robot's `telemetryIntervalSeconds` to 1, and have
+  the vehicle send `visualization` every second.
+
 If you implement `RobotBinding` against your own fleet API: `start()` MUST raise when it
 cannot connect (returning quietly is the defect above), `stop()` MUST be idempotent and safe
 when `start()` never ran, and `transport_alive()` MUST mean *"the readings below are

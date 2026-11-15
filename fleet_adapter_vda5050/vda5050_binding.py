@@ -42,6 +42,24 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
+def _vehicle_time(stamp: str) -> datetime | None:
+    """A VDA5050 header timestamp (ISO 8601, e.g. 2026-11-15T10:00:00.000Z), or None when it
+    cannot be read: then messages are taken in the order they arrive."""
+    try:
+        return datetime.fromisoformat(stamp) if stamp else None
+    except ValueError:
+        return None
+
+
+def _before(a: datetime, b: datetime) -> bool:
+    """a is earlier than b. False when the two cannot be compared (one with a time zone, one
+    without): arrival order then decides."""
+    try:
+        return a < b
+    except TypeError:
+        return False
+
+
 # A robot is CONFIRMED at rest when its reported velocity is within sensor noise and
 # it is not driving. Ground truth from `state` only — never a timer or silence (C5.3).
 _EPS_LINEAR = 0.01   # m/s
@@ -56,6 +74,9 @@ _PREEMPT_TIMEOUT_S = 60.0
 # How many recent states a redelivery is looked for among. QoS 1 redelivers a message the
 # broker has not seen acknowledged, after a reconnect: the last few, not the last hundred.
 _STATE_DEDUP_WINDOW = 64
+# The same for visualization, which carries only a position: a redelivery would move the
+# reported position back for one telemetry frame.
+_VISUALIZATION_DEDUP_WINDOW = 16
 
 # The operatingMode values in which only an order moves the vehicle. In MANUAL, SERVICE or
 # TEACHIN a person can drive it without one (VDA5050 2.0.0, 6.10.6).
@@ -111,6 +132,18 @@ class Vda5050Binding:
         self._repeat_reported = False              # a dropped repeat, logged once
         self._lists_missing_reported = False       # a state without nodeStates or actionStates, logged once
         self._map_mismatch_reported: set[tuple[str, str]] = set()  # (graph's, vehicle's), each logged once
+        # The position sent to the control plane: the one in the latest state or visualization
+        # that carried an agvPosition, None when that said the position is unknown. Only for
+        # telemetry: stops, orders and tasks read the state's own position.
+        self._pose: profiles.Position | None = None
+        # The vehicle's timestamp of that position, when it could be read: a visualization
+        # older than it is not applied (MQTT orders each topic, not the two together).
+        self._pose_at: datetime | None = None
+        # A state has come since the vehicle was last ONLINE: until then the battery reading
+        # is from before it went away, and is not sent.
+        self._battery_current = False
+        # (headerId, timestamp) of recent visualizations: a redelivery is dropped.
+        self._recent_visualizations: deque[tuple[int, str]] = deque(maxlen=_VISUALIZATION_DEDUP_WINDOW)
         # The actionId of this binding's latest startPause, until a stopPause goes out: its
         # FINISHED confirms the pause (:meth:`is_stopped`).
         self._start_pause_id = ""
@@ -148,6 +181,10 @@ class Vda5050Binding:
         state = self._profile.parse_connection(payload)
         with self._lock:
             self._connection = state
+            if state != profiles.CONN_ONLINE:
+                # Away: what it last reported is not where it is when it comes back (pushed,
+                # relocalised, recharged). Unknown until it reports again.
+                self._pose, self._pose_at, self._battery_current = None, None, False
 
     def connection_state(self, robot_id: str) -> str:
         with self._lock:
@@ -185,6 +222,9 @@ class Vda5050Binding:
                     self._state = snapshot
                     self._has_state = True
                     self._states_seen += 1
+                    self._battery_current = True
+                    if snapshot.position_reported:
+                        self._pose, self._pose_at = snapshot.position, _vehicle_time(snapshot.timestamp)
                     if key is not None:
                         self._recent_states.append(key)
                         self._state_seq += 1
@@ -235,6 +275,26 @@ class Vda5050Binding:
                       "answered FAILED. Logged once.", file=sys.stderr)
             self._service_hold()
             self._cancel_late_order()
+
+    def on_visualization(self, payload) -> None:
+        """A ``visualization`` from the vehicle: its position, for the position sent to the
+        control plane (:meth:`reported_pose`) and nothing else. A vehicle may send it more
+        often than its state. A redelivery, by headerId and timestamp, is dropped; one with no
+        agvPosition changes nothing."""
+        report = self._profile.parse_visualization(payload)
+        key = ((report.header_id, report.timestamp)
+               if report.header_id is not None and report.timestamp else None)
+        at = _vehicle_time(report.timestamp)
+        with self._lock:
+            if key is not None:
+                if key in self._recent_visualizations:
+                    return
+                self._recent_visualizations.append(key)
+            if not report.reported:
+                return
+            if at is not None and self._pose_at is not None and _before(at, self._pose_at):
+                return  # older than the position already reported (a redelivery, a retained one)
+            self._pose, self._pose_at = report.position, at
 
     def state_seq(self, robot_id: str) -> int:
         """How many new states, each with a headerId and a timestamp, this binding has received
@@ -397,19 +457,30 @@ class Vda5050Binding:
     def spawn(self, robot_id: str) -> None:
         self._robot_id = robot_id
 
-    def pose(self, robot_id: str) -> tuple[float, float, int]:
+    def pose(self, robot_id: str) -> tuple[float, float, int] | None:
+        """(x, y, floor) last reported, from a state or a visualization; None while the
+        position is unknown (none reported yet, or the vehicle not localized). Never the
+        origin in place of an unknown position (C6.2)."""
+        p = self.reported_pose(robot_id)
+        return (p[0], p[1], p[3]) if p is not None else None
+
+    def reported_pose(self, robot_id: str) -> tuple[float, float, float | None, int] | None:
+        """(x, y, yaw, floor) last reported, read as one; yaw None when the vehicle gave no
+        heading. None while the position is unknown. The position sent to the control plane."""
         with self._lock:
-            p = self._state.position
-        return (p.x, p.y, p.floor) if p is not None else (0.0, 0.0, 0)
+            p = self._pose
+        return (p.x, p.y, p.yaw, p.floor) if p is not None else None
 
     def yaw(self, robot_id: str) -> float:
         with self._lock:
-            return self._state.position.yaw if self._state.position is not None else 0.0
+            p = self._state.position
+        return p.yaw if p is not None and p.yaw is not None else 0.0
 
-    def battery_percent(self, robot_id: str) -> int:
+    def battery_percent(self, robot_id: str) -> int | None:
+        """The state's battery charge; None while unknown, never a 0% reading (C6.2), and
+        None from the time the vehicle leaves ONLINE until its next state."""
         with self._lock:
-            pct = self._state.battery.percent
-        return pct if pct is not None else 0
+            return self._state.battery.percent if self._battery_current else None
 
     def latest_battery(self, robot_id: str) -> profiles.Battery:
         with self._lock:
@@ -517,7 +588,8 @@ class Vda5050Binding:
         # it, so a routing failure leaves no pause lifted and no order taken as sent.
         with self._lock:
             start_pos, map_id = self._state.position, self._state.map_id
-        start = (profiles.OrderTarget(x=start_pos.x, y=start_pos.y, theta=start_pos.yaw,
+        start = (profiles.OrderTarget(x=start_pos.x, y=start_pos.y,
+                                      theta=start_pos.yaw if start_pos.yaw is not None else 0.0,
                                       map_id=map_id) if start_pos is not None else None)
         goal = profiles.OrderTarget(x=x, y=y, theta=yaw, map_id=map_id)
         via = self._via(order_id, start, goal)
@@ -921,6 +993,9 @@ class Vda5050Binding:
         self._mqtt.subscribe(self._topics.connection, lambda _t, p: self.on_connection(p))
         self._mqtt.subscribe(self._topics.state, lambda _t, p: self.on_state(p))
         self._mqtt.subscribe(self._topics.factsheet, lambda _t, p: self.on_factsheet(p))
+        if self._topics.visualization:
+            self._mqtt.subscribe(self._topics.visualization,
+                                 lambda _t, p: self.on_visualization(p))
         self._mqtt.connect()  # requires paho-mqtt + an MQTT broker
         with self._lock:
             self._started = True  # orders now publish; before this they are cached only

@@ -54,7 +54,7 @@ PHASE_MAINTENANCE = "MAINTENANCE"
 class Position:
     x: float
     y: float
-    yaw: float
+    yaw: float | None  # radians; None when the vehicle gave no theta (sent as absent, never 0)
     floor: int = 0
 
 
@@ -126,6 +126,9 @@ class StateSnapshot:
     # by the pair, and counts a state toward an estop's confirmation only when it has both.
     header_id: int | None = None
     timestamp: str = ""
+    # The state carries an agvPosition (position is then that position, or None when it is
+    # not usable); False when the state says nothing about where the vehicle is.
+    position_reported: bool = False
     # actionIds the vehicle reports FINISHED (not FAILED): a startPause the vehicle carried out.
     finished_actions: frozenset[str] = frozenset()
     # The state carries a nodeStates list, and an actionStates list. Without one, active_nodes
@@ -150,8 +153,8 @@ class StateSnapshot:
 class ProfileTopics:
     """The MQTT topics the adapter (fleet master) uses for one robot.
 
-    Subscribe (robot→master): ``connection``, ``state``, ``factsheet``. Publish
-    (master→robot): ``order``, ``instant_actions``.
+    Subscribe (robot→master): ``connection``, ``state``, ``factsheet``, ``visualization``.
+    Publish (master→robot): ``order``, ``instant_actions``.
     """
 
     connection: str
@@ -159,6 +162,22 @@ class ProfileTopics:
     order: str
     instant_actions: str
     factsheet: str = ""
+    visualization: str = ""
+
+
+@dataclass(frozen=True)
+class PoseReport:
+    """The position one message reports: a ``visualization``, or a ``state``'s agvPosition.
+
+    ``reported`` is False when the message carries no position at all: it says nothing, and
+    the position last reported stands. When it does carry one, ``position`` is that position,
+    or None when the vehicle says it is not localized (VDA5050 ``positionInitialized:
+    false``) or the reading cannot be used: then the position is unknown."""
+
+    reported: bool = False
+    position: Position | None = None
+    header_id: int | None = None
+    timestamp: str = ""
 
 
 @dataclass
@@ -193,6 +212,10 @@ class CommsProfile(Protocol):
     def parse_state(self, payload: bytes | str) -> StateSnapshot:
         """Robot ``state`` message → the profile-neutral :class:`StateSnapshot`
         (numeric + bounded-enum only)."""
+
+    def parse_visualization(self, payload: bytes | str) -> PoseReport:
+        """Robot ``visualization`` message → the position it reports. Used for the position
+        sent to the control plane only, never for a stop, an order or a task."""
 
     def encode_order(self, header_id: int, order_id: str, order_update_id: int,
                      manufacturer: str, serial: str, start: OrderTarget | None,

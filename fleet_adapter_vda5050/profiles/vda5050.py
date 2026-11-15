@@ -35,6 +35,7 @@ from fleet_adapter_vda5050.profiles import (
     FactsheetInfo,
     Hardware,
     OrderTarget,
+    PoseReport,
     Position,
     ProfileTopics,
     StateSnapshot,
@@ -73,6 +74,7 @@ class Vda5050Profile:
             order=f"{base}/order",
             instant_actions=f"{base}/instantActions",
             factsheet=f"{base}/factsheet",
+            visualization=f"{base}/visualization",
         )
 
     def parse_connection(self, payload: bytes | str) -> str:
@@ -107,13 +109,14 @@ class Vda5050Profile:
             velocity=_velocity(obj.get("velocity")),
             operating_mode=str(obj.get("operatingMode", "")),
             order_id=str(obj.get("orderId", "")),
-            order_update_id=int(_num(obj.get("orderUpdateId")) or 0),
+            order_update_id=int(_finite(obj.get("orderUpdateId")) or 0),  # NaN would raise
             active_nodes=len(node_states) if isinstance(node_states, list) else 0,
             active_actions=_active_actions(obj.get("actionStates")),
             ended_actions=_ended_actions(obj.get("actionStates"), obj.get("errors")),
             active_action_ids=_active_action_ids(obj.get("actionStates")),
             order_errors=_order_errors(obj.get("errors")),
             paused=obj.get("paused") is True,
+            position_reported=isinstance(ap, dict),
             # A mapId that is not a string (null, a number) is no map id: never sent back
             # in an order as "None".
             map_id=(ap["mapId"] if isinstance(ap, dict) and isinstance(ap.get("mapId"), str)
@@ -124,6 +127,18 @@ class Vda5050Profile:
             node_states_reported=isinstance(node_states, list),
             action_states_reported=isinstance(obj.get("actionStates"), list),
         )
+
+    def parse_visualization(self, payload: bytes | str) -> PoseReport:
+        """VDA5050 ``visualization`` → the position it reports (:class:`PoseReport`). A
+        vehicle may send it more often than ``state`` (vda-5050-lib: every second); only its
+        ``agvPosition`` is read, by the same rules as a state's. A malformed message reports
+        nothing."""
+        obj = _load(payload)
+        ap = obj.get("agvPosition")
+        return PoseReport(reported=isinstance(ap, dict), position=_position(ap),
+                          header_id=_header_id(obj.get("headerId")),
+                          timestamp=obj["timestamp"] if isinstance(obj.get("timestamp"), str)
+                          else "")
 
     def parse_factsheet(self, payload: bytes | str) -> FactsheetInfo:
         """VDA5050 ``factsheet`` → :class:`FactsheetInfo`: the AGV's type identity
@@ -233,6 +248,13 @@ def _num(v) -> float | None:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
+def _finite(v) -> float | None:
+    """A number that is finite: a position or heading reading. NaN and infinity are no
+    reading (Python's json accepts them)."""
+    n = _num(v)
+    return n if n is not None and math.isfinite(n) else None
+
+
 def _node(node_id: str, sequence_id: int, t: OrderTarget, theta: bool = True) -> dict:
     """A released VDA5050 order node at an OrderTarget's pose; without ``theta``, its
     position names no heading."""
@@ -253,10 +275,11 @@ def _position(ap) -> Position | None:
     uninitialized pose is reported as absent, never as a bogus (0,0)."""
     if not isinstance(ap, dict) or ap.get("positionInitialized") is False:
         return None
-    x, y = _num(ap.get("x")), _num(ap.get("y"))
+    x, y = _finite(ap.get("x")), _finite(ap.get("y"))
     if x is None or y is None:
         return None
-    theta = _num(ap.get("theta")) or 0.0
+    # No theta, or one that is not a finite number, is no heading: absent, never 0.
+    theta = _finite(ap.get("theta"))
     # mapId is a string map identifier (not a numeric floor) — not smuggled in.
     return Position(x=x, y=y, yaw=theta, floor=0)
 
@@ -265,11 +288,12 @@ def _battery(bs) -> Battery:
     """batteryState {batteryCharge (already 0–100 %), charging, batteryVoltage}."""
     if not isinstance(bs, dict):
         return Battery()
-    charge = _num(bs.get("batteryCharge"))
+    # Not finite is no reading: round(NaN) would raise and lose the whole state.
+    charge = _finite(bs.get("batteryCharge"))
     percent = None if charge is None else max(0, min(100, round(charge)))
     charging = bs.get("charging")
     charging = bool(charging) if isinstance(charging, bool) else None  # unknown, not False
-    return Battery(percent=percent, charging=charging, voltage=_num(bs.get("batteryVoltage")))
+    return Battery(percent=percent, charging=charging, voltage=_finite(bs.get("batteryVoltage")))
 
 
 def _hardware(errors) -> list[Hardware]:
