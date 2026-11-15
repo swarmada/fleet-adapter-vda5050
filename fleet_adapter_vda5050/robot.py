@@ -163,6 +163,14 @@ class RobotBinding(Protocol):
         """CONFIRMED at rest — the ground truth the adapter waits on before it
         reports STOPPED. MUST reflect the real robot, never a timeout."""
 
+    def state_seq(self, robot_id: str) -> int:
+        """How many new state reports the binding has received from the robot. The adapter
+        reads it once an estop is sent, and the SDK confirms the stop only from a report
+        counted after that (swarmada_sdk.safety.await_estop_confirmation). An int that never
+        falls; the state `is_stopped` reads is stored before the count rises. Optional: a
+        binding whose state is current after every `tick()` declares
+        `tick_keeps_state_current = True` instead (SimulatedRobot)."""
+
     def pose(self, robot_id: str) -> tuple[float, float, int]:
         """(x, y, floor) in the zone frame."""
 
@@ -184,6 +192,10 @@ class SimulatedRobot:
     # How fast the simulated vehicle drives to its target: the speed the conformance fixture
     # assumes when it sizes a goal that keeps an action in flight.
     SPEED_MPS = 0.5
+
+    # Its state is the simulation, current after every tick(): the SDK's estop wait reads
+    # is_stopped() as it is and needs no state_seq (swarmada_sdk.safety).
+    tick_keeps_state_current = True
 
     def __init__(self, engine=None) -> None:
         self._moving: dict[str, bool] = {}

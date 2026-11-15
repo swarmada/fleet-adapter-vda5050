@@ -81,3 +81,29 @@ def mark_registered(adapter):
     """
     adapter._registered = True
     return adapter
+
+
+# ── "the vehicle reports after the stop" fixture ────────────────────────────
+
+def reply_on_tick(binding, **state):
+    """Make ``binding`` receive a new ``state`` on each ``tick()``, as a vehicle sends one
+    after a stop, and return it. The SDK's estop wait ticks the binding and confirms a stop
+    only from a state counted after the stop was sent (``state_seq``); a state given before
+    the stop can no longer confirm it. Each state carries the next headerId and its own
+    timestamp, so none is taken for a redelivery. ``state`` is the VDA5050 state's fields
+    (``paused=True``, say); the default is a vehicle at rest."""
+    import json
+
+    tick = binding.tick
+    count = [0]
+
+    def _tick(dt: float) -> None:
+        count[0] += 1
+        body = {"driving": False, "velocity": {"vx": 0.0, "vy": 0.0, "omega": 0.0}}
+        body.update(state)
+        body.update(headerId=10_000 + count[0], timestamp=f"tick-{count[0]}")
+        binding.on_state(json.dumps(body))
+        tick(dt)
+
+    binding.tick = _tick
+    return binding

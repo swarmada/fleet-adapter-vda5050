@@ -121,6 +121,17 @@ class StateSnapshot:
     # button on the vehicle. VDA5050 does not say which.
     paused: bool = False
     map_id: str = ""
+    # The message's own identity: headerId (None unless an integer) and timestamp ("" unless a
+    # string). The binding drops a state it has already seen (QoS 1 redelivers byte for byte)
+    # by the pair, and counts a state toward an estop's confirmation only when it has both.
+    header_id: int | None = None
+    timestamp: str = ""
+    # actionIds the vehicle reports FINISHED (not FAILED): a startPause the vehicle carried out.
+    finished_actions: frozenset[str] = frozenset()
+    # The state carries a nodeStates list, and an actionStates list. Without one, active_nodes
+    # or active_actions reads 0 but is unknown: what is left to drive is not known.
+    node_states_reported: bool = False
+    action_states_reported: bool = False
 
 
 @dataclass(frozen=True)

@@ -405,10 +405,10 @@ def test_a_tick_while_the_hold_is_being_set_up_does_not_time_it_out() -> None:
     ticker = threading.Thread(target=b.tick, args=(1.0,))
     send_cancel = b._send_cancel
 
-    def mid_setup(robot_id, tag):
+    def mid_setup(robot_id):
         ticker.start()
         ticker.join(0.3)  # the tick waits for command_move, so this times out
-        return send_cancel(robot_id, tag)
+        return send_cancel(robot_id)
 
     b._send_cancel = mid_setup
     b.command_move(ROBOT, 9.0, 0.0)

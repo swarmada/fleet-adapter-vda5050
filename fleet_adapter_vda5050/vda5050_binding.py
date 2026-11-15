@@ -15,8 +15,9 @@ Subscribes to and parses ``connection`` (online/offline) and ``state`` (telemetr
 order progress, latest-wins); publishes ``order`` (task dispatch), a ``cancelOrder``
 instantAction (confirmed-stop safe-hold), and ``startPause`` / ``stopPause``
 instantActions (pause / resume the active order). ``is_stopped`` is CONFIRMED from
-``state`` (not driving + velocity ≈ 0), never inferred — the binding is
-safety-complete.
+``state`` (not driving, velocity ≈ 0, the pause acknowledged), never inferred, and
+``state_seq`` counts new states, so an estop is confirmed only from a state sent after
+it — the binding is safety-complete.
 
 A new order while the vehicle still has one is a preemption: ``cancelOrder`` first, and the
 new order once the vehicle reports the old one gone (:meth:`Vda5050Binding.command_move`).
@@ -29,6 +30,7 @@ import secrets
 import sys
 import threading
 import time
+from collections import deque
 from datetime import UTC, datetime
 
 from fleet_adapter_vda5050 import profiles, task
@@ -50,6 +52,14 @@ _EPS_ANGULAR = 0.01  # rad/s
 # can be a publish interval old (vda-5050-lib's default is 30 s). Past this the new order is
 # dropped and its action FAILED.
 _PREEMPT_TIMEOUT_S = 60.0
+
+# How many recent states a redelivery is looked for among. QoS 1 redelivers a message the
+# broker has not seen acknowledged, after a reconnect: the last few, not the last hundred.
+_STATE_DEDUP_WINDOW = 64
+
+# The operatingMode values in which only an order moves the vehicle. In MANUAL, SERVICE or
+# TEACHIN a person can drive it without one (VDA5050 2.0.0, 6.10.6).
+_ORDER_DRIVEN_MODES = frozenset({"AUTOMATIC", "SEMIAUTOMATIC"})
 
 
 class Vda5050Binding:
@@ -90,7 +100,24 @@ class Vda5050Binding:
         self._last_action: str | None = None       # last instantAction JSON built (test seam)
         self._action_seq = 0                       # generates a unique actionId per stop
         self._has_state = False                    # True once a state message has arrived
-        self._states_seen = 0                      # state messages received
+        self._states_seen = 0                      # state messages received, less redeliveries
+        # state_seq: states with a headerId and a timestamp, less redeliveries. Only these
+        # can confirm an estop (:meth:`state_seq`).
+        self._state_seq = 0
+        # (headerId, timestamp) of the last _STATE_DEDUP_WINDOW counted states: a QoS 1
+        # redelivery is byte for byte the state it repeats.
+        self._recent_states: deque[tuple[int, str]] = deque(maxlen=_STATE_DEDUP_WINDOW)
+        self._unidentified_reported = False        # a state with no headerId or timestamp, logged once
+        self._repeat_reported = False              # a dropped repeat, logged once
+        # The actionId of this binding's latest startPause, until a stopPause goes out: its
+        # FINISHED confirms the pause (:meth:`is_stopped`).
+        self._start_pause_id = ""
+        # A counted state that lists that startPause as ended has shown the vehicle paused
+        # (paused: true, or the startPause FINISHED). Kept
+        # when a later state shows the pause lifted, as a cancelOrder lifts it on
+        # vda-5050-lib's virtual vehicle; cleared by the next startPause, a stopPause or an
+        # order.
+        self._pause_acked = False
         self._holding = False                      # a stop has been commanded; hold until a new order
         self._recancelled = False                  # this stop's one late cancel has been sent
         self._stop_cancel_id = ""                  # the cancelOrder the last stop sent
@@ -128,14 +155,69 @@ class Vda5050Binding:
         return self.connection_state(robot_id) == profiles.CONN_ONLINE
 
     def on_state(self, payload) -> None:
-        snapshot = self._profile.parse_state(payload)  # latest-wins telemetry
+        """A ``state`` from the vehicle: stored (latest wins), counted, and then any held order
+        or late cancel is seen to.
+
+        A state seen before, by its headerId and timestamp, is a QoS 1 redelivery and is
+        dropped: not stored (it is older than the current one), not counted, nothing seen to.
+        A vehicle that restarts begins its headerIds again, with new timestamps, so its states
+        still count. A state without an integer headerId or a timestamp cannot be told from a
+        redelivery: it is stored and seen to, but not counted in :meth:`state_seq`, so it
+        never confirms an estop. That is logged once.
+
+        The state is stored before the counts rise, under one lock, so a reader that sees a
+        count raised reads a state at least as new as the one that raised it (the SDK's
+        ``state_seq`` contract)."""
+        snapshot = self._profile.parse_state(payload)
+        key = ((snapshot.header_id, snapshot.timestamp)
+               if snapshot.header_id is not None and snapshot.timestamp else None)
+        report = warn = False
         with self._publish_lock:
             with self._lock:
-                self._state = snapshot
-                self._has_state = True
-                self._states_seen += 1
+                repeat = key is not None and key in self._recent_states
+                if repeat:
+                    warn, self._repeat_reported = not self._repeat_reported, True
+                else:
+                    self._state = snapshot
+                    self._has_state = True
+                    self._states_seen += 1
+                    if key is not None:
+                        self._recent_states.append(key)
+                        self._state_seq += 1
+                        # Only a state that names this startPause as ended: one the vehicle
+                        # sent after it took the startPause. A paused: true from a state that
+                        # crossed it could be a pause the vehicle was about to leave.
+                        pid = self._start_pause_id
+                        if pid and pid in snapshot.ended_actions and (
+                                snapshot.paused or pid in snapshot.finished_actions):
+                            self._pause_acked = True
+                    elif not self._unidentified_reported:
+                        self._unidentified_reported = report = True
+            if repeat:
+                if warn:
+                    print(f"vda5050: warning: a state with headerId {key[0]} and timestamp "
+                          f"{key[1]!r} came again and was dropped. MQTT redelivers a message "
+                          "after a reconnect; a vehicle that sends one headerId and timestamp "
+                          "for two different states loses the second. Logged once.",
+                          file=sys.stderr)
+                return
+            if report:
+                print("vda5050: error: a state from the vehicle has no integer headerId or no "
+                      "timestamp, so a redelivered state cannot be told from a new one. Such "
+                      "states are used, but none confirms an emergency stop, which is then "
+                      "answered FAILED. Logged once.", file=sys.stderr)
             self._service_hold()
             self._cancel_late_order()
+
+    def state_seq(self, robot_id: str) -> int:
+        """How many new states, each with a headerId and a timestamp, this binding has received
+        from its vehicle: the SDK's ``await_estop_confirmation`` confirms a stop only from a
+        state counted after the stop was sent. Never falls. 0 for a robot id that is not this
+        binding's, so a stop is never confirmed for a robot it does not drive."""
+        if robot_id != self._robot_id:
+            return 0
+        with self._lock:
+            return self._state_seq
 
     def _cancel_late_order(self) -> None:
         """Once per stop: the vehicle has taken the order this binding stopped, after the stop's
@@ -165,7 +247,7 @@ class Vda5050Binding:
             if late:
                 print(f"vda5050: the vehicle is running order {last}, which was stopped; "
                       "cancelling it again", file=sys.stderr)
-                self._send_cancel(self._robot_id, "stop")
+                self._send_cancel(self._robot_id)
 
     def _service_hold(self) -> None:
         """Send a held order whose wait is over, or time the hold out (:meth:`_take_held_locked`)."""
@@ -179,28 +261,48 @@ class Vda5050Binding:
         info = self._profile.parse_factsheet(payload)  # capabilities self-description
         with self._lock:
             self._factsheet = info
-            self._check_id_len_locked(self._order_id_locked(self._order_seq + 1))
+            self._check_id_len_locked()
             self._check_node_id_len_locked()
 
     def _order_id_locked(self, seq: int) -> str:
         """The orderId of order number ``seq``. The caller holds the lock."""
         return f"{self._robot_id}-{self._boot}-order-{seq}"
 
-    def _check_id_len_locked(self, order_id: str) -> None:
-        """Log an error when ``order_id`` is longer than the vehicle's factsheet allows
-        (``protocolLimits.maxStringLens.idLen``): the vehicle would reject every order. The
-        orderId is the longest id this binding makes (an actionId is at most the robot id and
-        13 characters, before its number). Checked when a factsheet arrives, against the next
-        orderId, and again on each order sent, since the id grows a digit as orders mount.
-        Logged once for each limit. Nothing is refused here: the vehicle's rejection then ends
-        the action FAILED with its reason. The caller holds the lock."""
+    def _action_id_locked(self, robot_id: str, seq: int) -> str:
+        """The actionId of instantAction number ``seq``: ``robot-token-a-N``. It carries the
+        process token, as an orderId does: a vehicle lists an ended action for a while, and an
+        id a restarted adapter used again could look like this process's startPause FINISHED,
+        which confirms a stop (:meth:`is_stopped`). Four characters shorter than an orderId at
+        the same number, so a vehicle that takes this binding's orders takes its stops too.
+        The caller holds the lock."""
+        return f"{robot_id}-{self._boot}-a-{seq}"
+
+    def _check_id_len_locked(self, order_id: str | None = None) -> None:
+        """Log an error when the longest id this binding sends is longer than the vehicle's
+        factsheet allows (``protocolLimits.maxStringLens.idLen``). The longer of two: the
+        orderId (``order_id``, else the next one), and the next actionId. The orderId, unless
+        far more instantActions than orders have been sent. An actionId the vehicle rejects is
+        an instantAction it refuses, an emergency stop's among them; an orderId, an order.
+        Checked when a factsheet arrives, and again on each order and instantAction sent,
+        since the ids grow a digit as they mount. Logged once for each limit. Nothing is refused here: a rejected
+        order ends its action FAILED with the vehicle's reason, and a stop the vehicle does
+        not take is answered FAILED. The caller holds the lock."""
         limit = self._factsheet.id_len
-        if limit is None or len(order_id) <= limit or self._id_len_reported == limit:
+        if limit is None or self._id_len_reported == limit:
+            return
+        if order_id is None:
+            order_id = self._order_id_locked(self._order_seq + 1)
+        action_id = self._action_id_locked(self._robot_id, self._action_seq + 1)
+        kind, longest = max(("orderId", order_id), ("actionId", action_id),
+                            key=lambda k: len(k[1]))
+        if len(longest) <= limit:
             return
         self._id_len_reported = limit
+        what = ("its orders" if kind == "orderId"
+                else "its instantActions, an emergency stop's startPause among them")
         print(f"vda5050: error: the vehicle's factsheet limits ids to {limit} characters "
-              f"(protocolLimits.maxStringLens.idLen), and orderId {order_id} has "
-              f"{len(order_id)}; the vehicle will reject its orders. Use a shorter robot id.",
+              f"(protocolLimits.maxStringLens.idLen), and {kind} {longest} has "
+              f"{len(longest)}; the vehicle will reject {what}. Use a shorter robot id.",
               file=sys.stderr)
 
     def _check_node_id_len_locked(self) -> None:
@@ -260,7 +362,7 @@ class Vda5050Binding:
     def request_factsheet(self, robot_id: str) -> None:
         """Publish a VDA5050 ``factsheetRequest`` instantAction — asks the AGV to
         publish its ``factsheet``, which then arrives via :meth:`on_factsheet`."""
-        self._publish_action(robot_id, profiles.ACTION_FACTSHEET_REQUEST, "factsheet")
+        self._publish_action(robot_id, profiles.ACTION_FACTSHEET_REQUEST)
 
     # ── RobotBinding: telemetry accessors (sub-item 2) ────────────────────────
 
@@ -357,7 +459,7 @@ class Vda5050Binding:
                 return
             if held:
                 return  # the cancelOrder already sent ends the order this one waits on
-            cancel_id = open_cancel or self._send_cancel(robot_id, "preempt")
+            cancel_id = open_cancel or self._send_cancel(robot_id)
             with self._lock:
                 self._held_cancel_id = cancel_id
                 self._held_deadline = self._clock() + self._preempt_timeout_s
@@ -396,12 +498,16 @@ class Vda5050Binding:
             unpause = self._estop_paused
             self._estop_paused = False
         if pause:  # before the estop's stopPause: a Swarmada pause stays
-            self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "pause")
+            self._publish_action(robot_id, profiles.ACTION_START_PAUSE)
         elif unpause:
-            self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
+            self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE)
         with self._lock:
             self._check_id_len_locked(order_id)
             self._last_order_id = order_id
+            # The vehicle has work again: a new stop needs a new pause. Today a stopPause or a
+            # startPause always goes first and clears it already; kept so no later path
+            # carries a pause over an order.
+            self._pause_acked = False
             self._open_cancel_id = ""
             self._header_id += 1
             header_id = self._header_id
@@ -562,17 +668,19 @@ class Vda5050Binding:
                 if not always and self._nothing_to_cancel_locked():
                     self._suppressed_stops += 1
                     return
-            cancel_id = self._send_cancel(robot_id, "stop")
+            cancel_id = self._send_cancel(robot_id)
             with self._lock:
                 self._stop_cancel_id = cancel_id
 
-    def _send_cancel(self, robot_id: str, tag: str) -> str:
+    def _send_cancel(self, robot_id: str) -> str:
         """Publish a ``cancelOrder`` and return its actionId."""
         with self._publish_lock:
             with self._lock:
                 self._action_seq += 1
                 self._header_id += 1
-                header_id, action_id = self._header_id, f"{robot_id}-{tag}-{self._action_seq}"
+                header_id = self._header_id
+                action_id = self._action_id_locked(robot_id, self._action_seq)
+                self._check_id_len_locked()
             payload = self._profile.encode_instant_action(
                 header_id=header_id, action_type=profiles.ACTION_CANCEL_ORDER,
                 action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
@@ -601,7 +709,7 @@ class Vda5050Binding:
         with self._publish_lock:
             with self._lock:
                 self._estop_paused = True
-            self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "estop-pause")
+            self._publish_action(robot_id, profiles.ACTION_START_PAUSE)
             # Always, even when the last state shows nothing to cancel: that state can be up to
             # a publish interval old, and a paused order the cancel missed would be resumed by
             # the next stopPause. A noOrderToCancel warning is the price of a stop.
@@ -659,7 +767,7 @@ class Vda5050Binding:
         which uses ``cancelOrder`` (abort + hold)."""
         with self._lock:
             self._pause_requested = True
-        self._publish_action(robot_id, profiles.ACTION_START_PAUSE, "pause")
+        self._publish_action(robot_id, profiles.ACTION_START_PAUSE)
 
     def command_resume(self, robot_id: str) -> None:
         """Publish a VDA5050 ``stopPause`` instantAction — resumes a paused order. The adapter
@@ -667,14 +775,22 @@ class Vda5050Binding:
         with self._lock:
             self._estop_paused = False
             self._pause_requested = False
-        self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
+        self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE)
 
-    def _publish_action(self, robot_id: str, action_type: str, tag: str) -> None:
+    def _publish_action(self, robot_id: str, action_type: str) -> None:
         with self._publish_lock:
             with self._lock:
                 self._action_seq += 1
                 self._header_id += 1
-                header_id, action_id = self._header_id, f"{robot_id}-{tag}-{self._action_seq}"
+                header_id = self._header_id
+                action_id = self._action_id_locked(robot_id, self._action_seq)
+                self._check_id_len_locked()
+                # Before it is sent, so its FINISHED cannot arrive first. A stopPause ends the
+                # pause: an earlier startPause's FINISHED then confirms nothing.
+                if action_type == profiles.ACTION_START_PAUSE:
+                    self._start_pause_id, self._pause_acked = action_id, False
+                elif action_type == profiles.ACTION_STOP_PAUSE:
+                    self._start_pause_id, self._pause_acked = "", False
             payload = self._profile.encode_instant_action(
                 header_id=header_id, action_type=action_type,
                 action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
@@ -691,16 +807,43 @@ class Vda5050Binding:
             return self._last_action
 
     def is_stopped(self, robot_id: str) -> bool:
-        """CONFIRMED at rest: a ``state`` has been observed, the robot reports it is
-        not driving, and the reported velocity is within sensor noise. Returns False
-        until a state arrives — rest is never inferred from the stop command, a timer,
-        or the absence of a message (C5.3)."""
+        """CONFIRMED at rest and paused: a ``state`` has been observed, the robot reports it is
+        not driving, the reported velocity is within sensor noise, and the vehicle has
+        acknowledged the pause. Returns False until a state arrives — rest is never inferred
+        from the stop command, a timer, or the absence of a message (C5.3).
+
+        The pause is acknowledged when the state reports ``paused: true``, or reports this
+        binding's latest ``startPause`` FINISHED (VDA5050 2.0.0: a finished startPause means
+        the vehicle "stands still" and reports paused). Every caller asks after a startPause:
+        the estop's, or a Swarmada pause. A vehicle at rest between nodes has not stopped
+        until it has paused, since a stopPause or its order could move it on. A startPause
+        that FAILED confirms nothing by itself, and does not stand against ``paused: true``:
+        a vehicle already paused refuses a second startPause and stays paused.
+
+        Or: a counted state that lists this startPause as ended has shown the vehicle paused,
+        and it now has nothing left to drive: no node, no action that has not ended, and the
+        last order this binding sent is the one it reports (none in flight). A state that
+        leaves out ``nodeStates`` or ``actionStates`` says nothing about what is left, and
+        does not confirm by this rule. The estop's
+        cancelOrder can lift the pause (vda-5050-lib's virtual vehicle lifts it when it ends
+        an order), and a vehicle drops an ended instantAction from its state after a few
+        publishes, so the latest state may show neither; with no order left, nothing moves
+        it. Only in AUTOMATIC or SEMIAUTOMATIC operatingMode: in MANUAL, SERVICE or TEACHIN a
+        person can move the vehicle without an order."""
         with self._lock:
             if not self._has_state:
                 return False
-            driving = self._state.driving
-            linear, angular = self._state.velocity
-        return (not driving) and linear <= _EPS_LINEAR and angular <= _EPS_ANGULAR
+            st, pause_id, acked = self._state, self._start_pause_id, self._pause_acked
+            last_order = self._last_order_id
+        linear, angular = st.velocity
+        if st.driving or linear > _EPS_LINEAR or angular > _EPS_ANGULAR:
+            return False
+        if st.paused or (bool(pause_id) and pause_id in st.finished_actions):
+            return True
+        return (acked and st.node_states_reported and st.action_states_reported
+                and not st.active_nodes and not st.active_actions
+                and st.operating_mode in _ORDER_DRIVEN_MODES
+                and (not last_order or st.order_id == last_order))
 
     def tick(self, dt: float) -> None:
         """paho runs its own network loop, so there is no model to advance -- but this is
