@@ -92,7 +92,8 @@ the `--comms simulated` path and existing setups are unaffected.
   instead of declining it, and discovers a live robot's capabilities from its
   VDA5050 `factsheet` (`request_factsheet` publishes a `factsheetRequest`
   instantAction; `on_factsheet` parses `typeSpecification` + `protocolFeatures`); and
-- **streams task completion**: it derives `SUCCEEDED` (order reached its last node) /
+- **streams task completion**: it derives `SUCCEEDED` (order reached its last node, read
+  from a `nodeStates` list: a `state` without one isn't taken as arrived) /
   `FAILED` (FATAL error) from the robot's `state` and reports the terminal
   `TaskStatusUpdate` once — echoing the executing fencing token (C6.4) — so the
   control-plane FleetTask lifecycle sees the order finish, not just start.
@@ -163,7 +164,8 @@ has reported the pause.
 - **Any other stop** (a cancel, a lapsed lease, the reconcile at registration) is
   `cancelOrder`. It is not sent when the vehicle's own `state` says there is nothing to
   cancel: at rest, no node left, no action that has not ended, and no order the adapter
-  sent still outstanding. An emergency stop always sends it.
+  sent still outstanding. A `state` that leaves out `nodeStates` or `actionStates` never
+  says that, so the cancel is sent. An emergency stop always sends it.
 - **A pause at the vehicle.** When the vehicle reports `paused` and the adapter did not
   pause it (by its button, or by an earlier adapter process), work is refused
   `ROBOT_UNAVAILABLE` with "paused at the vehicle". The adapter never sends the
@@ -183,11 +185,11 @@ higher-priority action preempting a running one), the adapter does not send the 
 at once:
 
 - It sends `cancelOrder` and holds the new order. The vehicle "may still have an order"
-  when its last `state` lists a node or an action that has not ended, or does not yet
-  report the last order the adapter sent.
+  when its last `state` lists a node or an action that has not ended, leaves out
+  `nodeStates` or `actionStates`, or does not yet report the last order the adapter sent.
 - The held order goes out once the vehicle reports that cancel ended (`FINISHED`, or
-  refused with a `noOrderToCancel` error naming it), with no node and no action left and
-  not driving. It starts from where the vehicle stopped. Only the cancel's own end counts:
+  refused with a `noOrderToCancel` error naming it), with both lists reported, no node and
+  no action left, and not driving. It starts from where the vehicle stopped. Only the cancel's own end counts:
   MQTT keeps one client's messages in order per topic only, and an order that overtook its
   cancel would be ended by it.
 - A cancel from a stop is waited on while the vehicle lists it as running, or before any
@@ -224,7 +226,14 @@ warning until it accepts a new order (VDA 5050 2.0.0 6.6.4).
 - **An order taken after it was stopped.** If the vehicle reports a stop's `cancelOrder`
   ended and then runs the order the adapter stopped, the adapter sends one more
   `cancelOrder`. That happens when the cancel overtakes the order, or when a rejected order
-  is delivered again and taken.
+  is delivered again and taken. A `state` that leaves out `nodeStates` or `actionStates`
+  counts as still running it.
+- **A `state` without `nodeStates` or `actionStates`.** VDA 5050 2.0.0 requires both lists.
+  Without one, what the vehicle has left to do is unknown, never taken as nothing. Every stop
+  then sends its `cancelOrder`, an order waits behind a cancel for a `state` with both
+  lists, and no task is marked done. The adapter logs this once, as an error. Likewise an
+  action listed with no `actionStatus`, or one other than VDA 5050's, counts as not
+  ended: only `FINISHED` and `FAILED` end it.
 - Each `orderId` carries a token unique to the adapter process. A rejection the vehicle still
   reports from an earlier process can then not be taken for one of this process's orders.
   An `orderId` is the robot id, 16 characters, and the order's number. An `actionId` carries
