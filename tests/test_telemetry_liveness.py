@@ -98,13 +98,14 @@ def test_an_unobservable_robot_is_reported_OFFLINE_with_no_position_or_battery()
 
 
 def test_the_old_behaviour_would_have_published_the_defaults() -> None:
-    """Pins WHAT was wrong, so the regression is recognisable rather than abstract. These
-    are the values the accessors return on an un-started binding, and they were published
+    """Pins WHAT was wrong, so the regression is recognisable rather than abstract. The
+    accessors of an un-started binding answered the origin and 0%, and those were published
     every 200 ms with a fresh timestamp — while the binding's own connection state said
-    OFFLINE in the same breath."""
+    OFFLINE in the same breath. They now answer None (unknown) as well, so not even a live
+    binding that has no reading can send them."""
     b = Vda5050Binding(robot_id="amr-1")
-    assert b.pose("amr-1") == (0.0, 0.0, 0)
-    assert b.battery_percent("amr-1") == 0
+    assert b.pose("amr-1") is None
+    assert b.battery_percent("amr-1") is None
     assert b.is_online("amr-1") is False     # the binding KNEW
     assert b.transport_alive() is False      # ...and the adapter now asks this first
 

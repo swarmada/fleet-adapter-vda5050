@@ -171,10 +171,17 @@ class RobotBinding(Protocol):
         binding whose state is current after every `tick()` declares
         `tick_keeps_state_current = True` instead (SimulatedRobot)."""
 
-    def pose(self, robot_id: str) -> tuple[float, float, int]:
-        """(x, y, floor) in the zone frame."""
+    def pose(self, robot_id: str) -> tuple[float, float, int] | None:
+        """(x, y, floor) in the zone frame; None while the binding does not know it, and the
+        adapter then sends no position (C6.2: never a defaulted origin)."""
 
-    def battery_percent(self, robot_id: str) -> int: ...
+    def reported_pose(self, robot_id: str) -> tuple[float, float, float | None, int] | None:
+        """Optional: (x, y, yaw, floor), read as one, with yaw None when the robot gave no
+        heading; None while unknown. When a binding has it, the adapter sends the heading
+        too (VDA5050: a state's or a visualization's agvPosition)."""
+
+    def battery_percent(self, robot_id: str) -> int | None:
+        """0–100; None while unknown, and the adapter then sends no battery (C6.2)."""
 
 
 class SimulatedRobot:

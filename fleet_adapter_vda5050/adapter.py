@@ -1028,7 +1028,7 @@ class fleet_adapter_vda5050Adapter:
         while not self._shutdown.is_set():
             with self._action_lock:  # an expiry ends the action: one step, as every other end
                 self._lease.tick()  # C4 self-stop check — must keep running while degraded
-            x = y = floor = battery = None
+            position = battery = None
             with self._robot_lock:
                 try:
                     self._tick_robot()  # advances the scenario clock too
@@ -1040,7 +1040,7 @@ class fleet_adapter_vda5050Adapter:
                     # not depend on which thread happened to consume the one-shot raise.
                     live, detail = False, str(exc)
                 if live:
-                    x, y, floor = self._robot.pose(self._robot_id)
+                    position = self._position_now()  # None while unknown: left out (C6.2)
                     battery = self._robot.battery_percent(self._robot_id)  # battery-edge curve
             self._maybe_estop_drill()   # estop-drill: confirmed stop on a timer
             self._maybe_stream_drop()   # comms-flaky: tear the stream down on a timer
@@ -1067,14 +1067,39 @@ class fleet_adapter_vda5050Adapter:
                       "position and battery are being sent.", file=sys.stderr)
             phase = (pb.RobotPhase.ROBOT_PHASE_IN_PROGRESS if self._current_action
                      else pb.RobotPhase.ROBOT_PHASE_IDLE)
+            # C6.2: a position or battery the binding does not know is left out, never sent
+            # as a defaulted origin or 0%.
             self._outbox.put(pb.AdapterMessage(telemetry=pb.TelemetryPayload(  # C6
                 robot_id=self._robot_id, timestamp_ms=int(time.time() * 1000),
-                position=pb.RobotPosition(x=x, y=y, floor=floor),  # C6.2 explicit presence
-                battery=pb.BatteryStatus(percent=battery), phase=phase,
+                position=position,
+                battery=pb.BatteryStatus(percent=battery) if battery is not None else None,
+                phase=phase,
                 current_action=self._current_action,
                 hardware=self._hardware_updates())))  # hardware-fault, delta-compressed
             self._maybe_emit_task_progress()  # stream order completion / failure (C6.4)
             time.sleep(self._telemetry_interval)
+
+    def _position_now(self):
+        """The robot's position as a RobotPosition, or None while the binding does not know
+        it. With the binding's ``reported_pose`` (VDA5050), the heading is sent when the
+        vehicle gave one; a binding with ``pose`` alone sends x, y and floor. The caller holds
+        the robot lock."""
+        pb = self._pb
+        reported = getattr(self._robot, "reported_pose", None)
+        if callable(reported):
+            p = reported(self._robot_id)
+            if p is None:
+                return None
+            x, y, yaw, floor = p
+            pos = pb.RobotPosition(x=x, y=y, floor=floor)
+            if yaw is not None:
+                pos.yaw = yaw
+            return pos
+        p = self._robot.pose(self._robot_id)
+        if p is None:
+            return None
+        x, y, floor = p
+        return pb.RobotPosition(x=x, y=y, floor=floor)
 
     def _tick_robot(self) -> None:
         """Advance the robot (and the scenario clock) by the time that passed since the last
@@ -1378,11 +1403,13 @@ class fleet_adapter_vda5050Adapter:
         estub = self._pb_grpc.EdgeServiceStub(self._dial_edge(addr))
         outbox: queue.Queue = queue.Queue()
         # C8.2: tee one PositionFrame so the edge node has a pose to evaluate, fire-and-forget.
+        # Only while the robot can be observed and its position is known, as for telemetry: no
+        # frame otherwise, never a frozen one or one at the origin (C6.2).
         with self._robot_lock:
-            x, y, floor = self._robot.pose(self._robot_id)
-        outbox.put(pb.AdapterEdgeMessage(position=pb.PositionFrame(
-            robot_id=self._robot_id,
-            position=pb.RobotPosition(x=x, y=y, floor=floor))))
+            position = self._position_now() if self._robot.transport_alive() else None
+        if position is not None:
+            outbox.put(pb.AdapterEdgeMessage(position=pb.PositionFrame(
+                robot_id=self._robot_id, position=position, ts_ms=_now_ms())))
 
         def requests() -> Iterator:
             while True:

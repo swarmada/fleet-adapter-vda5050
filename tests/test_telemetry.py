@@ -116,7 +116,9 @@ def test_binding_caches_and_maps_state() -> None:
 
 
 def test_binding_defaults_before_any_state() -> None:
+    # Unknown, not the origin or 0% (C6.2).
     b = Vda5050Binding(robot_id="amr-1")
-    assert b.pose("amr-1") == (0.0, 0.0, 0)
-    assert b.battery_percent("amr-1") == 0
+    assert b.pose("amr-1") is None
+    assert b.reported_pose("amr-1") is None
+    assert b.battery_percent("amr-1") is None
     assert b.latest_hardware("amr-1") == []
