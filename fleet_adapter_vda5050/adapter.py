@@ -33,6 +33,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from swarmada_sdk.safety import (
     ESTOP_FAILED,
     ESTOP_STOPPED,
+    EstopToken,
     FenceDecision,
     FenceGuard,
     LeaseMonitor,
@@ -593,7 +594,7 @@ class fleet_adapter_vda5050Adapter:
         else:
             ack.stop_initiated_at = _now_ms()
             with self._robot_lock:
-                self._command_estop()
+                self._command_estop()  # its token is not needed: this stop is not confirmed
             self._interrupt_current("emergency stop under a robot_id this adapter does not serve",
                                     command_stop=False)
             self._log_unserved(received, f"{via} id={estop_id}",
@@ -905,13 +906,20 @@ class fleet_adapter_vda5050Adapter:
         Deliberately NOT a blanket `except Exception`: only the transport's own
         RuntimeError is absorbed. A bug in the safety primitive itself must still crash.
         """
-        self._command_estop()
-        return self._await_estop()
+        return self._await_estop(self._command_estop())
 
-    def _command_estop(self) -> None:
+    def _command_estop(self) -> EstopToken | None:
         """Issue the emergency stop (`command_estop`) and return without confirming rest. The
         caller holds the robot lock. The transport's RuntimeError is reported, never raised:
-        `_await_estop` then answers FAILED, the true answer (see `_confirm_estop`)."""
+        `_await_estop` then answers FAILED, the true answer (see `_confirm_estop`).
+
+        Returns the token to pass to `_await_estop`: the binding's `state_seq` read once the
+        stop was sent, so only a state that came after it confirms the stop. Not the SDK's
+        `command_estop`, which stops with `command_stop` (a cancelOrder alone, no startPause).
+        None when the binding has no `state_seq`, when the stop could not be sent, or when
+        `state_seq` raised; the wait then reads the count when it begins, which is stricter.
+        Returned and never kept: a token kept from an earlier stop would let a state from
+        between the two stops confirm the later one."""
         self._estop_epoch += 1
         # A binding written before command_estop was declared still stops: with its stop. An
         # estop must never end in an AttributeError that kills the thread and leaves no ack.
@@ -921,12 +929,23 @@ class fleet_adapter_vda5050Adapter:
         except RuntimeError as exc:
             print(f"estop could not be commanded - the robot binding's transport is not "
                   f"live: {exc}", file=sys.stderr)
-
-    def _await_estop(self) -> str:
-        """Wait for confirmed rest after `_command_estop`: STOPPED, or FAILED. The caller holds
-        the robot lock."""
+            return None
+        state_seq = getattr(self._robot, "state_seq", None)
+        if not callable(state_seq):
+            return None
         try:
-            return await_estop_confirmation(self._robot, self._robot_id)
+            seq = state_seq(self._robot_id)
+        except Exception as exc:  # noqa: BLE001 - the stop is sent; the wait then reads the count itself
+            print(f"estop: the robot binding's state_seq raised after the stop was sent: "
+                  f"{exc!r}", file=sys.stderr)
+            return None
+        return EstopToken(self._robot_id, seq, id(self._robot))
+
+    def _await_estop(self, since: EstopToken | None) -> str:
+        """Wait for confirmed rest after `_command_estop`, given the token it returned:
+        STOPPED, or FAILED. The caller holds the robot lock."""
+        try:
+            return await_estop_confirmation(self._robot, self._robot_id, since=since)
         except RuntimeError as exc:
             print(f"estop could not be confirmed - the robot binding's transport is not "
                   f"live, so rest cannot be read from the robot and C5.3 forbids "
@@ -1193,10 +1212,10 @@ class fleet_adapter_vda5050Adapter:
         # "inferred, not confirmed" case the estop protocol forbids.
         initiated_ms = int(time.time() * 1000)
         with self._robot_lock:
-            self._command_estop()
+            since = self._command_estop()
         self._interrupt_current("estop drill (scenario)", command_stop=False)  # like a real estop
         with self._robot_lock:
-            state = self._await_estop()  # C5 discipline: never faked
+            state = self._await_estop(since)  # C5 discipline: never faked
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id, estop_ack=pb.EstopAck(
                 estop_id=f"drill-{self._robot_id}",
@@ -1280,10 +1299,10 @@ class fleet_adapter_vda5050Adapter:
         # the work it held is interrupted, and then rest is confirmed.
         initiated_ms = _now_ms()
         with self._robot_lock:
-            self._command_estop()
+            since = self._command_estop()
         self._interrupt_current("emergency stop", command_stop=False)
         with self._robot_lock:
-            state = self._await_estop()  # C5: confirmed, never inferred
+            state = self._await_estop(since)  # C5: confirmed, never inferred
         stopped = state == ESTOP_STOPPED
         self._latch.record_state(self._robot_id, estop_id, "STOPPED" if stopped else "FAILED")
         ack = pb.EstopAck(estop_id=estop_id, stop_initiated_at=initiated_ms,

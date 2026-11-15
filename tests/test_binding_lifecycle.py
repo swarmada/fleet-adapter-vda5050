@@ -27,7 +27,7 @@ provable wherever the tests run.
 from __future__ import annotations
 
 import pytest
-from conftest import mark_transport_live
+from conftest import mark_transport_live, reply_on_tick
 from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED
 
 from fleet_adapter_vda5050 import profiles
@@ -239,8 +239,7 @@ def test_an_inert_transport_still_answers_an_estop_with_FAILED() -> None:
 def test_a_live_transport_still_reaches_the_real_confirm_estop() -> None:
     """The wrapper must not swallow the normal path: a binding that CAN confirm rest must
     still report STOPPED, or the guard above would have turned every estop into FAILED."""
-    b = mark_transport_live(Vda5050Binding(robot_id="amr-1"))
-    b.on_state('{"driving": false, "velocity": {"vx": 0.0, "vy": 0.0, "omega": 0.0}}')
+    b = reply_on_tick(mark_transport_live(Vda5050Binding(robot_id="amr-1")), paused=True)
     a = Adapter(None, None, b, "amr-1")
     assert a._confirm_estop() == ESTOP_STOPPED
 

@@ -9,8 +9,8 @@ testable without a broker: ``paho`` is an optional dependency imported lazily in
 nor a live broker. Subscriptions registered before :meth:`connect` are applied on
 connect, so the binding can wire its handlers at construction time.
 
-VDA5050 runs over MQTT at QoS 1 (at-least-once); the binding dedups duplicate
-deliveries on the message ``headerId`` (sub-items 3–4).
+VDA5050 runs over MQTT at QoS 1 (at-least-once); the binding drops a redelivered
+``state`` by its ``headerId`` and ``timestamp`` (``Vda5050Binding.on_state``).
 """
 
 from __future__ import annotations

@@ -115,6 +115,11 @@ class Vda5050Profile:
             order_errors=_order_errors(obj.get("errors")),
             paused=obj.get("paused") is True,
             map_id=str(ap.get("mapId", "")) if isinstance(ap, dict) else "",
+            header_id=_header_id(obj.get("headerId")),
+            timestamp=obj["timestamp"] if isinstance(obj.get("timestamp"), str) else "",
+            finished_actions=_finished_actions(obj.get("actionStates")),
+            node_states_reported=isinstance(node_states, list),
+            action_states_reported=isinstance(obj.get("actionStates"), list),
         )
 
     def parse_factsheet(self, payload: bytes | str) -> FactsheetInfo:
@@ -366,6 +371,21 @@ def _active_action_ids(states) -> frozenset[str]:
 
 # actionStatus values of an action that has ended.
 _ACTION_ENDED = frozenset({"FINISHED", "FAILED"})
+
+
+def _header_id(value) -> int | None:
+    """The state's headerId when it is an integer (not a bool, not a float), else None."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _finished_actions(states) -> frozenset[str]:
+    """The actionIds listed in ``actionStates`` as FINISHED. Unlike :func:`_ended_actions`, not
+    FAILED and not an error reference: only an action the vehicle carried out."""
+    if not isinstance(states, list):
+        return frozenset()
+    return frozenset(st["actionId"] for st in states
+                     if isinstance(st, dict) and st.get("actionStatus") == "FINISHED"
+                     and isinstance(st.get("actionId"), str))
 
 
 def _ended_actions(states, errors) -> frozenset[str]:

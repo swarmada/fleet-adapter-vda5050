@@ -14,15 +14,16 @@ from __future__ import annotations
 
 import json
 
-from conftest import mark_transport_live
+from conftest import mark_transport_live, reply_on_tick
 from swarmada_sdk.safety import ESTOP_FAILED, ESTOP_STOPPED, confirm_estop
 
 from fleet_adapter_vda5050 import profiles
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
 
-def _state(driving=False, vx=0.0, vy=0.0, omega=0.0):
-    return json.dumps({"driving": driving, "velocity": {"vx": vx, "vy": vy, "omega": omega}})
+def _state(driving=False, vx=0.0, vy=0.0, omega=0.0, paused=False):
+    return json.dumps({"driving": driving, "velocity": {"vx": vx, "vy": vy, "omega": omega},
+                       "paused": paused})
 
 
 def test_is_stopped_false_before_any_state() -> None:
@@ -39,9 +40,11 @@ def test_is_stopped_false_while_driving_or_moving() -> None:
     assert b.is_stopped("amr-1") is False
 
 
-def test_is_stopped_true_only_when_not_driving_and_still() -> None:
+def test_is_stopped_true_only_when_not_driving_still_and_paused() -> None:
     b = Vda5050Binding(robot_id="amr-1")
     b.on_state(_state(driving=False, vx=0.005, omega=0.005))  # within sensor noise
+    assert b.is_stopped("amr-1") is False  # at rest, but nothing says it will stay there
+    b.on_state(_state(driving=False, vx=0.005, omega=0.005, paused=True))
     assert b.is_stopped("amr-1") is True
 
 
@@ -75,9 +78,17 @@ def test_stop_uses_monotonic_header_id() -> None:
 # behaviour of an INERT binding is covered on its own in test_binding_lifecycle.py.
 
 def test_confirm_estop_stopped_when_state_confirms_rest() -> None:
-    b = mark_transport_live(Vda5050Binding(robot_id="amr-1"))
-    b.on_state(_state(driving=False, vx=0.0))
+    # The SDK's confirm_estop stops with command_stop (a cancelOrder, no startPause): only a
+    # vehicle that reports itself paused, in a state sent after the stop, confirms it.
+    b = reply_on_tick(mark_transport_live(Vda5050Binding(robot_id="amr-1")), paused=True)
     assert confirm_estop(b, "amr-1") == ESTOP_STOPPED
+
+
+def test_confirm_estop_fails_from_a_state_older_than_the_stop() -> None:
+    b = mark_transport_live(Vda5050Binding(robot_id="amr-1"))
+    b.on_state(json.dumps({"headerId": 1, "timestamp": "t1", "driving": False, "paused": True,
+                           "velocity": {"vx": 0.0, "vy": 0.0, "omega": 0.0}}))
+    assert confirm_estop(b, "amr-1", tick_dt=0.0, max_ticks=5) == ESTOP_FAILED
 
 
 def test_confirm_estop_fails_when_robot_still_moving() -> None:

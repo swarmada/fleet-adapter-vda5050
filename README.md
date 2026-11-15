@@ -106,6 +106,51 @@ Safety is **never faked**: `is_stopped` is CONFIRMED from the robot's `state`
 (velocity ≈ 0 / not driving), never inferred from a timer or from silence
 (CONFORMANCE.md C5).
 
+### When an emergency stop is confirmed
+
+An emergency stop is answered `STOPPED` only from a `state` the vehicle sent after the
+stop, which shows it at rest and paused:
+
+- **After the stop.** The adapter counts the states it receives. A state counted before the
+  stop was sent can't confirm it.
+- **At rest and paused.** The state shows the vehicle not driving, with its velocity within
+  sensor noise, and paused: `paused: true`, or the stop's `startPause` reported `FINISHED`.
+  VDA 5050 2.0.0 says a finished `startPause` means the vehicle "stands still" and reports
+  `paused: true`. A `startPause` that `FAILED` confirms nothing by itself. A vehicle already
+  paused refuses a second one and still reports `paused: true`, so a second stop is
+  confirmed.
+- **Or paused, then nothing left to drive.** A vehicle can leave pause mode when the stop's
+  `cancelOrder` ends its order, and vda-5050-lib's virtual vehicle does. It also drops an
+  ended instant action from its `state` after a few publishes. So the stop is also
+  confirmed when a counted `state` that lists the stop's `startPause` as ended has shown
+  the vehicle paused, and the latest one shows it at rest, with no node and no action left,
+  reporting the last order the adapter sent, in `AUTOMATIC` or `SEMIAUTOMATIC` mode. A
+  `state` that doesn't name the `startPause` may have been sent before the vehicle took it.
+  A `state` that leaves out `nodeStates` or `actionStates` says nothing about what is left,
+  so it doesn't confirm the stop this way. In `MANUAL`, `SERVICE` or `TEACHIN` a person can
+  move the vehicle without an order, so only `paused: true` or the `startPause` finished
+  confirms the stop there.
+- **Within 2 s.** The adapter waits 2 s for that state, then answers `FAILED`. VDA 5050
+  lets a vehicle send its `state` on "relevant events" or "at the latest every 30s", so
+  the vehicle must report the pause, or its `startPause` finished, within 2 s of the stop.
+  vda-5050-lib's virtual vehicle reports it on its next tick, within 200 ms at its default
+  5 Hz.
+- **Each state once.** MQTT QoS 1 can deliver a message twice. A `state` with the
+  `headerId` and `timestamp` of one of the last 64 is dropped: not stored, not counted. A
+  vehicle that restarts begins its `headerId`s again, with new timestamps, so its states
+  still count. The first drop is logged as a warning: a vehicle that sends one `headerId`
+  and `timestamp` for two different states loses the second.
+- **Its own `startPause`.** Each `actionId` carries the same token unique to the adapter
+  process as an `orderId` does. A vehicle lists an ended action for a while, so a `startPause`
+  `FINISHED` from an earlier adapter process can't be taken for this one's.
+- **Without a `headerId` or `timestamp`.** A `state` that lacks an integer `headerId` or a
+  `timestamp` can't be told from a repeat. It updates the vehicle's telemetry but isn't
+  counted, so it never confirms a stop. The adapter logs this once, as an error.
+
+A pause for Swarmada (`require_stop_before_ack`) is checked once, right after its
+`startPause`, against the same rule. A vehicle at rest is answered `paused=false` until it
+has reported the pause.
+
 ### Stops and pauses on a VDA 5050 vehicle
 
 - **An emergency stop** is `startPause`, then `cancelOrder`. VDA 5050 2.0.0 lets
@@ -182,10 +227,13 @@ warning until it accepts a new order (VDA 5050 2.0.0 6.6.4).
   is delivered again and taken.
 - Each `orderId` carries a token unique to the adapter process. A rejection the vehicle still
   reports from an earlier process can then not be taken for one of this process's orders.
-  An `orderId` is the robot id, 16 characters, and the order's number. When the vehicle's
-  factsheet sets a shorter `protocolLimits.maxStringLens.idLen`, the adapter logs an error
-  naming the limit and the id's length, once for each limit: the vehicle would reject every
-  order. A shorter robot id fixes it.
+  An `orderId` is the robot id, 16 characters, and the order's number. An `actionId` carries
+  the token too: the robot id, 12 characters, and the action's number. It's 4 characters
+  shorter at the same number, so a vehicle that takes the adapter's orders takes its stops.
+  `idLen` bounds both. When the vehicle's factsheet sets a shorter
+  `protocolLimits.maxStringLens.idLen`, the adapter logs an error naming the limit and the
+  longer id's length, once for each limit: the vehicle would reject the orders, or instant
+  actions, that carry it. A shorter robot id fixes it.
 - **Not detected:** a rejection whose error names only the `headerId`. Header ids restart
   with the adapter process, so an old error could be taken for a new order. That action ends
   at its lease or the control plane's timeout.
@@ -255,7 +303,7 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 --comms vda505
   coordinate that is not a finite number within 10^6 m, two nodes closer than 0.05 m, a node
   named `start` or `goal` (the order's own ends), or a graph that is not connected.
 - **idLen.** When the vehicle's factsheet arrives, a node id longer than its `idLen` is logged
-  as an error, as an orderId is.
+  as an error, as an over-long orderId or actionId is.
 - **No traffic control.** Each vehicle is routed alone. Two vehicles on the same lanes can meet
   head-on, and nothing keeps a vehicle off a lane another robot is using.
 - **`examples/warehouse-lanes.yaml`** is the warehouse world's lane graph, generated from the
