@@ -145,6 +145,17 @@ class RobotBinding(Protocol):
         vehicle, say): the adapter then refuses work, ROBOT_UNAVAILABLE. A binding whose robot
         has no pause of its own answers False."""
 
+    def goal_refusal(self, robot_id: str, x: float, y: float) -> str:
+        """Why the binding cannot route an order to a goal at (x, y), or "" when it can: the
+        adapter then refuses the assignment, INVALID_ACTION, with this text. Optional: a
+        binding without it routes nothing, and every goal can be sent (VDA5050: a goal off
+        the lanes of a route graph, vda5050_binding.py)."""
+
+    def route_unavailable(self, robot_id: str) -> str:
+        """Why the binding can route no order now, or "" when it can: the adapter then
+        refuses work, ROBOT_UNAVAILABLE. Optional, as goal_refusal is (VDA5050: the vehicle's
+        position is unknown while a route graph is loaded)."""
+
     def tick(self, dt: float) -> None:
         """Advance any internal model by dt seconds (no-op for a real robot)."""
 

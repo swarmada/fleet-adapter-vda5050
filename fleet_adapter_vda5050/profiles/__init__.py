@@ -17,6 +17,7 @@ in vendor repositories.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, runtime_checkable
 
@@ -81,7 +82,8 @@ class OrderTarget:
     y: float
     theta: float = 0.0
     map_id: str = ""        # string map identifier (e.g. a floor/level map), not a number
-    label: str = ""         # named destination when coordinates are resolved by the robot's map
+    label: str = ""         # named destination when coordinates are resolved by the robot's map;
+                            # on a lane node of a route (encode_order's via), its node id
 
 
 @dataclass
@@ -171,10 +173,12 @@ class CommsProfile(Protocol):
 
     def encode_order(self, header_id: int, order_id: str, order_update_id: int,
                      manufacturer: str, serial: str, start: OrderTarget | None,
-                     goal: OrderTarget, timestamp: str) -> str:
+                     goal: OrderTarget, timestamp: str,
+                     via: Sequence[OrderTarget] = ()) -> str:
         """A navigation :class:`OrderTarget` → the wire order payload (a JSON string
-        for VDA5050). ``header_id``/``order_update_id`` are monotonic — the robot-side
-        at-least-once dedup keys."""
+        for VDA5050), passing ``via`` in order on the way (a route along the lanes).
+        ``header_id``/``order_update_id`` are monotonic — the robot-side at-least-once
+        dedup keys."""
 
     def encode_instant_action(self, header_id: int, action_type: str, action_id: str,
                               manufacturer: str, serial: str, timestamp: str,

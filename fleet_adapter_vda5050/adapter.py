@@ -698,6 +698,15 @@ class fleet_adapter_vda5050Adapter:
                 unhonourable_subjects=unhonourable))
             return
         goal = task_map.goal_from_assign(task.destination, task.payload_json)  # FleetTask → order target
+        # With a route graph (--route-graph) a goal off the lanes is refused: the order's last
+        # leg would leave them. A binding without goal_refusal routes nothing, so it has none.
+        goal_refusal = getattr(self._robot, "goal_refusal", None)
+        refusal = goal_refusal(self._robot_id, goal.x, goal.y) if goal_refusal else ""
+        if refusal:
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_INVALID_ACTION,
+                message=refusal))
+            return
         with self._robot_lock:
             if self._estop_epoch != epoch:
                 # An emergency stop was commanded while this assignment was being checked. The
@@ -735,13 +744,19 @@ class fleet_adapter_vda5050Adapter:
           as long as its lease is renewed, and the adapter does not release a pause it did not
           set. A pause pressed during this adapter's own estop pause is not seen here: the
           stopPause sent before the first order after the clear releases it (VDA5050 2.0.0:
-          stopPause "can also restart vehicles that were stopped with a hardware button")."""
+          stopPause "can also restart vehicles that were stopped with a hardware button").
+        * With a route graph, the vehicle's position is unknown: an order starts from it
+          (``route_unavailable``, vda5050_binding.py)."""
         if not self._registered:
             return "this robot's registration was not accepted on this session"
         paused = getattr(self._robot, "paused_at_vehicle", None)  # a binding written before it
+        unroutable = getattr(self._robot, "route_unavailable", None)  # a binding that routes
         with self._robot_lock:
             if paused is not None and paused(self._robot_id):
                 return "paused at the vehicle"
+            why = unroutable(self._robot_id) if unroutable is not None else ""
+            if why:
+                return why
         return ""
 
     def _reconcile_action_state(self, ack) -> None:
@@ -1409,6 +1424,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--serial", default="amr-1",
                     help="vda5050 comms: 'serialNumber' segment of the robot's MQTT topic "
                          "identity. Must match the robot's VDA5050 serial to bind a real AMR.")
+    ap.add_argument("--route-graph", default="",
+                    help="vda5050 comms: a YAML lane graph (routing.py). Orders then follow its "
+                         "lanes instead of one straight edge from the vehicle to the goal, and a "
+                         "goal more than 0.05 m from every lane node is refused")
     ap.add_argument("--scenario", default="healthy-fleet",
                     help="simulated-comms scenario preset name or path (default: healthy-fleet)")
     ap.add_argument("--fault-component", default="camera_front",
@@ -1435,16 +1454,28 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--insecure", action="store_true",
                     help="dial without TLS. For local tests only; never the default")
     args = ap.parse_args(argv)
+    if args.route_graph and args.comms != "vda5050":
+        ap.error("--route-graph needs --comms vda5050")
     dial = dialler(args, ap)
 
     from fleet_adapter.v1 import fleet_adapter_pb2 as pb
     from fleet_adapter.v1 import fleet_adapter_pb2_grpc as pb_grpc
 
     if args.comms == "vda5050":
+        from fleet_adapter_vda5050.routing import RouteGraph
         from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
+        graph = None
+        if args.route_graph:
+            try:
+                graph = RouteGraph.load(args.route_graph)
+            except ValueError as exc:
+                ap.error(str(exc))
+            print(f"route graph {args.route_graph}: {len(graph.node_ids)} nodes, "
+                  f"{graph.edge_count} edges", file=sys.stderr)
         robot = Vda5050Binding(robot_id=args.robot_id,
                                manufacturer=args.manufacturer, serial=args.serial,
-                               mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port)
+                               mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
+                               route_graph=graph)
     else:
         # Scenarios are additive tooling, not a safety requirement (ADR-0005): if
         # scenario support is unavailable (e.g. PyYAML missing) run the $0 skeleton.

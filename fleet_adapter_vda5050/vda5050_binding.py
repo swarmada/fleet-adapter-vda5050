@@ -24,6 +24,7 @@ new order once the vehicle reports the old one gone (:meth:`Vda5050Binding.comma
 
 from __future__ import annotations
 
+import math
 import secrets
 import sys
 import threading
@@ -32,6 +33,7 @@ from datetime import UTC, datetime
 
 from fleet_adapter_vda5050 import profiles, task
 from fleet_adapter_vda5050.mqtt_client import MqttClient
+from fleet_adapter_vda5050.routing import NODE_TOLERANCE_M, RouteGraph
 
 
 def _now_iso() -> str:
@@ -58,8 +60,9 @@ class Vda5050Binding:
                  profile_name: str = "vda5050",
                  mqtt_host: str = "localhost", mqtt_port: int = 1883,
                  preempt_timeout_s: float = _PREEMPT_TIMEOUT_S, clock=time.monotonic,
-                 boot: str | None = None) -> None:
+                 boot: str | None = None, route_graph: RouteGraph | None = None) -> None:
         self._robot_id = robot_id
+        self._graph = route_graph  # the lanes orders follow (routing.py); None: one straight edge
         self._manufacturer = manufacturer
         self._serial = serial
         self._profile = profiles.get_profile(profile_name)
@@ -80,6 +83,7 @@ class Vda5050Binding:
         # vehicle still shows for that one would look like a rejection of the new one.
         self._boot = boot if boot is not None else secrets.token_hex(4)
         self._id_len_reported: int | None = None   # the idLen an over-long orderId was logged for
+        self._node_id_len_reported: int | None = None  # ...and an over-long lane node id
         self._current_order_id = ""
         self._last_order_id = ""                   # the last order published; a stop does not clear it
         self._pending_order: str | None = None     # last order JSON built (test seam)
@@ -176,6 +180,7 @@ class Vda5050Binding:
         with self._lock:
             self._factsheet = info
             self._check_id_len_locked(self._order_id_locked(self._order_seq + 1))
+            self._check_node_id_len_locked()
 
     def _order_id_locked(self, seq: int) -> str:
         """The orderId of order number ``seq``. The caller holds the lock."""
@@ -197,6 +202,55 @@ class Vda5050Binding:
               f"(protocolLimits.maxStringLens.idLen), and orderId {order_id} has "
               f"{len(order_id)}; the vehicle will reject its orders. Use a shorter robot id.",
               file=sys.stderr)
+
+    def _check_node_id_len_locked(self) -> None:
+        """Log an error when a lane node id of the route graph is longer than the vehicle's
+        factsheet allows (idLen also bounds nodeId): the vehicle would reject every order routed
+        through that node. Checked when a factsheet arrives, since the graph does not change;
+        logged once for each limit, naming the longest id. The caller holds the lock."""
+        limit = self._factsheet.id_len
+        if (self._graph is None or limit is None
+                or self._node_id_len_reported == limit):
+            return
+        longest = max(self._graph.node_ids, key=lambda n: (len(n), n))
+        if len(longest) <= limit:
+            return
+        self._node_id_len_reported = limit
+        print(f"vda5050: error: the vehicle's factsheet limits ids to {limit} characters "
+              f"(protocolLimits.maxStringLens.idLen), and the route graph's node id {longest} "
+              f"has {len(longest)}; the vehicle will reject orders routed through it. Use "
+              f"shorter node ids in the route graph.", file=sys.stderr)
+
+    def route_unavailable(self, robot_id: str) -> str:
+        """Why no order can be routed now, or "" when one can: with a route graph, the
+        vehicle's position must be known (a state with an initialised, finite
+        ``agvPosition``). The order starts there; from an unknown position it would be one
+        edge from the goal to itself, which a vehicle that plans its own way to the first node
+        could drive straight across the floor. The adapter refuses work then,
+        ROBOT_UNAVAILABLE. Without a graph, "" always."""
+        if self._graph is None:
+            return ""
+        with self._lock:
+            pos = self._state.position
+        if pos is None or not (math.isfinite(pos.x) and math.isfinite(pos.y)):
+            return ("the vehicle's position is unknown, and with a route graph an order starts "
+                    "from it")
+        return ""
+
+    def goal_refusal(self, robot_id: str, x: float, y: float) -> str:
+        """Why a goal at (x, y) cannot be routed, or "" when it can. With a route graph the
+        goal must be a lane node (within routing.NODE_TOLERANCE_M of one): the order's last
+        leg runs straight from the node nearest the goal, and off the lanes that leg could
+        cross a rack. Without a graph every goal can be sent."""
+        if self._graph is None:
+            return ""
+        if not (math.isfinite(x) and math.isfinite(y)):
+            return f"goal ({x:g}, {y:g}) is not a position"
+        node, d = self._graph.nearest(x, y)
+        if d <= NODE_TOLERANCE_M:
+            return ""
+        return (f"goal ({x:g}, {y:g}) is not on the route graph: the nearest lane node, "
+                f"{node}, is {d:.2f} m away (at most {NODE_TOLERANCE_M} m)")
 
     def factsheet(self, robot_id: str) -> profiles.FactsheetInfo:
         """The latest parsed ``factsheet`` (the AGV's capability self-description)."""
@@ -329,6 +383,14 @@ class Vda5050Binding:
         force. Then the pause stays: a ``startPause`` goes first instead, since a vehicle may
         leave pause mode on a cancelOrder (vda-5050-lib's virtual AGV does), and only a
         Swarmada resume lifts that pause."""
+        # The route first, from the vehicle's position now: nothing is sent or changed before
+        # it, so a routing failure leaves no pause lifted and no order taken as sent.
+        with self._lock:
+            start_pos, map_id = self._state.position, self._state.map_id
+        start = (profiles.OrderTarget(x=start_pos.x, y=start_pos.y, theta=start_pos.yaw,
+                                      map_id=map_id) if start_pos is not None else None)
+        goal = profiles.OrderTarget(x=x, y=y, theta=yaw, map_id=map_id)
+        via = self._via(order_id, start, goal)
         with self._lock:
             pause = self._pause_requested
             unpause = self._estop_paused
@@ -339,23 +401,40 @@ class Vda5050Binding:
             self._publish_action(robot_id, profiles.ACTION_STOP_PAUSE, "resume")
         with self._lock:
             self._check_id_len_locked(order_id)
-            start_pos, map_id = self._state.position, self._state.map_id
             self._last_order_id = order_id
             self._open_cancel_id = ""
             self._header_id += 1
             header_id = self._header_id
             self._holding = False  # a new order releases a prior stop-hold
-        start = (profiles.OrderTarget(x=start_pos.x, y=start_pos.y, theta=start_pos.yaw,
-                                      map_id=map_id) if start_pos is not None else None)
-        goal = profiles.OrderTarget(x=x, y=y, theta=yaw, map_id=map_id)
         payload = self._profile.encode_order(
             header_id=header_id, order_id=order_id, order_update_id=0,
             manufacturer=self._manufacturer, serial=self._serial,
-            start=start, goal=goal, timestamp=_now_iso())
+            start=start, goal=goal, timestamp=_now_iso(), via=via)
         with self._lock:
             self._pending_order = payload
         if self._started:  # pragma: no cover — requires paho + a broker
             self._mqtt.publish(self._topics.order, payload)
+
+    def _via(self, order_id: str, start: profiles.OrderTarget | None,
+             goal: profiles.OrderTarget) -> list[profiles.OrderTarget]:
+        """The lane nodes an order passes on its way (routing.py), from the vehicle's position
+        now: none without a route graph. An assignment is refused while the position is unknown
+        (:meth:`route_unavailable`); a held order can still go out on a state without one, and is
+        then sent unrouted, with an error logged."""
+        if self._graph is None:
+            return []
+        if start is None or not (math.isfinite(start.x) and math.isfinite(start.y)):
+            print(f"vda5050: error: order {order_id} is sent without a route: the vehicle's "
+                  "position is unknown", file=sys.stderr)
+            return []
+        route = self._graph.route(start.x, start.y, goal.x, goal.y)
+        if route.off_graph_m is not None:
+            first = route.waypoints[0].node_id if route.waypoints else "the goal"
+            print(f"vda5050: error: order {order_id} starts {route.off_graph_m:.2f} m from the "
+                  f"nearest lane, at ({start.x:g}, {start.y:g}); its first leg runs straight "
+                  f"to {first}. Start and admit the vehicle on a lane node.", file=sys.stderr)
+        return [profiles.OrderTarget(x=w.x, y=w.y, map_id=goal.map_id, label=w.node_id)
+                for w in route.waypoints]
 
     def _order_active_locked(self) -> bool:
         """True when the vehicle may still have an order a new one would be rejected behind:
