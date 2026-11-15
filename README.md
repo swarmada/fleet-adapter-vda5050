@@ -182,6 +182,10 @@ warning until it accepts a new order (VDA 5050 2.0.0 6.6.4).
   is delivered again and taken.
 - Each `orderId` carries a token unique to the adapter process. A rejection the vehicle still
   reports from an earlier process can then not be taken for one of this process's orders.
+  An `orderId` is the robot id, 16 characters, and the order's number. When the vehicle's
+  factsheet sets a shorter `protocolLimits.maxStringLens.idLen`, the adapter logs an error
+  naming the limit and the id's length, once for each limit: the vehicle would reject every
+  order. A shorter robot id fixes it.
 - **Not detected:** a rejection whose error names only the `headerId`. Header ids restart
   with the adapter process, so an old error could be taken for a new order. That action ends
   at its lease or the control plane's timeout.
