@@ -192,6 +192,37 @@ warning until it accepts a new order (VDA 5050 2.0.0 6.6.4).
 - The adapter never sends an order update. Every order has a new `orderId` and
   `orderUpdateId` 0, so no rule for a rejected update is needed.
 
+### A command for another robot
+
+The adapter serves one vehicle, under the robot id it registers. Every Command and every
+SafetyStream message names a robot by that id.
+
+- **A command for another id, or for none,** is refused before anything runs. Nothing reaches
+  the vehicle, the stop latch, the fencing mark, the lease or the current action. Each command
+  gets the refusal its result already has: an assignment is refused `ROBOT_UNAVAILABLE`, and a
+  renewal, a cancel, a pause, a resume or a zone-rule push is not done.
+- **An emergency stop or a stop's fence for another id** is answered `FAILED` on the
+  SafetyStream, never `STOPPED`. The adapter cannot confirm that robot is at rest, and nothing
+  is latched. Whether this vehicle stops depends on the registration:
+  - **Once a registration is accepted** on the current session, the adapter serves its robot,
+    and a stop for another id does not stop this vehicle. **This `FAILED` means this vehicle
+    was not stopped.**
+  - **While no registration is accepted**, the adapter serves no robot, and the likeliest cause
+    is an id mismatch: the adapter's `--robot-id` is not the Robot's `swarmada.io/robot-id`, so
+    its registration was refused and every stop for that Robot arrives under the other id. The
+    vehicle is then stopped as well, and the stop is still answered `FAILED`. The log says "no
+    accepted registration; vehicle stopped".
+- **A clear for another id** lifts nothing and is not acknowledged.
+- A capabilities scan, and a command this adapter declines anyway, are answered as for any
+  robot. A scan names this adapter's own robot.
+- The leader term is kept for the served robot only. A command for another id neither raises
+  it nor is refused by it.
+- Each one is logged at error level, naming the id received and the id served, so an id
+  mismatch with the control plane shows.
+- **Existing gap:** the adapter sends no `CommandResult` receipt for a stop's fence
+  (`Command.estop`), for its own robot or another. The stop's answer is the `EstopAck` on the
+  SafetyStream, which the control plane reads.
+
 ## Development
 
 ```bash

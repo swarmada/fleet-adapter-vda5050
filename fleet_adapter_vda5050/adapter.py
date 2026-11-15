@@ -80,6 +80,16 @@ def _provisioning_interval(ttl_seconds: int) -> float:
 CONTRACT_VERSION = "1.4.0"
 _TERMINAL = (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED, task_map.TASK_CANCELLED)
 
+# The Command arms this adapter implements that act on the robot (its motion, its lease, a hold)
+# or attest something about it (zone_constraints). Each is refused, before anything else runs,
+# when Command.robot_id is not the robot this adapter serves (`_refuse_unserved`). The fence
+# (`estop`) is answered FAILED on the SafetyStream (`_unserved_estop`). `scan` is not listed:
+# it moves nothing and its snapshot names this adapter's own robot, as the simulation adapter
+# answers it. Arms this adapter declines are declined (`unsupported`) whatever robot they name.
+_ROBOT_ACTING_ARMS = frozenset({
+    "assign_action", "renew_lease", "cancel_action", "pause", "resume", "zone_constraints",
+})
+
 
 def _at_least_14(version: str) -> bool:
     try:
@@ -450,8 +460,22 @@ class fleet_adapter_vda5050Adapter:
         pb = self._pb
         result = pb.CommandResult(command_id=command.command_id, robot_id=command.robot_id)
         which = command.WhichOneof("command")
-        if not self._latch.observe_term(self._robot_id, command.leader_term,
-                                        is_stop=which == "estop"):
+        if not self._serves(command.robot_id):
+            # Before the term, the latch, the fence and the lease: nothing of this robot's
+            # changes for a command addressed to another.
+            if which == "estop":
+                self._unserved_estop(command.robot_id, command.estop.estop_id, "fence")
+                return
+            if which in _ROBOT_ACTING_ARMS:
+                self._refuse_unserved(command, which, result)
+                self._outbox.put(pb.AdapterMessage(command_result=result))
+                return
+            self._log_unserved(command.robot_id, f"arm={which} command_id={command.command_id}",
+                               "answered as for any robot: it moves nothing")
+        # The term is kept for the robot (proto, Command.leader_term: "the highest term it has
+        # seen for the robot"): only a command for the served robot is held to it or raises it.
+        if self._serves(command.robot_id) and not self._latch.observe_term(
+                self._robot_id, command.leader_term, is_stop=which == "estop"):
             # A deposed leader's command: not acted on, the result left empty.
             result.stale_leader_term = True
             self._outbox.put(pb.AdapterMessage(command_result=result))
@@ -497,6 +521,86 @@ class fleet_adapter_vda5050Adapter:
             # C7.1: decline every optional command not implemented.
             result.unsupported = True
         self._outbox.put(pb.AdapterMessage(command_result=result))
+
+    # ── robot_id: the one robot this adapter serves ─────────────────────────────
+
+    def _serves(self, robot_id: str) -> bool:
+        """True only for the robot_id this adapter registered. The control plane addresses
+        every Command and every SafetyStream message by the robot's wire id, which is the id
+        its adapter announced (the Robot's swarmada.io/robot-id). An empty robot_id names no
+        robot, so it is never served."""
+        return bool(robot_id) and robot_id == self._robot_id
+
+    def _log_unserved(self, received: str, what: str, outcome: str) -> None:
+        """Every message for a robot this adapter does not serve, at error level, naming both
+        ids: an id mismatch with the control plane is loud, not silent."""
+        print(f"error: UNSERVED robot={self._robot_id!r} addressed={received!r} {what}: "
+              f"{outcome}", file=sys.stderr, flush=True)
+
+    def _refuse_unserved(self, command, which: str, result) -> None:
+        """Refuse a command addressed to a robot this adapter does not serve.
+
+        One ControlStream carries the commands for every Robot bound to this adapter, and
+        Command.robot_id selects which one (RFC-0001 #fleet-adapter-protocol-the-controlstream-
+        service). This adapter serves exactly one vehicle, and a command for any other id run on
+        it would move the wrong robot. So nothing here reaches the vehicle, the stop latch, the
+        fencing mark, the lease or the current action, and each arm is answered with the
+        refusal its result already defines. An assignment is declined ROBOT_UNAVAILABLE: the
+        robot it names is not available through this adapter, so the control plane releases it
+        to reschedule; INVALID_ACTION would wrongly say the action could not be served."""
+        pb = self._pb
+        why = (f"robot_id {command.robot_id!r} is not served by this adapter, which serves "
+               f"{self._robot_id!r}; nothing was done")
+        if which == "assign_action":
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
+                message=why))
+        elif which == "renew_lease":
+            result.renew_lease.CopyFrom(pb.RenewActionLeaseResult(
+                renewed=False, running=False, message=why))
+        elif which == "cancel_action":
+            result.cancel_action.CopyFrom(pb.CancelActionResult(acknowledged=False, message=why))
+        elif which == "pause":
+            result.pause.CopyFrom(pb.PauseResult(paused=False, message=why))
+        elif which == "resume":
+            result.resume.CopyFrom(pb.ResumeResult(resumed=False, message=why))
+        elif which == "zone_constraints":
+            result.zone_constraints.CopyFrom(pb.ZoneConstraintsAck(acknowledged=False))
+        self._log_unserved(command.robot_id, f"arm={which} command_id={command.command_id}",
+                           "refused; nothing was done")
+
+    def _unserved_estop(self, received: str, estop_id: str, via: str) -> None:
+        """An estop (on the SafetyStream) or a fence (Command.estop) for a robot this adapter
+        does not serve: answered FAILED on the SafetyStream, never STOPPED. This adapter cannot
+        confirm that robot is at rest, and FAILED is the answer that escalates; a STOPPED would
+        confirm a stop nobody made. Nothing is latched: the stop is not this robot's.
+
+        Whether this vehicle stops depends on the registration. Once one is accepted on this
+        session, the adapter serves its robot, and a stop for another id is not this vehicle's:
+        it does not stop. While none is accepted, the adapter serves no robot, and the likeliest
+        reason a stop arrives under another id is a mismatch: this adapter's --robot-id is not
+        the Robot's swarmada.io/robot-id, so its registration was refused and every stop for that
+        Robot comes here under the other id. The vehicle is then stopped, as a stop for it would,
+        so a misconfiguration never leaves it driving; the answer is still FAILED."""
+        pb = self._pb
+        ack = pb.EstopAck(estop_id=estop_id, state=pb.ESTOP_STATE_FAILED)
+        why = (f"robot_id {received!r} is not served by this adapter, which serves "
+               f"{self._robot_id!r}")
+        if self._registered:
+            self._log_unserved(received, f"{via} id={estop_id}",
+                               "answered FAILED; no stop was commanded")
+            ack.message = f"{why}; no stop was commanded and none can be confirmed"
+        else:
+            ack.stop_initiated_at = _now_ms()
+            with self._robot_lock:
+                self._command_estop()
+            self._interrupt_current("emergency stop under a robot_id this adapter does not serve",
+                                    command_stop=False)
+            self._log_unserved(received, f"{via} id={estop_id}",
+                               "answered FAILED; no accepted registration; vehicle stopped")
+            ack.message = (f"{why}; no registration is accepted on this session, so this "
+                           f"vehicle was stopped; rest is not confirmed for that robot")
+        self._safety_outbox.put(pb.AdapterSafetyMessage(robot_id=received, estop_ack=ack))
 
     def _on_pause(self, pause, result) -> None:
         """Map Swarmada pause → VDA5050 startPause (pause the order without aborting
@@ -1137,6 +1241,14 @@ class fleet_adapter_vda5050Adapter:
 
     def _on_safety_message(self, cp) -> None:
         kind = cp.WhichOneof("payload")
+        if kind in ("estop", "estop_clear") and not self._serves(cp.robot_id):
+            if kind == "estop":
+                self._unserved_estop(cp.robot_id, cp.estop.estop_id, "SafetyStream estop")
+            else:
+                # It lifts nothing here: the latch this adapter keeps is its own robot's.
+                self._log_unserved(cp.robot_id, f"estop_clear id={cp.estop_clear.estop_id}",
+                                   "ignored; nothing was lifted")
+            return
         if kind == "estop":
             if _at_least_14(self._negotiated):
                 self._latch.on_estop(self._robot_id, cp.estop.estop_id)
