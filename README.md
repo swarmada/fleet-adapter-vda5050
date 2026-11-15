@@ -223,6 +223,60 @@ SafetyStream message names a robot by that id.
   (`Command.estop`), for its own robot or another. The stop's answer is the `EstopAck` on the
   SafetyStream, which the control plane reads.
 
+### Routes along lanes
+
+Without a route graph, an order is one straight edge from the vehicle's position to the goal.
+VDA 5050 leaves the route to the fleet master, and here the adapter is the master. With
+`--route-graph FILE`, an order follows lanes:
+
+```bash
+python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 --comms vda5050 \
+    --mqtt-host broker.local --route-graph examples/warehouse-lanes.yaml
+```
+
+- **The file** is YAML. `nodes` maps a node id to `[x, y]`, in metres, in the map frame the
+  vehicle reports its position in. `edges` lists undirected `[a, b]` pairs, each weighted by
+  its length. Other keys are ignored.
+- **The order** is one released base: the start node at the vehicle's position, each lane node
+  on the shortest path, and the goal, with an edge between each pair. A lane node keeps its id
+  and names no heading; the goal keeps the assignment's heading. A lane node within 0.05 m of
+  the start or the goal is not sent, so no edge has zero length.
+- **The goal must be a lane node.** With a graph loaded, a goal more than 0.05 m from every lane
+  node is refused `INVALID_ACTION`, naming the nearest node and its distance. Off the lanes,
+  the last leg could cross a rack.
+- **The start.** The route is worked out when the order is sent. A vehicle between two nodes,
+  after a stop or an order replaced in place, enters the graph by the edge it is on, at
+  whichever end makes the route shorter. A vehicle more than 0.5 m from every edge goes
+  straight to the nearest node, and the adapter logs an error naming the distance.
+- **The position must be known.** While the vehicle has reported no initialised position, work
+  is refused `ROBOT_UNAVAILABLE`: the order would start nowhere on the lanes.
+- **The graph is checked at start-up.** The adapter refuses to start on any of these: a node id
+  given twice, an edge naming an unknown node, a self-loop, a duplicate edge, no edge at all, a
+  coordinate that is not a finite number within 10^6 m, two nodes closer than 0.05 m, a node
+  named `start` or `goal` (the order's own ends), or a graph that is not connected.
+- **idLen.** When the vehicle's factsheet arrives, a node id longer than its `idLen` is logged
+  as an error, as an orderId is.
+- **No traffic control.** Each vehicle is routed alone. Two vehicles on the same lanes can meet
+  head-on, and nothing keeps a vehicle off a lane another robot is using.
+- **`examples/warehouse-lanes.yaml`** is the warehouse world's lane graph, generated from the
+  warehouse layout. `examples/ks-aisles.yaml` is a graph for the open ks floor, which has no
+  racks; the tests use it.
+
+On a floor shared with other robots, the setup must provide:
+
+- **One frame.** The zones, the goals, the lane graph and the vehicles' reported positions all
+  in the same map frame.
+- **Start poses on lane nodes**, and not on the nodes the other robots start on.
+- **Goals at lane nodes.** A goal anywhere else is refused, as above.
+- **No operating constraints in the vehicles' zones.** This adapter honours none, and refuses
+  an assignment that carries one `OPERATING_CONSTRAINT_UNMET`.
+
+**Admission.** A vehicle with no Robot yet needs no other adapter to admit it first. Its
+registration is refused `NOT_ADMITTED`; the adapter then announces the robot (`DiscoverRobot`)
+and registers again each provisioning interval until an operator admits it. The interval is
+half the `DiscoverAck`'s TTL, at most 300 s, or 60 s without one, so the robot registers up to
+one interval after it is admitted.
+
 ## Development
 
 ```bash

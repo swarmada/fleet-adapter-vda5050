@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import math
 import unicodedata
+from collections.abc import Sequence
 
 from fleet_adapter_vda5050.profiles import (
     CONN_BROKEN,
@@ -144,23 +145,28 @@ class Vda5050Profile:
 
     def encode_order(self, header_id: int, order_id: str, order_update_id: int,
                      manufacturer: str, serial: str, start: OrderTarget | None,
-                     goal: OrderTarget, timestamp: str) -> str:
+                     goal: OrderTarget, timestamp: str,
+                     via: Sequence[OrderTarget] = ()) -> str:
         """:class:`OrderTarget` → a canonical VDA5050 base order (JSON string).
 
-        A two-node released order: node seq 0 (start = the robot's current pose, so
-        the AGV is already on the first node as VDA5050 requires) → edge seq 1 →
-        node seq 2 (goal). ``headerId`` and ``orderUpdateId`` are the robot-side
-        at-least-once dedup keys — a re-delivered identical order is a no-op.
+        A released order: node seq 0 (start = the robot's current pose, so the AGV is
+        already on the first node as VDA5050 requires), then each ``via`` node in order (a
+        route along the lanes, routing.py), then the goal, with an edge between each pair:
+        sequenceIds 0, 1, 2, ... alternate node and edge. Without ``via``, start → edge seq 1
+        → goal seq 2. A ``via`` node's id is its ``label``, and it has no ``theta``: VDA5050
+        makes the vehicle take a node's theta when one is given, and only the goal's heading
+        is asked for. ``headerId`` and ``orderUpdateId`` are the robot-side at-least-once
+        dedup keys — a re-delivered identical order is a no-op.
         """
         start = start or OrderTarget(x=goal.x, y=goal.y, map_id=goal.map_id)
-        nodes = [
-            _node("start", 0, start),
-            _node("goal", 2, goal),
-        ]
+        points = [("start", start, True)]
+        points += [(t.label or f"via-{i}", t, False) for i, t in enumerate(via)]
+        points.append(("goal", goal, True))
+        nodes = [_node(nid, 2 * i, t, theta) for i, (nid, t, theta) in enumerate(points)]
         edges = [{
-            "edgeId": "edge-0", "sequenceId": 1, "released": True,
-            "startNodeId": "start", "endNodeId": "goal", "actions": [],
-        }]
+            "edgeId": f"edge-{i}", "sequenceId": 2 * i + 1, "released": True,
+            "startNodeId": points[i][0], "endNodeId": points[i + 1][0], "actions": [],
+        } for i in range(len(points) - 1)]
         order = {
             "headerId": header_id,
             "timestamp": timestamp,
@@ -219,13 +225,17 @@ def _num(v) -> float | None:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
 
 
-def _node(node_id: str, sequence_id: int, t: OrderTarget) -> dict:
-    """A released VDA5050 order node at an OrderTarget's pose."""
+def _node(node_id: str, sequence_id: int, t: OrderTarget, theta: bool = True) -> dict:
+    """A released VDA5050 order node at an OrderTarget's pose; without ``theta``, its
+    position names no heading."""
+    position = {"x": t.x, "y": t.y, "theta": t.theta, "mapId": t.map_id}
+    if not theta:
+        del position["theta"]
     return {
         "nodeId": node_id,
         "sequenceId": sequence_id,
         "released": True,
-        "nodePosition": {"x": t.x, "y": t.y, "theta": t.theta, "mapId": t.map_id},
+        "nodePosition": position,
         "actions": [],
     }
 
