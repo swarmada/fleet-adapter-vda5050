@@ -33,7 +33,7 @@ from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapte
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
 ROBOT = "amr-1"
-ORDER = f"{ROBOT}-order"
+ORDER = f"{ROBOT}-b0-order"  # the orderIds of a binding with boot token "b0"
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────
@@ -62,7 +62,7 @@ def _state(order_id="", nodes=0, actions=(), driving=False, vx=0.0, x=0.0, error
 def _binding(timeout: float = 60.0) -> tuple[Vda5050Binding, _Clock]:
     clock = _Clock()
     b = mark_transport_live(Vda5050Binding(robot_id=ROBOT, preempt_timeout_s=timeout,
-                                           clock=clock))
+                                           clock=clock, boot="b0"))
     return b, clock
 
 

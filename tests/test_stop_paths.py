@@ -350,7 +350,7 @@ def test_the_first_order_after_an_estop_is_preceded_by_stop_pause_once() -> None
     b.on_state(_state(order_id="x", paused=True))  # halted, paused, order cancelled
     b.published.clear()
     b.command_move(ROBOT, 1.0, 0.0)
-    b.on_state(_state(order_id=f"{ROBOT}-order-1"))  # that order done
+    b.on_state(_state(order_id=json.loads(b.pending_order(ROBOT))["orderId"]))  # that one done
     b.command_move(ROBOT, 2.0, 0.0)
     assert _wire(b) == ["stopPause", "order", "order"]
 
