@@ -181,6 +181,34 @@ def test_register_ack_in_progress_for_the_local_action_keeps_it() -> None:
     assert not [m for m in _drain(a._outbox) if m.HasField("action_status")]
 
 
+def test_register_ack_in_progress_for_the_local_action_under_a_newer_token_stops_it() -> None:
+    # The plane requeued the action and assigned it again, at a newer generation this adapter
+    # never accepted. The run here is not that assignment: stopped, never re-keyed.
+    a = _adapter()
+    assert _assign(a, 5).accepted
+    assert not a._robot.is_stopped(ROBOT)
+    _drain(a._outbox)
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            action_id="act-1", phase=pb.ROBOT_ACTION_PHASE_IN_PROGRESS, fencing_token=9)))
+    assert a._current_action == ""
+    assert a._robot.is_stopped(ROBOT)
+    assert _reported(a) == [("act-1", pb.ACTION_STATE_CANCELLED, 9)]
+    # Not kept for a later connection: the plane never reads a kept CANCELLED for a live action.
+    assert a._retained.get(ROBOT) is None
+
+
+def test_register_ack_in_progress_for_the_local_action_without_a_token_stops_it() -> None:
+    a = _adapter()
+    assert _assign(a, 5).accepted
+    _drain(a._outbox)
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            action_id="act-1", phase=pb.ROBOT_ACTION_PHASE_IN_PROGRESS)))
+    assert a._current_action == ""
+    assert a._robot.is_stopped(ROBOT)
+
+
 def test_live_binding_with_no_manifest_still_pushes_the_catalog() -> None:
     # The live --comms vda5050 path has no hardware manifest. The snapshot pushed at
     # registration must still carry the catalog, the same one scan answers (C12.2): the
