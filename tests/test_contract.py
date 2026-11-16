@@ -103,6 +103,12 @@ def test_register_ack_cancel_stops_and_reports_the_action() -> None:
     assert a._current_action == ""
 
 
+def _settle(a: Adapter) -> None:
+    """Wait for the reports of superseded actions, which follow the vehicle's confirmation."""
+    for t in a._superseded_threads:
+        t.join(10)
+
+
 def _reported(a: Adapter) -> list[tuple]:
     """(action, state, token or None) for each ActionStatusUpdate in the outbox."""
     return [(s.action_id, s.state, s.fencing_token if s.HasField("fencing_token") else None)
@@ -141,7 +147,10 @@ def test_a_report_for_the_replys_action_never_carries_the_local_actions_token() 
     a._reconcile_action_state(pb.RegisterAck(
         accepted=True, authoritative_action_state=pb.RobotActionState(
             action_id="act-b", phase=pb.ROBOT_ACTION_PHASE_IN_PROGRESS, fencing_token=9)))
-    assert _reported(a) == [("act-b", pb.ACTION_STATE_CANCELLED, 9)]
+    _settle(a)
+    # act-b under the reply's token; act-a, which the reply does not name, under its own.
+    assert sorted(_reported(a)) == [("act-a", pb.ACTION_STATE_STOPPED, 5),
+                                    ("act-b", pb.ACTION_STATE_CANCELLED, 9)]
     assert a._current_action == ""
 
 
@@ -155,7 +164,9 @@ def test_a_reply_without_a_token_puts_no_token_on_a_report_for_an_action_not_hel
     a._reconcile_action_state(pb.RegisterAck(
         accepted=True, authoritative_action_state=pb.RobotActionState(
             action_id="act-b", phase=pb.ROBOT_ACTION_PHASE_UNKNOWN)))
-    assert _reported(a) == [("act-b", pb.ACTION_STATE_STOPPED, None)]
+    _settle(a)
+    assert sorted(_reported(a)) == [("act-a", pb.ACTION_STATE_STOPPED, 5),
+                                    ("act-b", pb.ACTION_STATE_STOPPED, None)]
 
 
 def test_an_idle_reply_reports_the_local_action_under_its_own_token() -> None:
@@ -167,6 +178,7 @@ def test_an_idle_reply_reports_the_local_action_under_its_own_token() -> None:
     a._reconcile_action_state(pb.RegisterAck(
         accepted=True, authoritative_action_state=pb.RobotActionState(
             phase=pb.ROBOT_ACTION_PHASE_IDLE, fencing_token=20)))
+    _settle(a)
     assert _reported(a) == [("act-a", pb.ACTION_STATE_STOPPED, 3)]
 
 

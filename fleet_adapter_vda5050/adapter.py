@@ -81,6 +81,10 @@ def _provisioning_interval(ttl_seconds: int) -> float:
 # edge-stop report's Not-met note), so there, after an edge stop, work stays refused.
 CONTRACT_VERSION = "1.4.0"
 _TERMINAL = (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED, task_map.TASK_CANCELLED)
+# The wait for a vehicle's own confirmation of a stop: the estop's budget
+# (swarmada_sdk.safety.await_estop_confirmation's default, 40 x 0.05 s).
+_STOP_CONFIRM_TICK_S = 0.05
+_STOP_CONFIRM_TICKS = 40
 
 # The Command arms this adapter implements that act on the robot (its motion, its lease, a hold)
 # or attest something about it (zone_constraints). Each is refused, before anything else runs,
@@ -203,12 +207,20 @@ class fleet_adapter_vda5050Adapter:
         self._retained = RetainedOutcomes(state_dir)
         self._interrupted: dict[str, int] = {}
         self._action_tokens: dict[str, int] = {}
+        # A superseded action's report waits for the vehicle's confirmation of its stop, on a
+        # thread of its own (_end_superseded); kept so a test can join it.
+        self._superseded_threads: list[threading.Thread] = []
+        self._stop_confirm_sleep = time.sleep
         self._shutdown = threading.Event()
         self._telemetry_started = False
         # True only between an ACCEPTED RegisterAck and the end of that ControlStream session.
         # A robot whose registration was refused, or not yet answered, is not under management
         # on this session, and no work is accepted for it (C13.2).
         self._registered = False
+        # The outbox of the session whose registration was accepted. A report sent from another
+        # thread goes out only on it, and only while it is still the current session's: the
+        # reconnect loop installs a new session's outbox before that session registers (C2.1).
+        self._registered_outbox: queue.Queue | None = None
         # The ControlStream session, counted. The provisioning loop registers again only on the
         # session that was refused; a newer session registers on its own (C2.4).
         self._session = 0
@@ -379,6 +391,7 @@ class fleet_adapter_vda5050Adapter:
                 self._on_register_refused(ack)
                 return
             self._registered = True
+            self._registered_outbox = self._outbox
             # Registered: the catalog, and any hardware manifest (C12.2), and a full snapshot
             # next (C6.1). Sent here rather than at the hello, because a robot admitted through
             # the provisioning loop had no Robot when the hello came, and what was sent for it
@@ -824,27 +837,40 @@ class fleet_adapter_vda5050Adapter:
                       f"a generation this adapter never accepted; the vehicle is stopped",
                       file=sys.stderr)
             phase = pb.ROBOT_ACTION_PHASE_CANCELLED  # divergence is treated as a cancel
-        if phase not in (pb.ROBOT_ACTION_PHASE_CANCELLED, pb.ROBOT_ACTION_PHASE_UNKNOWN,
-                         pb.ROBOT_ACTION_PHASE_IDLE):
+        named = st.action_id
+        if phase == pb.ROBOT_ACTION_PHASE_REVOKING:
+            # REVOKING names an action whose lease the plane stopped renewing: it self-stops
+            # here when that lease runs out. Only a local action it does not name goes on below.
+            if not self._current_action or self._current_action == named:
+                return
+        elif phase not in (pb.ROBOT_ACTION_PHASE_CANCELLED, pb.ROBOT_ACTION_PHASE_UNKNOWN,
+                           pb.ROBOT_ACTION_PHASE_IDLE):
             return
         with self._action_lock:
-            local, _ = self._take_current()
+            local, local_token = self._take_current()
             with self._robot_lock:
                 self._robot.command_stop(self._robot_id)
+                since = self._state_seq_now()
             self._lease.release(self._robot_id)
-            reported = st.action_id or local
+            if local and local != named:
+                # A local action the reply does not name is the plane's past: the robot is
+                # bound to another action, or to none. Stopped above; reported once the
+                # vehicle's own state confirms the stop (_end_superseded).
+                self._action_tokens.pop(local, None)
+                self._end_superseded_async(local, local_token, st.phase, named, since)
+            if phase == pb.ROBOT_ACTION_PHASE_REVOKING:
+                return  # the named action is not held here: nothing to stop or report
+            reported = named
             if reported:
                 state = (task_map.TASK_CANCELLED if phase == pb.ROBOT_ACTION_PHASE_CANCELLED
                          else task_map.TASK_STOPPED)
-                # C6.4: every report carries the token of the action it names. When the reply
-                # names the action, its token is that action's current one; the action may be
-                # one this adapter never received (an assignment made before this register was
-                # processed), which has no token here, and a report without one is refused as
-                # an adapter fault. Otherwise the local action's own token is used. No other
-                # token is put on a report, so it can only match its own action. The retained
-                # outcome is kept under the same token, the only one the plane acknowledges.
-                token = (st.fencing_token if reported == st.action_id and st.fencing_token
-                         else None)
+                # C6.4: every report carries the token of the action it names: here the action
+                # the reply names, under the reply's token, its current one. The action may be one
+                # this adapter never received (an assignment made before this register was
+                # processed), which has no token here, and a report without one is refused as an
+                # adapter fault. Without one in the reply, its own token if held. No other token
+                # is put on a report, so it can only match its own action.
+                token = st.fencing_token or None
                 if newer_generation:
                     # Not kept for a later connection: the action is live at that generation, and
                     # the plane neither reads nor acknowledges a kept CANCELLED for a live action,
@@ -854,6 +880,115 @@ class fleet_adapter_vda5050Adapter:
                     # Kept under the reply's token, the only one the plane acknowledges.
                     self._action_tokens[reported] = token
                 self._emit_action_status(reported, state, token)
+
+    def _state_seq_now(self) -> int | None:
+        """The binding's state count, read right after a stop was sent (the caller holds the
+        robot lock), or None when it has none (a simulator) or it does not answer an int."""
+        state_seq = getattr(self._robot, "state_seq", None)
+        if not callable(state_seq):
+            return None
+        try:
+            seq = state_seq(self._robot_id)
+        except Exception:  # noqa: BLE001 - the stop is sent; the wait then counts from None
+            return None
+        return seq if type(seq) is int else None
+
+    def _end_superseded_async(self, action: str, token: int | None, reply_phase: int,
+                              named: str, since: int | None) -> None:
+        """Report a superseded local action once its stop is confirmed or the budget is spent,
+        on a thread of its own: the wait must not hold the ControlStream's reader."""
+        self._superseded_threads = [t for t in self._superseded_threads if t.is_alive()]
+        t = threading.Thread(target=self._end_superseded,
+                             args=(action, token, reply_phase, named, since), daemon=True)
+        self._superseded_threads.append(t)
+        t.start()
+
+    def _end_superseded(self, action: str, token: int | None, reply_phase: int, named: str,
+                        since: int | None) -> None:
+        """The registration reply names another action, or none, while this adapter ran
+        ``action``; the vehicle was stopped (a cancelOrder). The action is reported STOPPED
+        only once a state the vehicle sent after the stop confirms it (the estop's rule: a
+        state counted after the stop, and the vehicle at rest); if none does within the stop
+        budget, or new work is taken meanwhile, FAILED with the reason. Always one report, and
+        never silence: whatever goes wrong while waiting becomes the reason.
+
+        Under the action's own token, and never retained or written to the token record: the
+        plane has moved on, a kept outcome under an old generation is never acknowledged, and
+        the same action id may already be running again under a newer token (_report_only).
+        End cause SUPERSEDED with the action that displaced it when the reply names one; when it
+        names none there is no displacing action, so no cause is stated (the proto: leave it
+        unset rather than guess)."""
+        pb = self._pb
+        what = (f"names {named} ({pb.RobotActionPhase.Name(reply_phase)})" if named
+                else "names no action")
+        why = f"superseded: the control plane's registration reply {what}"
+        try:
+            failure = self._confirm_stop(since)
+        except Exception as exc:  # noqa: BLE001 - never silence: the error becomes the reason
+            failure = f"the stop could not be confirmed: {exc!r}"
+        print(f"reconcile: {action} (token {token}) {why}; the vehicle was stopped and "
+              + ("its state confirms it" if not failure else f"the stop was not confirmed: {failure}"),
+              file=sys.stderr)
+        cause = pb.ACTION_END_CAUSE_SUPERSEDED if named else pb.ACTION_END_CAUSE_UNSPECIFIED
+        if not failure:
+            self._report_only(action, task_map.TASK_STOPPED, token, why, cause, named)
+        else:
+            self._report_only(action, task_map.TASK_FAILED, token,
+                              f"{why}; the stop was not confirmed: {failure}", cause, named)
+
+    def _report_only(self, action: str, state_name: str, token: int | None, message: str,
+                     end_cause: int, superseding: str) -> None:
+        """Send one ActionStatusUpdate and nothing else: no retained outcome, and the token
+        record (_action_tokens) untouched, so a newer run under the same action id keeps its
+        own. Under the action lock, as every report of an ended action. Sent only on the session
+        whose registration was accepted, while it is current; otherwise dropped (C2.1)."""
+        pb = self._pb
+        upd = pb.ActionStatusUpdate(action_id=action, state=getattr(pb, state_name), message=message)
+        if token is not None:
+            upd.fencing_token = token
+        if end_cause:
+            upd.end_cause = end_cause
+            if end_cause == pb.ACTION_END_CAUSE_SUPERSEDED:
+                upd.superseding_action_id = superseding
+        with self._action_lock:
+            outbox = self._outbox
+            if not (self._registered and self._registered_outbox is outbox):
+                # C2.1: nothing about the robot goes on a session before its registration is
+                # accepted. A report that would is dropped, and said so.
+                print(f"reconcile: the {pb.ActionState.Name(upd.state)} report of {action} is "
+                      f"dropped: this session's registration has not been accepted (C2.1)",
+                      file=sys.stderr)
+                return
+            outbox.put(pb.AdapterMessage(action_status=upd))
+
+    def _confirm_stop(self, since: int | None) -> str:
+        """Wait for the vehicle's own confirmation of a cancelOrder stop: "" when a state
+        counted after the stop (``state_seq`` > ``since``) shows it at rest
+        (``stop_confirmed``, else ``is_stopped``), or the reason it was not confirmed within
+        the stop budget, the estop's (_STOP_CONFIRM_TICKS x _STOP_CONFIRM_TICK_S). Never
+        inferred from a timeout or from silence. A binding without ``state_seq`` (a
+        simulator) is asked ``is_stopped`` alone. The binding is not ticked here: the
+        telemetry loop does that, and states arrive on the transport's own thread. Once new
+        work is taken, a state can no longer speak for this stop: not confirmed."""
+        confirmed = getattr(self._robot, "stop_confirmed", None) or self._robot.is_stopped
+        state_seq = getattr(self._robot, "state_seq", None)
+        counted = callable(state_seq)
+        if counted and since is None:
+            return "the vehicle's state count could not be read after the stop"
+        for _ in range(_STOP_CONFIRM_TICKS):
+            if self._current_action:
+                return f"new work ({self._current_action}) was taken before the stop was confirmed"
+            with self._robot_lock:
+                seen = state_seq(self._robot_id) if counted else None
+                if (not counted or (type(seen) is int and seen > since)) and confirmed(
+                        self._robot_id):
+                    return ""
+            self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
+        if counted and not self._robot.transport_alive():
+            detail = self._transport_detail()
+            return "the vehicle is not connected" + (f": {detail}" if detail else "")
+        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+        return f"no state after the stop showed the vehicle at rest within {budget:g} s"
 
     def _on_renew(self, renew, result) -> None:
         pb = self._pb
