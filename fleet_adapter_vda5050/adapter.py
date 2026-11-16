@@ -15,6 +15,7 @@ Run:  python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090
 from __future__ import annotations
 
 import argparse
+import math
 import os
 import pathlib
 import queue
@@ -1474,6 +1475,12 @@ def main(argv: list[str] | None = None) -> None:
                     help="vda5050 comms: a YAML lane graph (routing.py). Orders then follow its "
                          "lanes instead of one straight edge from the vehicle to the goal, and a "
                          "goal more than 0.05 m from every lane node is refused")
+    ap.add_argument("--state-lapse-seconds", type=float, default=60.0,
+                    help="vda5050 comms: when the vehicle is taken as connected from its states (its "
+                         "retained connection message reads CONNECTIONBROKEN, or none has come "
+                         "since the broker session began), how long that lasts without a new "
+                         "state (default: 60; VDA 5050 has a vehicle send a state at least every "
+                         "30 s)")
     ap.add_argument("--scenario", default="healthy-fleet",
                     help="simulated-comms scenario preset name or path (default: healthy-fleet)")
     ap.add_argument("--fault-component", default="camera_front",
@@ -1502,6 +1509,8 @@ def main(argv: list[str] | None = None) -> None:
     args = ap.parse_args(argv)
     if args.route_graph and args.comms != "vda5050":
         ap.error("--route-graph needs --comms vda5050")
+    if not (math.isfinite(args.state_lapse_seconds) and args.state_lapse_seconds > 0):
+        ap.error(f"--state-lapse-seconds is {args.state_lapse_seconds:g}, not a positive number")
     dial = dialler(args, ap)
 
     from fleet_adapter.v1 import fleet_adapter_pb2 as pb
@@ -1522,7 +1531,7 @@ def main(argv: list[str] | None = None) -> None:
         robot = Vda5050Binding(robot_id=args.robot_id,
                                manufacturer=args.manufacturer, serial=args.serial,
                                mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
-                               route_graph=graph)
+                               route_graph=graph, state_lapse_s=args.state_lapse_seconds)
     else:
         # Scenarios are additive tooling, not a safety requirement (ADR-0005): if
         # scenario support is unavailable (e.g. PyYAML missing) run the $0 skeleton.

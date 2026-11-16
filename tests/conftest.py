@@ -61,6 +61,7 @@ def mark_transport_live(binding):
         def disconnect() -> None: ...
 
     binding._mqtt._client = _RecordingClient()
+    binding._mqtt._up = True  # the broker session is up, as after on_connect
     binding._started = True
     binding._connection = profiles.CONN_ONLINE
     binding.published = published

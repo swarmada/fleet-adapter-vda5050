@@ -87,6 +87,32 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 \
 robot's own identity. They default to `swarmada` / `amr-1` (the simulator's identity), so
 the `--comms simulated` path and existing setups are unaffected.
 
+The image includes paho-mqtt 2.1.0, so it runs `--comms vda5050` as it is; the Dockerfile shows
+the run line. The broker session works like this:
+
+- **Start-up.** The adapter starts only once the broker has accepted its connection and
+  every topic is subscribed. A broker it can't reach, or one that refuses or doesn't answer
+  within 10 s, stops it.
+- **A drop.** When the session drops, paho reconnects by itself, 1 s after the drop and then
+  at most 10 s apart. Each reconnect subscribes every topic again. While the session is
+  down, the vehicle is reported `OFFLINE`, with no position and no battery. Its connection
+  state, position and battery stay unknown until the broker delivers them again.
+- **A vehicle that doesn't say `ONLINE` again.** Some vehicles publish their retained
+  `ONLINE` only when they start; vda-5050-lib does. After a broker restart or a network blip,
+  the retained message is then still their last will, `CONNECTIONBROKEN`, while they're
+  connected and sending states. So after a drop, or while the connection reads
+  `CONNECTIONBROKEN` or hasn't been received, a fresh `state` restores the vehicle as
+  connected.
+- **When that connection lapses.** A connection restored this way lapses after 60 s without a
+  new `state` (`--state-lapse-seconds`): twice the 30 s VDA 5050 allows between states.
+- **What still decides.** An `ONLINE` from the vehicle restores it with no lapse. A later
+  `OFFLINE` or `CONNECTIONBROKEN` takes it down at once, and a vehicle that said `OFFLINE`
+  itself isn't restored by its states.
+- **What "not connected" does.** It only means the vehicle isn't treated as connected:
+  nothing is sent to it because of it.
+- **No TLS, no login.** The MQTT connection is plain TCP, so keep the broker on a network
+  that only the adapters and vehicles reach.
+
 ## Conformance roadmap (C1–C8)
 
 | # | Sub-item | Conformance | Status |

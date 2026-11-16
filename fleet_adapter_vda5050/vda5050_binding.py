@@ -71,6 +71,11 @@ _EPS_ANGULAR = 0.01  # rad/s
 # dropped and its action FAILED.
 _PREEMPT_TIMEOUT_S = 60.0
 
+# How long a connection taken from the vehicle's states lasts without a new one. VDA5050 2.0.0
+# has the vehicle send a state "at the latest every 30s", and vda-5050-lib sends it at QoS 0, so
+# one can be lost: twice that interval, so one late or lost state does not drop the vehicle.
+_STATE_LAPSE_S = 60.0
+
 # How many recent states a redelivery is looked for among. QoS 1 redelivers a message the
 # broker has not seen acknowledged, after a reconnect: the last few, not the last hundred.
 _STATE_DEDUP_WINDOW = 64
@@ -91,7 +96,10 @@ class Vda5050Binding:
                  profile_name: str = "vda5050",
                  mqtt_host: str = "localhost", mqtt_port: int = 1883,
                  preempt_timeout_s: float = _PREEMPT_TIMEOUT_S, clock=time.monotonic,
-                 boot: str | None = None, route_graph: RouteGraph | None = None) -> None:
+                 boot: str | None = None, route_graph: RouteGraph | None = None,
+                 state_lapse_s: float = _STATE_LAPSE_S) -> None:
+        if not (math.isfinite(state_lapse_s) and state_lapse_s > 0):
+            raise ValueError(f"state_lapse_s is {state_lapse_s!r}, not a positive number of seconds")
         self._robot_id = robot_id
         self._graph = route_graph  # the lanes orders follow (routing.py); None: one straight edge
         self._manufacturer = manufacturer
@@ -104,6 +112,14 @@ class Vda5050Binding:
         # estop's pause and cancel cannot fall either side of a held order going out.
         self._publish_lock = threading.RLock()
         self._connection = profiles.CONN_OFFLINE  # until the robot reports ONLINE
+        # The vehicle's connection, as last known. A connection message has been received since
+        # the start or the last broker drop (else the connection is unknown); and whether the
+        # vehicle is taken as ONLINE from its states rather than from a message, which lapses
+        # after state_lapse_s without a new state (_online_locked).
+        self._connection_known = False
+        self._online_by_state = False
+        self._last_state_at: float | None = None
+        self._state_lapse_s = state_lapse_s
         self._state = profiles.StateSnapshot()    # latest parsed telemetry
         self._factsheet = profiles.FactsheetInfo() # latest parsed factsheet (capabilities)
         self._header_id = 0                        # monotonic per-topic dedup key
@@ -174,20 +190,53 @@ class Vda5050Binding:
         self._started = False                      # True once the broker is connected
         self._never_started_raised = False          # tick()'s never-started diagnosis is one-shot
         self._mqtt = MqttClient(mqtt_host, mqtt_port, client_id=f"swarmada-{robot_id}")
+        self._mqtt.on_session(self._on_broker_session)
 
     # ── robot-side message callbacks (also the test entry points) ─────────────
 
     def on_connection(self, payload) -> None:
         state = self._profile.parse_connection(payload)
         with self._lock:
-            self._connection = state
+            # An explicit message always wins: ONLINE with no lapse, OFFLINE or CONNECTIONBROKEN
+            # at once, whatever the states say.
+            self._connection, self._connection_known, self._online_by_state = state, True, False
             if state != profiles.CONN_ONLINE:
                 # Away: what it last reported is not where it is when it comes back (pushed,
                 # relocalised, recharged). Unknown until it reports again.
                 self._pose, self._pose_at, self._battery_current = None, None, False
 
-    def connection_state(self, robot_id: str) -> str:
+    def _on_broker_session(self, up: bool) -> None:
+        """The broker session came up or went down (paho's thread). Down: nothing from the
+        vehicle arrives, and whatever happened meanwhile is not known. Its connection state
+        is taken as not ONLINE and unknown until the broker delivers it again (VDA5050 retains
+        it, so it comes with the new subscription) or the vehicle's states show it connected
+        (:meth:`on_state`), and its position and battery are unknown until it reports them
+        again. Up: nothing to do here; the retained connection follows."""
+        if up:
+            return
         with self._lock:
+            self._connection, self._connection_known, self._online_by_state = (
+                profiles.CONN_OFFLINE, False, False)
+            self._pose, self._pose_at, self._battery_current = None, None, False
+
+    def _online_locked(self) -> bool:
+        """The vehicle is taken as ONLINE: by its own connection message, or by its states (see
+        :meth:`on_state`) while a new one has come within ``state_lapse_s``. Not ONLINE says
+        only that it is not connected: nothing is sent to it because of it. The caller holds
+        the lock."""
+        if self._connection != profiles.CONN_ONLINE:
+            return False
+        if not self._online_by_state:
+            return True
+        return (self._last_state_at is not None
+                and self._clock() - self._last_state_at <= self._state_lapse_s)
+
+    def connection_state(self, robot_id: str) -> str:
+        """ONLINE, OFFLINE or CONNECTIONBROKEN, as last known; OFFLINE when a connection taken
+        from the vehicle's states has lapsed."""
+        with self._lock:
+            if self._connection == profiles.CONN_ONLINE and not self._online_locked():
+                return profiles.CONN_OFFLINE
             return self._connection
 
     def is_online(self, robot_id: str) -> bool:
@@ -212,7 +261,8 @@ class Vda5050Binding:
                if snapshot.header_id is not None and snapshot.timestamp else None)
         report = warn = False
         missing: list[str] = []
-        other_map: str | None = None  # the vehicle's map, when it is not the graph's
+        other_map: str | None = None
+        restored_from = ""  # the connection a fresh state restored, for the log  # the vehicle's map, when it is not the graph's
         with self._publish_lock:
             with self._lock:
                 repeat = key is not None and key in self._recent_states
@@ -228,6 +278,7 @@ class Vda5050Binding:
                     if key is not None:
                         self._recent_states.append(key)
                         self._state_seq += 1
+                        restored_from = self._restore_by_state_locked()
                         # Only a state that names this startPause as ended: one the vehicle
                         # sent after it took the startPause. A paused: true from a state that
                         # crossed it could be a pause the vehicle was about to leave.
@@ -256,6 +307,11 @@ class Vda5050Binding:
                           "for two different states loses the second. Logged once.",
                           file=sys.stderr)
                 return
+            if restored_from:
+                print(f"vda5050: the vehicle sends states while its connection reads "
+                      f"{restored_from}; taken as connected while its states keep coming "
+                      f"(not after {self._state_lapse_s:g} s without one). An ONLINE, OFFLINE or "
+                      f"CONNECTIONBROKEN message from it still decides.", file=sys.stderr)
             if other_map is not None:
                 print(f"vda5050: error: the route graph is for map {self._graph.map_id!r} and "
                       f"the vehicle reports map {other_map!r}; orders follow the graph's lanes "
@@ -295,6 +351,25 @@ class Vda5050Binding:
             if at is not None and self._pose_at is not None and _before(at, self._pose_at):
                 return  # older than the position already reported (a redelivery, a retained one)
             self._pose, self._pose_at = report.position, at
+
+    def _restore_by_state_locked(self) -> str:
+        """A counted state has come: the vehicle is connected and sending. When its connection
+        is unknown (no connection message since the start or the last broker drop) or
+        CONNECTIONBROKEN, it is taken as ONLINE from this state, until no new state comes for
+        ``state_lapse_s`` (:meth:`_online_locked`). Not when it said OFFLINE itself. Why: a
+        vehicle may publish its retained ONLINE only when it starts (vda-5050-lib 1.7.2), so
+        after a broker restart or a network blip the retained message stays its last will,
+        CONNECTIONBROKEN, while it is connected and sending states. Returns the connection it
+        restored from, for the log, or "" when nothing changed. The caller holds the lock."""
+        was_online = self._online_locked()
+        self._last_state_at = self._clock()
+        before = self._connection if self._connection_known else "unknown"
+        if self._connection != profiles.CONN_ONLINE and (
+                not self._connection_known or self._connection == profiles.CONN_BROKEN):
+            self._connection, self._online_by_state = profiles.CONN_ONLINE, True
+        if self._online_by_state and not was_online:
+            return before if before != profiles.CONN_ONLINE else "ONLINE, lapsed"
+        return ""
 
     def state_seq(self, robot_id: str) -> int:
         """How many new states, each with a headerId and a timestamp, this binding has received
@@ -651,7 +726,7 @@ class Vda5050Binding:
         cannot be observed or has
         reported no state: there is nothing to wait on then, and the order goes out as
         before."""
-        if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
+        if not (self._started and self._online_locked() and self._has_state):
             return False
         st = self._state
         if not st.nothing_left:  # a node, an action not ended, or a list not reported
@@ -836,7 +911,7 @@ class Vda5050Binding:
           vehicle rejected an order is read from an error naming it (:meth:`_rejected_locked`),
           and VDA5050 lets any error name an order. The stop after a rejection sends its
           cancelOrder, at the price of a noOrderToCancel warning."""
-        if not (self._started and self._connection == profiles.CONN_ONLINE and self._has_state):
+        if not (self._started and self._online_locked() and self._has_state):
             return False
         st = self._state
         linear, angular = st.velocity
@@ -853,8 +928,7 @@ class Vda5050Binding:
         renewed, and this binding will not send the stopPause that releases a pause it did not
         set. Read from the last ``state`` while the vehicle can be observed; False otherwise."""
         with self._lock:
-            if not (self._started and self._connection == profiles.CONN_ONLINE
-                    and self._has_state):
+            if not (self._started and self._online_locked() and self._has_state):
                 return False
             return self._state.paused and not (self._estop_paused or self._pause_requested)
 
@@ -1032,7 +1106,8 @@ class Vda5050Binding:
         `is_online()`) and the adapter never read. Declaring it on `RobotBinding` is what
         obliges a caller to ask; use `connection_state()` to tell the three apart."""
         with self._lock:
-            return self._started and self._connection == profiles.CONN_ONLINE
+            started, online = self._started, self._online_locked()
+        return started and online and self._mqtt.connected
 
     def transport_detail(self, robot_id: str = "") -> str:
         """Why `transport_alive()` is False, for the operator-facing log. Not on the
@@ -1043,4 +1118,11 @@ class Vda5050Binding:
         if not started:
             return ("the binding was never started: no broker session and no "
                     "subscriptions")
+        if not self._mqtt.connected:
+            return "the MQTT broker session is down; paho is reconnecting"
+        with self._lock:
+            lapsed = conn == profiles.CONN_ONLINE and not self._online_locked()
+        if lapsed:
+            return (f"the vehicle was taken as connected from its states, and none has come "
+                    f"for {self._state_lapse_s:g} s")
         return f"the robot's VDA5050 connection state is {conn}"
