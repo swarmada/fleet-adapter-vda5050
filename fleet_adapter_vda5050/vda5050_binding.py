@@ -1021,6 +1021,26 @@ class Vda5050Binding:
                 and st.operating_mode in _ORDER_DRIVEN_MODES
                 and (not last_order or st.order_id == last_order))
 
+    def stop_confirmed(self, robot_id: str) -> bool:
+        """At rest after a stop that was a ``cancelOrder`` alone (no startPause): a ``state``
+        has been observed, the vehicle is not driving, its velocity is within sensor noise, and
+        either it reports ``paused`` or it has nothing left to drive (no node, no action that
+        has not ended, the last order sent is the one it reports) in AUTOMATIC or
+        SEMIAUTOMATIC mode. ``is_stopped`` asks more, a pause, because an estop pauses the
+        vehicle; a cancelled order is ended once nothing is left of it. The caller confirms
+        only from a state counted after the stop (``state_seq``), as for an estop."""
+        with self._lock:
+            if not self._has_state:
+                return False
+            st, last_order = self._state, self._last_order_id
+        linear, angular = st.velocity
+        if st.driving or linear > _EPS_LINEAR or angular > _EPS_ANGULAR:
+            return False
+        if st.paused:
+            return True
+        return (st.nothing_left and st.operating_mode in _ORDER_DRIVEN_MODES
+                and (not last_order or st.order_id == last_order))
+
     def tick(self, dt: float) -> None:
         """paho runs its own network loop, so there is no model to advance -- but this is
         the binding's only guaranteed MAIN-THREAD callback (the adapter's telemetry loop

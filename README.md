@@ -217,6 +217,15 @@ has reported the pause.
   cancel: at rest, no node left, no action that has not ended, and no order the adapter
   sent still outstanding. A `state` that leaves out `nodeStates` or `actionStates` never
   says that, so the cancel is sent. An emergency stop always sends it.
+- **The reconcile at registration.** The control plane's reply names the action it holds for
+  the robot, or none. An action the adapter runs is kept only when the reply names it under the
+  token it was assigned with. The same action under a newer token is stopped and reported under
+  that token. An action the reply doesn't name is stopped and reported `STOPPED` once a
+  `state` sent after the stop shows the vehicle at rest. If none does within 2 s, or new work
+  is taken first, it's reported `FAILED` with the reason. When the reply names another action,
+  the end cause is `SUPERSEDED`, naming that action; when it names none, no cause is stated.
+  The report goes only on a session whose registration is accepted; on any other it is
+  dropped, and the log says so.
 - **A pause at the vehicle.** When the vehicle reports `paused` and the adapter did not
   pause it (by its button, or by an earlier adapter process), work is refused
   `ROBOT_UNAVAILABLE` with "paused at the vehicle". The adapter never sends the

@@ -81,6 +81,7 @@ def mark_registered(adapter):
     The registration paths are tested in test_provisioning.py.
     """
     adapter._registered = True
+    adapter._registered_outbox = adapter._outbox  # the session's outbox, as an accepted register records it
     return adapter
 
 
