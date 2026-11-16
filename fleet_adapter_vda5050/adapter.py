@@ -796,7 +796,18 @@ class fleet_adapter_vda5050Adapter:
             if reported:
                 state = (task_map.TASK_CANCELLED if phase == pb.ROBOT_ACTION_PHASE_CANCELLED
                          else task_map.TASK_STOPPED)
-                self._emit_action_status(reported, state, None)
+                # C6.4: every report carries the token of the action it names. When the reply
+                # names the action, its token is that action's current one; the action may be
+                # one this adapter never received (an assignment made before this register was
+                # processed), which has no token here, and a report without one is refused as
+                # an adapter fault. Otherwise the local action's own token is used. No other
+                # token is put on a report, so it can only match its own action. The retained
+                # outcome is kept under the same token, the only one the plane acknowledges.
+                token = (st.fencing_token if reported == st.action_id and st.fencing_token
+                         else None)
+                if token is not None and reported in self._action_tokens:
+                    self._action_tokens[reported] = token
+                self._emit_action_status(reported, state, token)
 
     def _on_renew(self, renew, result) -> None:
         pb = self._pb

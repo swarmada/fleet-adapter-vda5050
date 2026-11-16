@@ -98,9 +98,76 @@ def test_register_ack_cancel_stops_and_reports_the_action() -> None:
         accepted=True, authoritative_action_state=pb.RobotActionState(
             action_id="act-1", phase=pb.ROBOT_ACTION_PHASE_CANCELLED, fencing_token=1)))
     msgs = [m for m in _drain(a._outbox) if m.HasField("action_status")]
-    assert [(m.action_status.action_id, m.action_status.state) for m in msgs] == [
-        ("act-1", pb.ACTION_STATE_CANCELLED)]
+    assert [(m.action_status.action_id, m.action_status.state, m.action_status.fencing_token)
+            for m in msgs] == [("act-1", pb.ACTION_STATE_CANCELLED, 1)]
     assert a._current_action == ""
+
+
+def _reported(a: Adapter) -> list[tuple]:
+    """(action, state, token or None) for each ActionStatusUpdate in the outbox."""
+    return [(s.action_id, s.state, s.fencing_token if s.HasField("fencing_token") else None)
+            for s in (m.action_status for m in _drain(a._outbox) if m.HasField("action_status"))]
+
+
+def test_register_ack_in_progress_for_an_action_never_received_is_cancelled_under_its_token() -> None:
+    # The plane assigned wp1 before this register was processed, so the assignment never
+    # arrived. The reply names wp1 IN_PROGRESS; the adapter does not hold it and reports it
+    # cancelled. The report must carry wp1's token from the reply: without one the plane
+    # refuses it and records the adapter as omitting the token (C6.4).
+    a = _adapter()
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            action_id="wp1", phase=pb.ROBOT_ACTION_PHASE_IN_PROGRESS, fencing_token=41)))
+    assert _reported(a) == [("wp1", pb.ACTION_STATE_CANCELLED, 41)]
+
+
+def test_a_cancel_for_the_local_action_is_retained_under_the_replys_token() -> None:
+    # The plane acknowledges a retained outcome only under the token it was reported with.
+    a = _adapter()
+    assert _assign(a, 5, action_id="act-a").accepted
+    _drain(a._outbox)
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            action_id="act-a", phase=pb.ROBOT_ACTION_PHASE_CANCELLED, fencing_token=9)))
+    assert _reported(a) == [("act-a", pb.ACTION_STATE_CANCELLED, 9)]
+    kept = a._retained.get(ROBOT)
+    assert (kept.action_id, kept.fencing_token) == ("act-a", 9)
+
+
+def test_a_report_for_the_replys_action_never_carries_the_local_actions_token() -> None:
+    a = _adapter()
+    assert _assign(a, 5, action_id="act-a").accepted
+    _drain(a._outbox)
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            action_id="act-b", phase=pb.ROBOT_ACTION_PHASE_IN_PROGRESS, fencing_token=9)))
+    assert _reported(a) == [("act-b", pb.ACTION_STATE_CANCELLED, 9)]
+    assert a._current_action == ""
+
+
+def test_a_reply_without_a_token_puts_no_token_on_a_report_for_an_action_not_held() -> None:
+    # UNKNOWN names an action the plane could not read and carries no token. The adapter
+    # holds a different action at token 5: that token is not put on the report, so the
+    # report can never match the named action's generation by guesswork.
+    a = _adapter()
+    assert _assign(a, 5, action_id="act-a").accepted
+    _drain(a._outbox)
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            action_id="act-b", phase=pb.ROBOT_ACTION_PHASE_UNKNOWN)))
+    assert _reported(a) == [("act-b", pb.ACTION_STATE_STOPPED, None)]
+
+
+def test_an_idle_reply_reports_the_local_action_under_its_own_token() -> None:
+    # IDLE names no action; its token is the plane's mark, adopted, but not put on the
+    # report for the local action, which keeps the token it was assigned under.
+    a = _adapter()
+    assert _assign(a, 3, action_id="act-a").accepted
+    _drain(a._outbox)
+    a._reconcile_action_state(pb.RegisterAck(
+        accepted=True, authoritative_action_state=pb.RobotActionState(
+            phase=pb.ROBOT_ACTION_PHASE_IDLE, fencing_token=20)))
+    assert _reported(a) == [("act-a", pb.ACTION_STATE_STOPPED, 3)]
 
 
 def test_register_ack_in_progress_for_the_local_action_keeps_it() -> None:
