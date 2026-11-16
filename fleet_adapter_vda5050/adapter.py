@@ -679,6 +679,20 @@ class fleet_adapter_vda5050Adapter:
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_STALE_FENCING_TOKEN))
             return
+        if decision is FenceDecision.REACK:
+            # C3.4: an identical re-delivery of the current assignment is re-acked, and nothing is
+            # started again (an assignment is never executed twice). Before the availability
+            # check: refusing it while the vehicle cannot be observed would tell the control plane
+            # this robot is not doing the work it may still be doing, and the plane would give
+            # it to another robot. The lease is granted again, as the reference adapter does,
+            # but only while the action is still the one running here.
+            if task.lease_duration_ms and task.action_id and task.action_id == self._current_action:
+                self._current_generation = task.lease_generation
+                self._lease.grant(self._robot_id, task.lease_duration_ms / 1000.0,
+                                  task.lease_generation)
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=True, accepted_fencing_token=task.fencing_token))
+            return
         # After the fencing branches, so a stale token is still refused STALE.
         if unavailable:
             result.assign_action.CopyFrom(pb.AssignActionResult(
@@ -751,6 +765,13 @@ class fleet_adapter_vda5050Adapter:
           (``route_unavailable``, vda5050_binding.py)."""
         if not self._registered:
             return "this robot's registration was not accepted on this session"
+        # The vehicle cannot be observed: its connection is OFFLINE or CONNECTIONBROKEN, it has
+        # sent no state within the lapse, or the broker session is down. An order now goes to
+        # a topic nobody reads, and the control plane, which keeps such a robot Idle and Ready
+        # by design, would hold the work on it. Refused, so the plane reschedules it.
+        if not self._robot.transport_alive():
+            detail = self._transport_detail()
+            return "the vehicle is not connected" + (f": {detail}" if detail else "")
         paused = getattr(self._robot, "paused_at_vehicle", None)  # a binding written before it
         unroutable = getattr(self._robot, "route_unavailable", None)  # a binding that routes
         with self._robot_lock:
