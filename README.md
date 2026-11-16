@@ -108,8 +108,11 @@ the run line. The broker session works like this:
 - **What still decides.** An `ONLINE` from the vehicle restores it with no lapse. A later
   `OFFLINE` or `CONNECTIONBROKEN` takes it down at once, and a vehicle that said `OFFLINE`
   itself isn't restored by its states.
-- **What "not connected" does.** It only means the vehicle isn't treated as connected:
-  nothing is sent to it because of it.
+- **What "not connected" does.** New work is refused `ROBOT_UNAVAILABLE`, naming the reason
+  ("the vehicle is not connected: …"), so the control plane can schedule it again; an order now
+  would go to a vehicle that isn't reading it. The same applies while the broker session is
+  down. A repeat delivery of the work the vehicle already holds is still accepted, and nothing
+  starts again. Nothing is sent to the vehicle because of it: no stop and no cancel.
 - **No TLS, no login.** The MQTT connection is plain TCP, so keep the broker on a network
   that only the adapters and vehicles reach.
 
