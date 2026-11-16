@@ -385,7 +385,9 @@ On a floor shared with other robots, the setup must provide:
 registration is refused `NOT_ADMITTED`; the adapter then announces the robot (`DiscoverRobot`)
 and registers again each provisioning interval until an operator admits it. The interval is
 half the `DiscoverAck`'s TTL, at most 300 s, or 60 s without one, so the robot registers up to
-one interval after it is admitted.
+one interval after it is admitted. Until then, work for it can't reach the adapter. When a
+registration is accepted, the adapter logs `REGISTERED robot=<id>` with the contract version and
+the telemetry interval.
 
 ## Development
 

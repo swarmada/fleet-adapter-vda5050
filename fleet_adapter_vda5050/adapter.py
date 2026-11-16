@@ -395,6 +395,11 @@ class fleet_adapter_vda5050Adapter:
             secs = cp.register_ack.telemetry_interval_seconds
             if secs > 0:
                 self._telemetry_interval = max(1.0, min(30.0, float(secs)))
+            # The one line that says the robot is now under management on this session: until
+            # it, work for the robot is refused here (C13.2) and the control plane cannot push it.
+            print(f"REGISTERED robot={self._robot_id}; under management on this session "
+                  f"(contract {self._negotiated or 'not negotiated'}, telemetry every "
+                  f"{self._telemetry_interval:g} s)", file=sys.stderr, flush=True)
             self._reconcile_action_state(cp.register_ack)
             self._send_retained()
         elif kind == "discover_ack":

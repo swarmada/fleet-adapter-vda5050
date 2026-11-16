@@ -1,7 +1,7 @@
 # Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
 # SPDX-License-Identifier: Apache-2.0
 
-"""Work for a vehicle the adapter cannot observe is refused.
+"""Work for a vehicle the adapter cannot observe is refused, and a register accepted is logged.
 
 The control plane keeps a robot Idle and Ready while its adapter streams OFFLINE frames for it
 (RFC-0001: only adapter or robot silence takes a robot Offline), so it can assign that robot
@@ -134,3 +134,20 @@ def test_work_is_refused_once_states_stop_for_the_lapse() -> None:
     r = _assign(a, 7)
     assert r.rejection == pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE
     assert "none has come for 60 s" in r.message
+
+
+def test_an_accepted_register_is_logged(capsys) -> None:
+    a = Adapter(pb, None, mark_transport_live(Vda5050Binding(robot_id=ROBOT)), ROBOT)
+    a._negotiated = "1.4.0"
+    a._handle_control_plane(pb.ControlPlaneMessage(register_ack=pb.RegisterAck(
+        accepted=True, telemetry_interval_seconds=1)), None)
+    err = capsys.readouterr().err
+    assert ("REGISTERED robot=amr-1; under management on this session (contract 1.4.0, "
+            "telemetry every 1 s)") in err
+
+
+def test_a_refused_register_is_not_logged_as_registered(capsys) -> None:
+    a = Adapter(pb, None, mark_transport_live(Vda5050Binding(robot_id=ROBOT)), ROBOT)
+    a._handle_control_plane(pb.ControlPlaneMessage(register_ack=pb.RegisterAck(
+        accepted=False, rejection=pb.REGISTRATION_REJECTION_NOT_ADMITTED)), None)
+    assert "REGISTERED" not in capsys.readouterr().err
