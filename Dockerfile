@@ -1,7 +1,8 @@
 # Copyright 2026 The Swarmada Authors <maintainers@swarmada.io>
 # SPDX-License-Identifier: Apache-2.0
 #
-# The VDA5050 Fleet Adapter image, serving the simulated vehicle (--comms simulated).
+# The VDA5050 Fleet Adapter image: the simulated vehicle by default (--comms simulated), or a VDA 5050
+# vehicle over MQTT (--comms vda5050; paho-mqtt is installed).
 #
 #   docker build --build-context swarmada=<Swarmada checkout> -t fleet-adapter-vda5050:dev .
 #
@@ -17,6 +18,18 @@
 #
 #   docker run -v <tls>:/tls:ro -v <data>:/data fleet-adapter-vda5050:dev \
 #     --endpoint <control plane>:9090 --robot-id <robot>
+#
+# For a VDA 5050 vehicle, give the arguments in full, since they replace CMD below. The manufacturer
+# and serial are the vehicle's VDA 5050 identity, its topics uagv/v2/<manufacturer>/<serial>/...:
+#
+#   docker run -v <tls>:/tls:ro -v <data>:/data fleet-adapter-vda5050:dev \
+#     --endpoint <control plane>:9090 --robot-id <robot> --state-dir /data \
+#     --tls-ca /tls/ca.crt --tls-cert /tls/tls.crt --tls-key /tls/tls.key \
+#     --comms vda5050 --mqtt-host <broker> --mqtt-port 1883 \
+#     --manufacturer <manufacturer> --serial <serial> [--route-graph /data/lanes.yaml]
+#
+# The MQTT connection is plain TCP to the broker, with no TLS and no login; keep the broker on a
+# network only the adapters and vehicles reach.
 #
 # Without the three files the adapter refuses to start. --insecure (no TLS) exists for local tests
 # only and is never the default. Nothing in the image holds a site value or a key.
@@ -63,7 +76,7 @@ ENV PYTHONPATH=/app/proto \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# It needs no privileges: it only dials out over gRPC.
+# It needs no privileges: it only dials out, over gRPC and, with --comms vda5050, MQTT.
 USER 65532:65532
 VOLUME ["/data"]
 ENTRYPOINT ["fleet-adapter-vda5050"]

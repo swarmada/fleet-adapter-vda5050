@@ -22,7 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The MQTT transport for --comms vda5050. Optional: --comms simulated needs none.
-vda5050 = ["paho-mqtt>=1.6"]
+vda5050 = ["paho-mqtt>=2.0,<3"]  # callback API version 2 (mqtt_client.py)
 dev = ["pytest>=7", "ruff>=0.1"]
 
 [project.scripts]
