@@ -806,9 +806,23 @@ class fleet_adapter_vda5050Adapter:
         if st.fencing_token:
             self._fence.adopt(self._robot_id, st.fencing_token)
         phase = st.phase
+        newer_generation = False
         if phase == pb.ROBOT_ACTION_PHASE_IN_PROGRESS:
-            if st.action_id and st.action_id == self._current_action:
-                return  # agrees with local state; keep executing under the same lease
+            local = self._current_action
+            local_token = self._action_tokens.get(local) if local else None
+            if st.action_id and st.action_id == local:
+                if st.fencing_token and st.fencing_token == local_token:
+                    return  # the same action under the same token: keep executing, same lease
+                # The same name under another token: the control plane gave the action a newer
+                # generation (requeued and assigned again while this adapter was away), which
+                # this adapter never accepted and which may not be the work it is running.
+                # Never run under a generation not given: stopped, and reported under the
+                # reply's token like any other divergence.
+                newer_generation = True
+                print(f"reconcile: the registration reply names {local} IN_PROGRESS under token "
+                      f"{st.fencing_token or 'none'}, and it runs here under token {local_token}: "
+                      f"a generation this adapter never accepted; the vehicle is stopped",
+                      file=sys.stderr)
             phase = pb.ROBOT_ACTION_PHASE_CANCELLED  # divergence is treated as a cancel
         if phase not in (pb.ROBOT_ACTION_PHASE_CANCELLED, pb.ROBOT_ACTION_PHASE_UNKNOWN,
                          pb.ROBOT_ACTION_PHASE_IDLE):
@@ -831,7 +845,13 @@ class fleet_adapter_vda5050Adapter:
                 # outcome is kept under the same token, the only one the plane acknowledges.
                 token = (st.fencing_token if reported == st.action_id and st.fencing_token
                          else None)
-                if token is not None and reported in self._action_tokens:
+                if newer_generation:
+                    # Not kept for a later connection: the action is live at that generation, and
+                    # the plane neither reads nor acknowledges a kept CANCELLED for a live action,
+                    # so it would be sent again on every reconnect.
+                    self._action_tokens.pop(reported, None)
+                elif token is not None and reported in self._action_tokens:
+                    # Kept under the reply's token, the only one the plane acknowledges.
                     self._action_tokens[reported] = token
                 self._emit_action_status(reported, state, token)
 
