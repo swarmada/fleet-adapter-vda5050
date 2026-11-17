@@ -113,8 +113,15 @@ the run line. The broker session works like this:
   would go to a vehicle that isn't reading it. The same applies while the broker session is
   down. A repeat delivery of the work the vehicle already holds is still accepted, and nothing
   starts again. Nothing is sent to the vehicle because of it: no stop and no cancel.
-- **No TLS, no login.** The MQTT connection is plain TCP, so keep the broker on a network
-  that only the adapters and vehicles reach.
+- **No TLS, no login.** The MQTT connection is plain TCP with no login: see
+  [Known limitations](#known-limitations).
+
+## Known limitations
+
+- **MQTT without TLS or a login.** In this release the adapter connects to the MQTT broker over
+  plain TCP and doesn't log in. Anyone who can reach the broker can read every vehicle's topics
+  and publish orders and instant actions to the vehicles. Keep the broker on a private network
+  that only the adapters and vehicles reach. TLS and a login are planned for 0.5.0.
 
 ## Conformance roadmap (C1–C8)
 
