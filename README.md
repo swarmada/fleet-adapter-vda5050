@@ -241,8 +241,9 @@ has reported the pause.
   it's reported `FAILED`, and the reason says the outcome is unknown and the run may have done
   its work. Read that reason before running the work again. (The 0.4.1 control plane drops an
   `UNKNOWN` report, so `FAILED` is the report that ends the action.)
-  The report goes only on a session whose registration is accepted; on any other it is
-  dropped, and the log says so.
+  The report goes on the session that is current when it's sent, and only if that session's
+  registration is accepted; otherwise it is dropped and logged. Sent in the moment between one
+  session ending and the next one starting, it is lost.
 - **A pause at the vehicle.** When the vehicle reports `paused` and the adapter did not
   pause it (by its button, or by an earlier adapter process), work is refused
   `ROBOT_UNAVAILABLE` with "paused at the vehicle". The adapter never sends the
