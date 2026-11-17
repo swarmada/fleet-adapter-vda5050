@@ -119,9 +119,14 @@ the run line. The broker session works like this:
 ## Known limitations
 
 - **MQTT without TLS or a login.** In this release the adapter connects to the MQTT broker over
-  plain TCP and doesn't log in. Anyone who can reach the broker can read every vehicle's topics
-  and publish orders and instant actions to the vehicles. Keep the broker on a private network
-  that only the adapters and vehicles reach. TLS and a login are planned for 0.5.0.
+  plain TCP and doesn't log in, so the broker must accept anonymous clients. Anyone who can reach
+  the broker can read every vehicle's topics, send the vehicles orders and instant actions, and
+  forge a vehicle's `state` or `connection` messages. A forged `state` can make the adapter
+  confirm an emergency stop the vehicle never made. A client that connects with the adapter's
+  client id (`swarmada-<robot id>`) disconnects the adapter, and then no stop reaches the vehicle.
+  Topic access rules for anonymous clients can't tell the adapter from anyone else. Keep the
+  broker on a private network that only the adapters and vehicles reach. TLS and a login are
+  planned for 0.5.0.
 
 ## Conformance roadmap (C1–C8)
 
