@@ -224,6 +224,11 @@ has reported the pause.
   `state` sent after the stop shows the vehicle at rest. If none does within 2 s, or new work
   is taken first, it's reported `FAILED` with the reason. When the reply names another action,
   the end cause is `SUPERSEDED`, naming that action; when it names none, no cause is stated.
+  An action the reply names `UNKNOWN` (the control plane couldn't read it) is ended the same
+  way, with no cause. If its stop isn't confirmed, nobody can establish what the run achieved:
+  it's reported `FAILED`, and the reason says the outcome is unknown and the run may have done
+  its work. Read that reason before running the work again. (The 0.4.1 control plane drops an
+  `UNKNOWN` report, so `FAILED` is the report that ends the action.)
   The report goes only on a session whose registration is accepted; on any other it is
   dropped, and the log says so.
 - **A pause at the vehicle.** When the vehicle reports `paused` and the adapter did not

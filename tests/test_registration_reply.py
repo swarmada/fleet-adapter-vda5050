@@ -144,6 +144,7 @@ def test_a_state_from_before_the_stop_does_not_confirm_it() -> None:
     assert (r["action"], r["state"], r["token"], r["cause"], r["by"]) == (
         "act-a", "ACTION_STATE_FAILED", 3, "ACTION_END_CAUSE_SUPERSEDED", "act-b")
     assert "the stop was not confirmed: no state after the stop showed the vehicle at rest" in r["message"]
+    assert "outcome is unknown" not in r["message"]   # superseded: the reply named who has the robot
     assert a._retained.get(ROBOT) is None   # not kept: the plane has moved on
 
 
@@ -265,6 +266,36 @@ def test_revoking_for_the_local_action_under_a_newer_token_stops_it(capsys) -> N
     assert (r["action"], r["state"], r["token"]) == ("act-a", "ACTION_STATE_CANCELLED", 9)
     assert a._retained.get(ROBOT) is None and "act-a" not in a._action_tokens
     assert "names act-a REVOKING under token 9, and it runs here under token 3" in capsys.readouterr().err
+
+
+def test_unknown_for_the_local_action_is_reported_once_confirmed() -> None:
+    # The plane could not read act-a and sends no token. The run is stopped, and reported under
+    # its own token once the vehicle confirms rest, with no cause (nothing displaced it); its
+    # token entry goes, and nothing is kept for a later connection.
+    a, b = _running("act-a", 3)
+    _settled(a)
+    _reply(a, pb.ROBOT_ACTION_PHASE_UNKNOWN, "act-a")
+    assert a._current_action == "" and _cancels(b) == 1
+    [r] = _reports(a)
+    assert (r["action"], r["state"], r["token"], r["cause"], r["by"]) == (
+        "act-a", "ACTION_STATE_STOPPED", 3, "ACTION_END_CAUSE_UNSPECIFIED", "")
+    assert "could not read this action" in r["message"]
+    assert "act-a" not in a._action_tokens and a._retained.get(ROBOT) is None
+
+
+def test_unknown_for_the_local_action_not_confirmed_is_failed_saying_the_outcome_is_unknown() -> None:
+    # Nobody can establish what the run achieved. The v0.4 control plane drops
+    # ACTION_STATE_UNKNOWN, so FAILED (fail-closed, as RFC-0001 has a v0.4 adapter do), under its
+    # own token, with no cause, and a reason that says the outcome is unknown.
+    a, b = _running("act-a", 3)
+    _reply(a, pb.ROBOT_ACTION_PHASE_UNKNOWN, "act-a")
+    assert a._current_action == "" and _cancels(b) == 1
+    [r] = _reports(a)
+    assert (r["action"], r["state"], r["token"], r["cause"], r["by"]) == (
+        "act-a", "ACTION_STATE_FAILED", 3, "ACTION_END_CAUSE_UNSPECIFIED", "")
+    assert "could not read this action" in r["message"] and "not confirmed" in r["message"]
+    assert "the outcome is unknown" in r["message"]
+    assert "act-a" not in a._action_tokens and a._retained.get(ROBOT) is None
 
 
 def test_revoking_for_the_local_action_keeps_it() -> None:

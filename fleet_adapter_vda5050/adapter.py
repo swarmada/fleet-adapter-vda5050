@@ -859,7 +859,11 @@ class fleet_adapter_vda5050Adapter:
                 self._robot.command_stop(self._robot_id)
                 since = self._state_seq_now()
             self._lease.release(self._robot_id)
-            if local and local != named:
+            # UNKNOWN naming the local action: the plane could not read it. Stopped above, and
+            # ended like a run the reply does not name, so it gets a report under its own token
+            # and its token entry goes.
+            own_unknown = bool(local) and named == local and phase == pb.ROBOT_ACTION_PHASE_UNKNOWN
+            if local and (local != named or own_unknown):
                 # A local action the reply does not name is the plane's past: the robot is
                 # bound to another action, or to none. Stopped above; reported once the
                 # vehicle's own state confirms the stop (_end_superseded).
@@ -867,7 +871,7 @@ class fleet_adapter_vda5050Adapter:
                 self._end_superseded_async(local, local_token, st.phase, named, since)
             if phase == pb.ROBOT_ACTION_PHASE_REVOKING:
                 return  # the named action is not held here: nothing to stop or report
-            reported = named
+            reported = "" if own_unknown else named
             if reported:
                 state = (task_map.TASK_CANCELLED if phase == pb.ROBOT_ACTION_PHASE_CANCELLED
                          else task_map.TASK_STOPPED)
@@ -912,12 +916,14 @@ class fleet_adapter_vda5050Adapter:
 
     def _end_superseded(self, action: str, token: int | None, reply_phase: int, named: str,
                         since: int | None) -> None:
-        """The registration reply names another action, or none, while this adapter ran
-        ``action``; the vehicle was stopped (a cancelOrder). The action is reported STOPPED
+        """The registration reply names another action, or none, or names ``action`` UNKNOWN (the
+        plane could not read it), while this adapter ran ``action``; the vehicle was stopped (a
+        cancelOrder). The action is reported STOPPED
         only once a state the vehicle sent after the stop confirms it (the estop's rule: a
         state counted after the stop, and the vehicle at rest); if none does within the stop
-        budget, or new work is taken meanwhile, FAILED with the reason. Always one report, and
-        never silence: whatever goes wrong while waiting becomes the reason.
+        budget, or new work is taken meanwhile, FAILED with the reason, which also says the
+        outcome is unknown when the reply names ``action`` UNKNOWN. Always one report, and never silence: whatever goes wrong while waiting becomes the
+        reason.
 
         Under the action's own token, and never retained or written to the token record: the
         plane has moved on, a kept outcome under an old generation is never acknowledged, and
@@ -926,9 +932,14 @@ class fleet_adapter_vda5050Adapter:
         names none there is no displacing action, so no cause is stated (the proto: leave it
         unset rather than guess)."""
         pb = self._pb
-        what = (f"names {named} ({pb.RobotActionPhase.Name(reply_phase)})" if named
-                else "names no action")
-        why = f"superseded: the control plane's registration reply {what}"
+        own_unknown = named == action and reply_phase == pb.ROBOT_ACTION_PHASE_UNKNOWN
+        if own_unknown:
+            why = ("the control plane could not read this action: its registration reply names "
+                   "it UNKNOWN")
+        else:
+            what = (f"names {named} ({pb.RobotActionPhase.Name(reply_phase)})" if named
+                    else "names no action")
+            why = f"superseded: the control plane's registration reply {what}"
         try:
             failure = self._confirm_stop(since)
         except Exception as exc:  # noqa: BLE001 - never silence: the error becomes the reason
@@ -936,12 +947,21 @@ class fleet_adapter_vda5050Adapter:
         print(f"reconcile: {action} (token {token}) {why}; the vehicle was stopped and "
               + ("its state confirms it" if not failure else f"the stop was not confirmed: {failure}"),
               file=sys.stderr)
-        cause = pb.ACTION_END_CAUSE_SUPERSEDED if named else pb.ACTION_END_CAUSE_UNSPECIFIED
+        # Nothing displaced an action the plane could not read: no cause, as when none is named.
+        cause = (pb.ACTION_END_CAUSE_SUPERSEDED if named and not own_unknown
+                 else pb.ACTION_END_CAUSE_UNSPECIFIED)
         if not failure:
             self._report_only(action, task_map.TASK_STOPPED, token, why, cause, named)
         else:
-            self._report_only(action, task_map.TASK_FAILED, token,
-                              f"{why}; the stop was not confirmed: {failure}", cause, named)
+            reason = f"{why}; the stop was not confirmed: {failure}"
+            if own_unknown:
+                # The plane could not read the action and the stop is not confirmed: nobody can
+                # establish what the run achieved. The v0.4 control plane drops
+                # ACTION_STATE_UNKNOWN, and RFC-0001 has an adapter report FAILED itself, with a
+                # message saying the outcome is unknown: that message is the only record that
+                # the run may have done the job.
+                reason += "; the outcome is unknown: the run may have done its work"
+            self._report_only(action, task_map.TASK_FAILED, token, reason, cause, named)
 
     def _report_only(self, action: str, state_name: str, token: int | None, message: str,
                      end_cause: int, superseding: str) -> None:
