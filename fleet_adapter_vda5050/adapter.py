@@ -820,28 +820,35 @@ class fleet_adapter_vda5050Adapter:
             self._fence.adopt(self._robot_id, st.fencing_token)
         phase = st.phase
         newer_generation = False
-        if phase == pb.ROBOT_ACTION_PHASE_IN_PROGRESS:
+        if phase in (pb.ROBOT_ACTION_PHASE_IN_PROGRESS, pb.ROBOT_ACTION_PHASE_REVOKING):
             local = self._current_action
             local_token = self._action_tokens.get(local) if local else None
             if st.action_id and st.action_id == local:
                 if st.fencing_token and st.fencing_token == local_token:
-                    return  # the same action under the same token: keep executing, same lease
+                    # The same action under the same token: IN_PROGRESS keeps executing under
+                    # the same lease; REVOKING keeps it too, and it self-stops here when that
+                    # lease runs out.
+                    return
                 # The same name under another token: the control plane gave the action a newer
                 # generation (requeued and assigned again while this adapter was away), which
-                # this adapter never accepted and which may not be the work it is running.
-                # Never run under a generation not given: stopped, and reported under the
-                # reply's token like any other divergence.
+                # this adapter never accepted and which may not be the work it is running; a
+                # REVOKING reply revokes that newer generation, not this run. Never run under a
+                # generation not given: stopped, and reported under the reply's token like any
+                # other divergence.
                 newer_generation = True
-                print(f"reconcile: the registration reply names {local} IN_PROGRESS under token "
-                      f"{st.fencing_token or 'none'}, and it runs here under token {local_token}: "
-                      f"a generation this adapter never accepted; the vehicle is stopped",
-                      file=sys.stderr)
-            phase = pb.ROBOT_ACTION_PHASE_CANCELLED  # divergence is treated as a cancel
+                print(f"reconcile: the registration reply names {local} "
+                      f"{pb.RobotActionPhase.Name(phase).removeprefix('ROBOT_ACTION_PHASE_')} "
+                      f"under token {st.fencing_token or 'none'}, and it runs here under token "
+                      f"{local_token}: a generation this adapter never accepted; the vehicle is "
+                      f"stopped", file=sys.stderr)
+                phase = pb.ROBOT_ACTION_PHASE_CANCELLED  # divergence is treated as a cancel
+            elif phase == pb.ROBOT_ACTION_PHASE_IN_PROGRESS:
+                phase = pb.ROBOT_ACTION_PHASE_CANCELLED  # another action in progress: divergence
         named = st.action_id
         if phase == pb.ROBOT_ACTION_PHASE_REVOKING:
-            # REVOKING names an action whose lease the plane stopped renewing: it self-stops
-            # here when that lease runs out. Only a local action it does not name goes on below.
-            if not self._current_action or self._current_action == named:
+            # REVOKING naming another action: only a local action, which it does not name,
+            # goes on below (the same name was decided above).
+            if not self._current_action:
                 return
         elif phase not in (pb.ROBOT_ACTION_PHASE_CANCELLED, pb.ROBOT_ACTION_PHASE_UNKNOWN,
                            pb.ROBOT_ACTION_PHASE_IDLE):
