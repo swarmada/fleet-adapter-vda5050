@@ -255,6 +255,18 @@ def test_an_accepted_registration_records_its_session_outbox() -> None:
     assert a._registered and a._registered_outbox is a._outbox
 
 
+def test_revoking_for_the_local_action_under_a_newer_token_stops_it(capsys) -> None:
+    # The plane is revoking a newer generation of act-a, which this adapter never accepted; the
+    # run here is not that one. Stopped, reported under the reply's token, nothing kept.
+    a, b = _running("act-a", 3)
+    _reply(a, pb.ROBOT_ACTION_PHASE_REVOKING, "act-a", 9)
+    assert a._current_action == "" and _cancels(b) == 1
+    [r] = _reports(a)
+    assert (r["action"], r["state"], r["token"]) == ("act-a", "ACTION_STATE_CANCELLED", 9)
+    assert a._retained.get(ROBOT) is None and "act-a" not in a._action_tokens
+    assert "names act-a REVOKING under token 9, and it runs here under token 3" in capsys.readouterr().err
+
+
 def test_revoking_for_the_local_action_keeps_it() -> None:
     a, b = _running("act-a", 3)
     _reply(a, pb.ROBOT_ACTION_PHASE_REVOKING, "act-a", 3)
