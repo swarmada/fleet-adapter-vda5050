@@ -1,0 +1,23 @@
+## the adapter connects (ControlStream session 1)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"telemetry_interval_seconds":1},"seq":"2"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+## assign act-1
+control< {"command":{"assign_action":{"action_id":"act-1","action_type":"Navigate","assignment_id":"as-7","fencing_token":"7","payload_json":"eyJ4IjogNS4wLCAieSI6IDB9"},"command_id":"1","leader_term":"1","robot_id":"amr-1"},"seq":"3"}
+mqtt> order {"edges":[{"actions":[],"edgeId":"edge-0","endNodeId":"goal","released":true,"sequenceId":1,"startNodeId":"start"}],"headerId":1,"manufacturer":"swarmada","nodes":[{"actions":[],"nodeId":"start","nodePosition":{"mapId":"map","theta":0.0,"x":0.0,"y":0.0},"released":true,"sequenceId":0},{"actions":[],"nodeId":"goal","nodePosition":{"mapId":"map","theta":0.0,"x":5.0,"y":0.0},"released":true,"sequenceId":2}],"orderId":"amr-1-<boot>-order-1","orderUpdateId":0,"serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+control> {"action_status":{"action_id":"act-1","fencing_token":"7","state":"ACTION_STATE_RUNNING"}}
+control> {"command_result":{"assign_action":{"accepted":true,"accepted_fencing_token":"7"},"command_id":"1","robot_id":"amr-1"}}
+## the ControlStream drops
+-- the control plane drops the ControlStream
+## the adapter connects (ControlStream session 2)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"4"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"authoritative_action_state":{"action_id":"act-1","fencing_token":"7","phase":"ROBOT_ACTION_PHASE_IN_PROGRESS"},"telemetry_interval_seconds":1},"seq":"5"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+control: quiet
+mqtt: quiet
+## the control plane closes the streams
+safety> {"local_stop":{"source":"robot"},"robot_id":"amr-1"}

@@ -1,0 +1,23 @@
+## the adapter connects (ControlStream session 1)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"edge_endpoints":[{"address":"<edge>","zone":"zone-a"}],"telemetry_interval_seconds":1},"seq":"2"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+## the adapter dials the edge node and tees a position
+edge> {"position":{"position":{"floor":0,"x":0.0,"y":0.0,"yaw":0.0},"robot_id":"amr-1","ts_ms":"<t>"}}
+## an edge estop
+edge< {"estop":{"estop_id":"edge-1","issued_by":"edge","reason":"test"}}
+mqtt> instantActions {"actions":[{"actionId":"amr-1-<boot>-a-1","actionParameters":[],"actionType":"startPause","blockingType":"HARD"}],"headerId":1,"manufacturer":"swarmada","serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+mqtt> instantActions {"actions":[{"actionId":"amr-1-<boot>-a-2","actionParameters":[],"actionType":"cancelOrder","blockingType":"HARD"}],"headerId":2,"manufacturer":"swarmada","serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+edge> {"estop_ack":{"confirmed_at_ms":"<t>","estop_id":"edge-1","state":"ESTOP_STATE_STOPPED","stop_initiated_at":"<t>"}}
+safety> {"local_stop":{"source":"robot"},"robot_id":"amr-1"}
+safety> {"local_stop":{"changed_at_ms":"<t>","latched":true,"set_id":"<set>","source":"robot"},"robot_id":"amr-1"}
+## work under the local latch is refused, and the latch reported
+control< {"command":{"assign_action":{"action_id":"act-1","action_type":"Navigate","assignment_id":"as-7","fencing_token":"7","payload_json":"eyJ4IjogNS4wLCAieSI6IDB9"},"command_id":"1","leader_term":"1","robot_id":"amr-1"},"seq":"4"}
+control> {"command_result":{"assign_action":{"message":"under a stop: local latch","rejection":"ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE"},"command_id":"1","robot_id":"amr-1"}}
+safety> {"local_stop":{"changed_at_ms":"<t>","latched":true,"set_id":"<set>","source":"robot"},"robot_id":"amr-1"}
+control: quiet
+safety: quiet
+mqtt: quiet
+## the control plane closes the streams

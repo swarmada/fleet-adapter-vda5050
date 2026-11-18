@@ -1,0 +1,14 @@
+## the adapter connects (ControlStream session 1)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"message":"no Robot yet","rejection":"REGISTRATION_REJECTION_NOT_ADMITTED","telemetry_interval_seconds":1},"seq":"2"}
+control> {"discover":{"robot_id":"amr-1"}}
+## announced; the next register comes after min(ttl/2, 300) s
+control< {"discover_ack":{"accepted":true,"ttl_seconds":"2"},"seq":"3"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"telemetry_interval_seconds":1},"seq":"4"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+control: quiet
+## the control plane closes the streams
+safety> {"local_stop":{"source":"robot"},"robot_id":"amr-1"}
