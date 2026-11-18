@@ -358,6 +358,29 @@ SafetyStream message names a robot by that id.
   (`Command.estop`), for its own robot or another. The stop's answer is the `EstopAck` on the
   SafetyStream, which the control plane reads.
 
+### Another process under the same adapter identity
+
+Run one process per adapter identity, the client certificate's `FleetAdapter`. When the control
+plane accepts a second ControlStream or SafetyStream under the same identity, it closes the
+earlier one with `ABORTED` and a message that starts `superseded:`. A process whose stream is
+closed that way:
+
+- stops its vehicle with a `cancelOrder`, without pausing it, so the process that took over can
+  give it work;
+- ends the action it held, never continues it, and refuses all later work;
+- waits up to 2 s for a `state` that shows the vehicle at rest, and logs whether one came;
+- closes its MQTT session, so it doesn't take the client id back from the process that took over;
+- doesn't open either stream again, and stays up, idle, until it's stopped. Restart it to serve
+  again.
+
+Every other close of a stream is a drop, and the adapter reconnects.
+
+**While both processes run,** both connect to the broker with the client id
+`swarmada-<robot id>`. The broker keeps one session per client id, so at any moment one of the
+two is disconnected, and the superseded process's stop reaches the vehicle only if it holds the
+session at that moment. A client id per process (`--mqtt-client-id`) is planned for 0.5.0, with
+TLS and a login.
+
 ### Routes along lanes
 
 Without a route graph, an order is one straight edge from the vehicle's position to the goal.
