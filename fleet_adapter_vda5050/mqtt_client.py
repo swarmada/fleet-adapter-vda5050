@@ -109,10 +109,12 @@ class MqttClient:
             raise RuntimeError(f"MQTT broker {self._host}:{self._port} did not accept the "
                                f"connection: {why}")
 
-    def publish(self, topic: str, payload: str) -> None:
+    def publish(self, topic: str, payload: str):
+        """Publish at QoS 1, and return paho's ``MQTTMessageInfo``: it reads as published
+        once the broker has acknowledged the message (PUBACK)."""
         if self._client is None:
             raise RuntimeError("MqttClient is not connected; call connect() first.")
-        self._client.publish(topic, payload, qos=1)
+        return self._client.publish(topic, payload, qos=1)
 
     def _on_connect(self, client, _userdata, _flags, reason_code, _properties) -> None:
         """The broker answered a connect: the first one, or paho's reconnect after a drop.

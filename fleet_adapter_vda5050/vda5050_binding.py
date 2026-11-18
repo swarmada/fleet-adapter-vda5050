@@ -172,6 +172,12 @@ class Vda5050Binding:
         self._holding = False                      # a stop has been commanded; hold until a new order
         self._recancelled = False                  # this stop's one late cancel has been sent
         self._stop_cancel_id = ""                  # the cancelOrder the last stop sent
+        # What the last stop did about a cancelOrder: "" (not yet decided, or the send
+        # failed), "suppressed" (nothing to cancel) or "sent", and paho's handle for it
+        # (stop_cancel, cancel_accepted).
+        self._stop_cancel_state = ""
+        self._stop_cancel_info = None
+        self._last_cancel_info = None              # the handle of the last cancelOrder published
         self._stop_cancel_ended = False            # ...and the vehicle has reported it ended
         self._estop_paused = False                 # an estop paused the vehicle; stopPause before the next order
         self._pause_requested = False              # a Swarmada pause (command_pause) is in force
@@ -842,12 +848,16 @@ class Vda5050Binding:
                 self._recancelled = False  # a new stop: its own late cancel, if it comes to that
                 self._stop_cancel_id, self._stop_cancel_ended = "", False
                 self._held, self._held_cancel_id = None, ""  # a stop ends a preemption too
+                self._stop_cancel_state, self._stop_cancel_info = "", None
                 if not always and self._nothing_to_cancel_locked():
                     self._suppressed_stops += 1
+                    self._stop_cancel_state = "suppressed"
                     return
             cancel_id = self._send_cancel(robot_id)
             with self._lock:
                 self._stop_cancel_id = cancel_id
+                self._stop_cancel_state = "sent"
+                self._stop_cancel_info = self._last_cancel_info
 
     def _send_cancel(self, robot_id: str) -> str:
         """Publish a ``cancelOrder`` and return its actionId."""
@@ -865,9 +875,47 @@ class Vda5050Binding:
             with self._lock:
                 self._last_action = payload
                 self._open_cancel_id, self._open_cancel_at = action_id, self._states_seen
+                self._last_cancel_info = None
             if self._started:  # pragma: no cover — requires paho + a broker
-                self._mqtt.publish(self._topics.instant_actions, payload)
+                info = self._mqtt.publish(self._topics.instant_actions, payload)
+                with self._lock:
+                    self._last_cancel_info = info
             return action_id
+
+    def runs_last_order(self, robot_id: str) -> bool:
+        """True when the last ``state`` shows the vehicle on the last order this binding sent
+        (its ``orderId``), and no order is held behind a preemption's cancel: the vehicle is
+        then witnessed off every order sent before it. The caller asks only of a state
+        received after the moment in question (``state_seq``)."""
+        with self._lock:
+            if not self._has_state or self._held is not None or not self._last_order_id:
+                return False
+            return self._state.order_id == self._last_order_id
+
+    def stop_cancel(self, robot_id: str) -> tuple:
+        """The last stop's ``cancelOrder``, as a ticket for :meth:`cancel_accepted`. Taken
+        right after the stop, so a later stop's cancelOrder can't answer for this one."""
+        with self._lock:
+            return (self._stop_cancel_state, self._stop_cancel_info)
+
+    @staticmethod
+    def cancel_accepted(ticket: tuple) -> bool:
+        """Whether the broker has accepted the ``cancelOrder`` of the stop ``ticket``
+        (:meth:`stop_cancel`) names: True once it acknowledged the publish (QoS 1 PUBACK), and
+        True when that stop sent none because the vehicle's own state showed nothing to
+        cancel. False while the broker hasn't acknowledged it, when the publish failed (no
+        broker session), when nothing was published at all (the binding was not started), or
+        when the send itself failed. Rest is a separate question (:meth:`stop_confirmed`): a
+        cancel is confirmed only with both."""
+        state, info = ticket
+        if state == "suppressed":
+            return True
+        if state != "sent" or info is None:
+            return False
+        try:
+            return bool(info.is_published())
+        except (RuntimeError, ValueError):  # paho: not queued, or the publish failed
+            return False
 
     def command_estop(self, robot_id: str) -> None:
         """An emergency stop: ``startPause``, then ``cancelOrder``.
