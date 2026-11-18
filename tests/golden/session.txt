@@ -1,0 +1,17 @@
+## the adapter connects (ControlStream session 1)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"telemetry_interval_seconds":1},"seq":"2"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+## heartbeat
+control< {"heartbeat":{"robot_id":"amr-1"},"seq":"3"}
+control> {"heartbeat":{"robot_id":"amr-1"}}
+## telemetry, once the vehicle's position is known
+telemetry> {"telemetry":{"battery":{"percent":80},"phase":"ROBOT_PHASE_IDLE","position":{"floor":0,"x":0.0,"y":0.0,"yaw":0.0},"robot_id":"amr-1","timestamp_ms":"<t>"}}
+## an outcome ack for an action this adapter keeps nothing for
+control< {"outcome_ack":{"action_id":"act-none","fencing_token":"1"},"seq":"4"}
+control: quiet
+mqtt: quiet
+## the control plane closes the streams
+safety> {"local_stop":{"source":"robot"},"robot_id":"amr-1"}

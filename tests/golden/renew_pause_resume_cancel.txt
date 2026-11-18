@@ -1,0 +1,31 @@
+## the adapter connects (ControlStream session 1)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"telemetry_interval_seconds":1},"seq":"2"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+## assign act-1
+control< {"command":{"assign_action":{"action_id":"act-1","action_type":"Navigate","assignment_id":"as-7","fencing_token":"7","lease_duration_ms":30000,"lease_generation":"1","payload_json":"eyJ4IjogNS4wLCAieSI6IDB9"},"command_id":"1","leader_term":"1","robot_id":"amr-1"},"seq":"3"}
+mqtt> order {"edges":[{"actions":[],"edgeId":"edge-0","endNodeId":"goal","released":true,"sequenceId":1,"startNodeId":"start"}],"headerId":1,"manufacturer":"swarmada","nodes":[{"actions":[],"nodeId":"start","nodePosition":{"mapId":"map","theta":0.0,"x":0.0,"y":0.0},"released":true,"sequenceId":0},{"actions":[],"nodeId":"goal","nodePosition":{"mapId":"map","theta":0.0,"x":5.0,"y":0.0},"released":true,"sequenceId":2}],"orderId":"amr-1-<boot>-order-1","orderUpdateId":0,"serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+control> {"action_status":{"action_id":"act-1","fencing_token":"7","state":"ACTION_STATE_RUNNING"}}
+control> {"command_result":{"assign_action":{"accepted":true,"accepted_fencing_token":"7"},"command_id":"1","robot_id":"amr-1"}}
+## renew the lease
+control< {"command":{"command_id":"2","leader_term":"1","renew_lease":{"action_id":"act-1","lease_duration_ms":30000,"lease_generation":"2"},"robot_id":"amr-1"},"seq":"4"}
+control> {"command_result":{"command_id":"2","renew_lease":{"current_generation":"2","renewed":true,"running":true},"robot_id":"amr-1"}}
+## pause
+control< {"command":{"command_id":"3","leader_term":"1","pause":{"reason":"test"},"robot_id":"amr-1"},"seq":"5"}
+mqtt> instantActions {"actions":[{"actionId":"amr-1-<boot>-a-1","actionParameters":[],"actionType":"startPause","blockingType":"HARD"}],"headerId":2,"manufacturer":"swarmada","serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+control> {"command_result":{"command_id":"3","pause":{"message":"vda5050: startPause","paused":true},"robot_id":"amr-1"}}
+## resume
+control< {"command":{"command_id":"4","leader_term":"1","resume":{"reason":"test"},"robot_id":"amr-1"},"seq":"6"}
+mqtt> instantActions {"actions":[{"actionId":"amr-1-<boot>-a-2","actionParameters":[],"actionType":"stopPause","blockingType":"HARD"}],"headerId":3,"manufacturer":"swarmada","serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+control> {"command_result":{"command_id":"4","resume":{"message":"vda5050: stopPause","resumed":true},"robot_id":"amr-1"}}
+## cancel
+control< {"command":{"cancel_action":{"action_id":"act-1","reason":"test"},"command_id":"5","leader_term":"1","robot_id":"amr-1"},"seq":"7"}
+mqtt> instantActions {"actions":[{"actionId":"amr-1-<boot>-a-3","actionParameters":[],"actionType":"cancelOrder","blockingType":"HARD"}],"headerId":4,"manufacturer":"swarmada","serialNumber":"amr-1","timestamp":"<t>","version":"2.0.0"}
+control> {"action_status":{"action_id":"act-1","fencing_token":"7","state":"ACTION_STATE_CANCELLED"}}
+control> {"command_result":{"cancel_action":{"acknowledged":true,"disposition":"CANCEL_DISPOSITION_STOPPED_SAFELY"},"command_id":"5","robot_id":"amr-1"}}
+control: quiet
+mqtt: quiet
+## the control plane closes the streams
+safety> {"local_stop":{"source":"robot"},"robot_id":"amr-1"}

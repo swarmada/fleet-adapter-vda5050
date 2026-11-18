@@ -1,0 +1,23 @@
+## the adapter connects (ControlStream session 1)
+control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
+control> {"register":{"robot_id":"amr-1"}}
+control< {"register_ack":{"accepted":true,"telemetry_interval_seconds":1},"seq":"2"}
+control> {"capabilities":{"robot_id":"amr-1","snapshot_ms":"<t>","supported_actions":[{"action_type":"Navigate","description":"VDA5050 order to a node; optional x/y/theta target and mapId, else the destination label","params":[{"kind":"number","name":"x","unit":"m"},{"kind":"number","name":"y","unit":"m"},{"kind":"number","name":"theta","unit":"rad"},{"kind":"string","name":"mapId"}]}]}}
+## an assignment for another robot
+control< {"command":{"assign_action":{"action_id":"act-9","action_type":"Navigate","assignment_id":"as-1","fencing_token":"1","payload_json":"eyJ4IjogMSwgInkiOiAwfQ=="},"command_id":"1","leader_term":"1","robot_id":"amr-9"},"seq":"3"}
+control> {"command_result":{"assign_action":{"message":"robot_id 'amr-9' is not served by this adapter, which serves 'amr-1'; nothing was done","rejection":"ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE"},"command_id":"1","robot_id":"amr-9"}}
+## a fence for another robot
+control< {"command":{"command_id":"2","estop":{"estop_id":"e-9","reason":"test"},"leader_term":"1","robot_id":"amr-9"},"seq":"4"}
+safety> {"local_stop":{"source":"robot"},"robot_id":"amr-1"}
+safety> {"estop_ack":{"estop_id":"e-9","message":"robot_id 'amr-9' is not served by this adapter, which serves 'amr-1'; no stop was commanded and none can be confirmed","state":"ESTOP_STATE_FAILED"},"robot_id":"amr-9"}
+## a SafetyStream estop for another robot
+safety< {"estop":{"estop_id":"e-10","reason":"test"},"robot_id":"amr-9","seq":"5"}
+safety> {"estop_ack":{"estop_id":"e-10","message":"robot_id 'amr-9' is not served by this adapter, which serves 'amr-1'; no stop was commanded and none can be confirmed","state":"ESTOP_STATE_FAILED"},"robot_id":"amr-9"}
+## a heartbeat for another robot
+control< {"heartbeat":{"robot_id":"amr-9"},"seq":"6"}
+control> {"heartbeat":{"robot_id":"amr-9"}}
+control: quiet
+safety: quiet
+mqtt: quiet
+## the control plane closes the streams
