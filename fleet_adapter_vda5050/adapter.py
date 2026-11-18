@@ -105,6 +105,17 @@ def _at_least_14(version: str) -> bool:
     return (major, minor) >= (1, 4)
 
 
+def _is_superseded(exc) -> bool:
+    """A stream the control plane closed because it accepted a newer one under this adapter
+    identity: ABORTED, "superseded: ..." (RFC-0001 #fleet-adapter-protocol-connection-
+    lifecycle). Any other close is a drop, and is redialled."""
+    code = getattr(exc, "code", None)
+    details = getattr(exc, "details", None)
+    if not callable(code) or not callable(details):
+        return False
+    return code() == grpc.StatusCode.ABORTED and "superseded" in (details() or "")
+
+
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -187,6 +198,12 @@ class fleet_adapter_vda5050Adapter:
         # a resume already past its checks re-reads this under _robot_lock and gives up rather
         # than send an order or a stopPause after the stop.
         self._estop_epoch = 0
+        # Set once a stream is closed as superseded by another process under this adapter
+        # identity (_on_superseded): the vehicle is stopped, no work is held or taken, and no
+        # stream is opened again.
+        self._superseded = threading.Event()
+        self._superseded_lock = threading.Lock()
+        self._superseded_why = ""
         self._robot_id = robot_id
         self._fence = FenceGuard()                              # C3
         self._lease = LeaseMonitor(on_expiry=self._self_stop)   # C4
@@ -332,6 +349,13 @@ class fleet_adapter_vda5050Adapter:
                 except grpc.RpcError as exc:
                     if self._shutdown.is_set():
                         break
+                    if _is_superseded(exc):
+                        self._on_superseded("ControlStream", exc)
+                    if self._superseded.is_set():
+                        # Never redialled: another process serves this identity now. Up, and
+                        # idle, until the process is terminated.
+                        self._shutdown.wait()
+                        break
                     print(f"control stream dropped ({exc.code()}); reconnecting", file=sys.stderr)
                     time.sleep(0.5)
                     continue
@@ -355,6 +379,11 @@ class fleet_adapter_vda5050Adapter:
                 for cp in call:
                     self._handle_control_plane(cp, stub)
             except grpc.RpcError as exc:  # the drop surfaces as a CANCELLED RPC
+                if _is_superseded(exc):
+                    self._on_superseded("ControlStream", exc)
+                if self._superseded.is_set():
+                    self._shutdown.wait()
+                    break
                 if not self._reconnect_pending:
                     raise
                 print(f"control stream dropped ({exc.code()}); reconnecting", file=sys.stderr)
@@ -640,6 +669,9 @@ class fleet_adapter_vda5050Adapter:
         it before the stop's clear."""
         pb = self._pb
         epoch = self._estop_epoch
+        if self._superseded.is_set():
+            result.resume.CopyFrom(pb.ResumeResult(resumed=False, message=self._superseded_why))
+            return
         if self._latch.refuses_work(self._robot_id):
             result.resume.CopyFrom(pb.ResumeResult(resumed=False, message="under a stop"))
             return
@@ -781,6 +813,8 @@ class fleet_adapter_vda5050Adapter:
           stopPause "can also restart vehicles that were stopped with a hardware button").
         * With a route graph, the vehicle's position is unknown: an order starts from it
           (``route_unavailable``, vda5050_binding.py)."""
+        if self._superseded.is_set():
+            return self._superseded_why
         if not self._registered:
             return "this robot's registration was not accepted on this session"
         # The vehicle cannot be observed: its connection is OFFLINE or CONNECTIONBROKEN, it has
@@ -1172,6 +1206,46 @@ class fleet_adapter_vda5050Adapter:
                   f"inferring it: {exc}", file=sys.stderr)
             return ESTOP_FAILED
 
+    def _on_superseded(self, stream: str, exc) -> None:
+        """A stream closed as superseded by another process under this adapter identity
+        (RFC-0001 #fleet-adapter-protocol-connection-lifecycle: such a process "MUST stop every
+        robot it drives" and "MUST also hold no work"). Once, whichever stream comes first:
+
+        1. Work is refused from here on (_unavailable, _on_resume), and no stream is opened
+           again.
+        2. The vehicle is stopped with ``cancelOrder``, never paused: the process that took
+           over refuses work on a vehicle paused by another process ("paused at the vehicle"),
+           so a pause here would leave the robot out of service. The epoch is counted, so an
+           assignment or a resume already past its checks gives up rather than send after it.
+        3. The work it held is interrupted ("stream superseded"); its reports go nowhere now.
+        4. Rest is awaited, and logged: no stream is left to report it on.
+        5. The MQTT session is released. Both processes use the client id
+           ``swarmada-<robot id>``, and an idle process that kept it would take it back on
+           every reconnect, cutting the process that took over off the vehicle.
+
+        This adapter opens a stream only after the previous one ended, so a superseded close
+        is always a stream it did not open."""
+        with self._superseded_lock:
+            if self._superseded.is_set():
+                return
+            self._superseded_why = (f"this process's {stream} was superseded by another process "
+                                    f"under the same adapter identity; it holds no work")
+            self._superseded.set()
+        print(f"error: SUPERSEDED robot={self._robot_id}: {stream} closed by the control plane: "
+              f"{exc.details()}. Another process serves this adapter identity. Stopping the "
+              f"vehicle, holding no work, not reconnecting; restart this process to serve "
+              f"again", file=sys.stderr, flush=True)
+        with self._robot_lock:
+            self._estop_epoch += 1
+            self._robot.command_stop(self._robot_id)
+            since = self._state_seq_now()
+        self._interrupt_current("stream superseded", command_stop=False)
+        why = self._confirm_stop(since)
+        print(f"error: SUPERSEDED robot={self._robot_id}: the stop "
+              + ("is confirmed: the vehicle is at rest" if not why else f"is NOT confirmed: {why}")
+              + "; releasing the MQTT session", file=sys.stderr, flush=True)
+        self._robot.stop()
+
     def _self_stop(self, robot_id: str) -> None:
         # Report the stop, then the action's end, before dropping it. Without them the
         # control plane sees only silence after the lease lapses, which is
@@ -1511,6 +1585,10 @@ class fleet_adapter_vda5050Adapter:
             except grpc.RpcError as exc:
                 if self._shutdown.is_set():
                     return
+                if _is_superseded(exc):
+                    self._on_superseded("SafetyStream", exc)
+                if self._superseded.is_set():
+                    return  # never reopened: another process serves this identity now
                 print(f"safety stream dropped ({exc.code()}); reconnecting", file=sys.stderr)
                 time.sleep(0.5)
                 continue
