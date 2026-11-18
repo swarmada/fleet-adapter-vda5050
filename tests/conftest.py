@@ -48,17 +48,26 @@ def mark_transport_live(binding):
     published: list[tuple[str, str]] = []
 
     class _RecordingClient:
-        """Stands in for paho's client inside the real MqttClient."""
+        """Stands in for paho's client inside the real MqttClient. Each publish is
+        acknowledged at once, as a broker acknowledges a QoS 1 publish."""
 
         @staticmethod
-        def publish(topic, payload, qos=1) -> None:
+        def publish(topic, payload, qos=1):
             published.append((topic, payload))
+            return acknowledged()
 
         @staticmethod
         def loop_stop() -> None: ...
 
         @staticmethod
         def disconnect() -> None: ...
+
+    def acknowledged():
+        from paho.mqtt.client import MQTTMessageInfo
+
+        info = MQTTMessageInfo(len(published))
+        info._set_as_published()
+        return info
 
     binding._mqtt._client = _RecordingClient()
     binding._mqtt._up = True  # the broker session is up, as after on_connect

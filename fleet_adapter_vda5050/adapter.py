@@ -553,26 +553,8 @@ class fleet_adapter_vda5050Adapter:
         elif which == "renew_lease":
             self._on_renew(command.renew_lease, result)
         elif which == "cancel_action":
-            with self._action_lock:
-                named = command.cancel_action.action_id
-                if named and self._current_action and named != self._current_action:
-                    # C3.9: a cancel for an action this robot no longer runs (it was preempted
-                    # in place, or a stop ended it). That one is stopped already, and stopping
-                    # the current one would abort the action that replaced it.
-                    result.cancel_action.CopyFrom(pb.CancelActionResult(
-                        acknowledged=True, disposition=pb.CANCEL_DISPOSITION_STOPPED_SAFELY,
-                        cause=command.cancel_action.cause))
-                    self._outbox.put(pb.AdapterMessage(command_result=result))
-                    return
-                cancelled, _ = self._take_current()
-                with self._robot_lock:
-                    self._robot.command_stop(self._robot_id)
-                self._lease.release(self._robot_id)
-                result.cancel_action.CopyFrom(pb.CancelActionResult(
-                    acknowledged=True,
-                    disposition=pb.CANCEL_DISPOSITION_STOPPED_SAFELY))
-                if cancelled:
-                    self._emit_action_status(cancelled, task_map.TASK_CANCELLED, None)
+            if self._on_cancel(command.cancel_action, result):
+                return  # answered later, off this reader (_finish_cancel)
         elif which == "pause":
             self._on_pause(command.pause, result)
         elif which == "resume":
@@ -1043,7 +1025,123 @@ class fleet_adapter_vda5050Adapter:
                 return
             outbox.put(pb.AdapterMessage(action_status=upd))
 
-    def _confirm_stop(self, since: int | None) -> str:
+    def _on_cancel(self, cancel, result) -> bool:
+        """A cancel: answered for what was witnessed, never for what was only commanded.
+
+        STOPPED_SAFELY tells the control plane the robot is off the action, and it may then
+        give the action to another robot at once (its executor guard). Otherwise the answer is
+        CANCEL_DISPOSITION_STOP_UNCONFIRMED (contract 1.4.0), or acknowledged=false to a
+        control plane below 1.4.0, which has no such answer.
+
+        * The action it names is the one running: it is stopped, and STOPPED_SAFELY once a
+          state counted after the stop shows the vehicle at rest and the broker has accepted
+          the cancelOrder, within the estop's budget (_confirm_stop).
+        * C3.9: it names an action the vehicle no longer runs, replaced in place by the one
+          running. Nothing is stopped: that would abort the action that replaced it. It is
+          STOPPED_SAFELY once a state received after the cancel shows the vehicle on the
+          replacing order, which shows it off the one named (_witness_replaced).
+
+        One look is taken here, on the reader. If it doesn't settle the answer, the rest of the
+        wait and the answer run on a thread of their own, so no command behind the cancel waits
+        for it, a fence least of all. Returns True when the answer is left to that thread."""
+        replaced = ""
+        with self._action_lock:
+            named = cancel.action_id
+            if named and self._current_action and named != self._current_action:
+                replaced = self._current_action
+                with self._robot_lock:
+                    since = self._state_seq_now()
+            else:
+                cancelled, _ = self._take_current()
+                with self._robot_lock:
+                    self._robot.command_stop(self._robot_id)
+                    since = self._state_seq_now()
+                    # This stop's own cancelOrder: a later stop's can't answer for it.
+                    ticket = getattr(self._robot, "stop_cancel", None)
+                    ticket = ticket(self._robot_id) if ticket else None
+                self._lease.release(self._robot_id)
+                if cancelled:
+                    self._emit_action_status(cancelled, task_map.TASK_CANCELLED, None)
+        if replaced:
+            action, cause = named, cancel.cause
+            if getattr(self._robot, "runs_last_order", None) is None:
+                self._answer_cancel(result, action, f"this vehicle can't report which order it "
+                                    f"runs, so it can't be witnessed off this one for {replaced}",
+                                    cause=cause)
+                return False
+
+            def confirm(looks: int = _STOP_CONFIRM_TICKS) -> str:
+                return self._witness_replaced(since, replaced, looks)
+        else:
+            action, cause = named or cancelled, cancel.cause
+            accepted = None
+            if ticket is not None:
+                def accepted(_robot_id: str) -> bool:
+                    return self._robot.cancel_accepted(ticket)
+
+            def confirm(looks: int = _STOP_CONFIRM_TICKS) -> str:
+                return self._confirm_stop(since, accepted=accepted, looks=looks)
+        if not confirm(looks=1):
+            self._answer_cancel(result, action, "", cause=cause)
+            return False
+        threading.Thread(target=self._finish_cancel,
+                         args=(result, action, confirm, cause, self._outbox),
+                         daemon=True).start()
+        return True
+
+    def _finish_cancel(self, result, action: str, confirm, cause, outbox) -> None:
+        """The rest of a cancel's wait, and its answer, off the reader. The answer goes on the
+        outbox of the session the cancel came on: a newer session never had this cancel."""
+        try:
+            why = confirm()
+        except Exception as exc:  # noqa: BLE001 - a cancel is answered, never left silent
+            why = f"the wait raised {exc!r}"
+        self._answer_cancel(result, action, why, cause=cause)
+        outbox.put(self._pb.AdapterMessage(command_result=result))
+
+    def _witness_replaced(self, since: int | None, replaced: str, looks: int) -> str:
+        """C3.9: "" once a state received after the cancel (``state_seq`` > ``since``) shows
+        the vehicle on the order the binding sent last, the one that replaced the action
+        named, and none held behind a cancel (``runs_last_order``); else why not, within the
+        estop's budget. A state that still shows the old order, or comes from before the
+        cancel, witnesses nothing."""
+        on_order = self._robot.runs_last_order
+        state_seq = getattr(self._robot, "state_seq", None)
+        if not callable(state_seq) or since is None:
+            return "the vehicle's state count could not be read after the cancel"
+        for look in range(looks):
+            if look:
+                self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
+            with self._robot_lock:
+                seen = state_seq(self._robot_id)
+                if type(seen) is int and seen > since and on_order(self._robot_id):
+                    return ""
+        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+        return (f"no state after the cancel showed the vehicle on the order of {replaced}, "
+                f"which replaced it, within {budget:g} s")
+
+    def _answer_cancel(self, result, action: str, why: str, cause=0) -> None:
+        """STOPPED_SAFELY when ``why`` is empty (rest witnessed); else not confirmed."""
+        pb = self._pb
+        if not why:
+            answer = pb.CancelActionResult(acknowledged=True,
+                                           disposition=pb.CANCEL_DISPOSITION_STOPPED_SAFELY)
+        else:
+            message = f"the stop was commanded and not confirmed: {why}"
+            print(f"error: cancel of {action or '(no action)'} for {self._robot_id!r}: "
+                  f"{message}", file=sys.stderr, flush=True)
+            if _at_least_14(self._negotiated):
+                answer = pb.CancelActionResult(
+                    acknowledged=True, disposition=pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED,
+                    message=message)
+            else:
+                answer = pb.CancelActionResult(acknowledged=False, message=message)
+        if cause:
+            answer.cause = cause
+        result.cancel_action.CopyFrom(answer)
+
+    def _confirm_stop(self, since: int | None, accepted=None,
+                      looks: int = _STOP_CONFIRM_TICKS) -> str:
         """Wait for the vehicle's own confirmation of a cancelOrder stop: "" when a state
         counted after the stop (``state_seq`` > ``since``) shows it at rest
         (``stop_confirmed``, else ``is_stopped``), or the reason it was not confirmed within
@@ -1051,25 +1149,34 @@ class fleet_adapter_vda5050Adapter:
         inferred from a timeout or from silence. A binding without ``state_seq`` (a
         simulator) is asked ``is_stopped`` alone. The binding is not ticked here: the
         telemetry loop does that, and states arrive on the transport's own thread. Once new
-        work is taken, a state can no longer speak for this stop: not confirmed."""
+        work is taken, a state can no longer speak for this stop: not confirmed.
+
+        ``accepted`` (a cancel's): the stop is confirmed only once it also answers True, the
+        broker having accepted the cancelOrder, within the same budget. ``looks`` = 1 takes one
+        look and doesn't wait."""
         confirmed = getattr(self._robot, "stop_confirmed", None) or self._robot.is_stopped
+        rested = False
         state_seq = getattr(self._robot, "state_seq", None)
         counted = callable(state_seq)
         if counted and since is None:
             return "the vehicle's state count could not be read after the stop"
-        for _ in range(_STOP_CONFIRM_TICKS):
+        for look in range(looks):
+            if look:
+                self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
             if self._current_action:
                 return f"new work ({self._current_action}) was taken before the stop was confirmed"
             with self._robot_lock:
                 seen = state_seq(self._robot_id) if counted else None
-                if (not counted or (type(seen) is int and seen > since)) and confirmed(
-                        self._robot_id):
+                rested = bool((not counted or (type(seen) is int and seen > since)) and confirmed(
+                    self._robot_id))
+                if rested and (accepted is None or accepted(self._robot_id)):
                     return ""
-            self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
+        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+        if rested:
+            return f"the broker did not acknowledge the cancelOrder within {budget:g} s"
         if counted and not self._robot.transport_alive():
             detail = self._transport_detail()
             return "the vehicle is not connected" + (f": {detail}" if detail else "")
-        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
         return f"no state after the stop showed the vehicle at rest within {budget:g} s"
 
     def _on_renew(self, renew, result) -> None:

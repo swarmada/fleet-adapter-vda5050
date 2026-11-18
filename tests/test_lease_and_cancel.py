@@ -6,7 +6,8 @@
 * a lease that lapses ends the action STOPPED, then FAILED with LEASE_EXPIRED, so the control
   plane can tell the action ended (STOPPED alone is the commanded stop, not terminal);
 * a cancel naming an action this adapter no longer runs (it was preempted in place)
-  leaves the action that replaced it running."""
+  leaves the action that replaced it running, and is answered as a stop not confirmed: the
+  vehicle's rest can't be witnessed for it while the other action runs."""
 
 from __future__ import annotations
 
@@ -74,7 +75,7 @@ def test_a_cancel_naming_a_preempted_action_leaves_the_preemptor_running() -> No
     msgs = _drain(a)
     (res,) = [m.command_result.cancel_action for m in msgs
               if m.WhichOneof("payload") == "command_result"]
-    assert res.acknowledged and res.disposition == pb.CANCEL_DISPOSITION_STOPPED_SAFELY
+    assert res.acknowledged and res.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
     assert _statuses(msgs) == []
     assert a._current_action == "t-preemptor"
 
