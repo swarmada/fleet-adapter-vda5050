@@ -370,6 +370,8 @@ closed that way:
 - ends the action it held, never continues it, and refuses all later work;
 - waits up to 2 s for a `state` that shows the vehicle at rest, and logs whether one came;
 - closes its MQTT session, so it doesn't take the client id back from the process that took over;
+- when only its SafetyStream was superseded, closes its ControlStream too, so a stop for the robot
+  goes to the process that took over and not to one that can neither deliver nor answer it;
 - doesn't open either stream again, and stays up, idle, until it's stopped. Restart it to serve
   again.
 

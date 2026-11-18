@@ -341,10 +341,20 @@ class fleet_adapter_vda5050Adapter:
                     # with a shared queue it swallows the RegisterRobot the NEW session
                     # enqueues on hello_ack, so the control plane never sees the
                     # re-registration §9.2.5(b) requires.
-                    outbox: queue.Queue = queue.Queue()
-                    self._outbox = outbox
-                    self._new_session()
-                    for cp in stub.ControlStream(self._control_requests(outbox)):
+                    with self._superseded_lock:
+                        # Under the lock a supersession is recorded under, so one the other
+                        # stream recorded, during the backoff or before it, is seen here and
+                        # nothing is dialled. A redial would take the streams back from the
+                        # process that took over, after this one released MQTT: the robot's
+                        # stops would then come to a process that can't deliver them.
+                        if self._superseded.is_set():
+                            break
+                        outbox: queue.Queue = queue.Queue()
+                        self._outbox = outbox
+                        self._new_session()
+                        stream = stub.ControlStream(self._control_requests(outbox))
+                        self._active_call = stream  # closed by a SafetyStream supersession
+                    for cp in stream:
                         self._handle_control_plane(cp, stub)
                 except grpc.RpcError as exc:
                     if self._shutdown.is_set():
@@ -360,6 +370,7 @@ class fleet_adapter_vda5050Adapter:
                     time.sleep(0.5)
                     continue
                 break  # clean close (response iterator ended without error)
+            self._park_if_superseded()
             self._shutdown.set()
             return
 
@@ -368,13 +379,16 @@ class fleet_adapter_vda5050Adapter:
         # persisted fencing/lease state (C3/C4) across the outage.
         while not self._shutdown.is_set():
             self._reconnect_pending = False
-            # A fresh outbox per session, as above: what the dropped session left queued is
-            # not sent ahead of the new session's RegisterRobot.
-            outbox = queue.Queue()
-            self._outbox = outbox
-            self._new_session()
-            call = stub.ControlStream(self._control_requests(outbox))
-            self._active_call = call
+            with self._superseded_lock:  # as above: nothing is dialled after a supersession
+                if self._superseded.is_set():
+                    break
+                # A fresh outbox per session, as above: what the dropped session left queued
+                # is not sent ahead of the new session's RegisterRobot.
+                outbox = queue.Queue()
+                self._outbox = outbox
+                self._new_session()
+                call = stub.ControlStream(self._control_requests(outbox))
+                self._active_call = call
             try:
                 for cp in call:
                     self._handle_control_plane(cp, stub)
@@ -392,6 +406,7 @@ class fleet_adapter_vda5050Adapter:
             if self._shutdown.is_set() or not self._reconnect_pending:
                 break
             self._await_reconnect()
+        self._park_if_superseded()
         self._shutdown.set()
 
     def _new_session(self) -> None:
@@ -657,6 +672,12 @@ class fleet_adapter_vda5050Adapter:
         at rest (never inferred from the command or a timer)."""
         pb = self._pb
         with self._robot_lock:
+            if self._superseded.is_set():
+                # The vehicle is handed over unpaused, so the process that took over can give
+                # it work; and after MQTT is released a pause would publish nothing.
+                result.pause.CopyFrom(pb.PauseResult(paused=False,
+                                                     message=self._superseded_why))
+                return
             self._robot.command_pause(self._robot_id)
             paused = self._robot.is_stopped(self._robot_id) if pause.require_stop_before_ack else True
         result.pause.CopyFrom(pb.PauseResult(
@@ -1211,8 +1232,9 @@ class fleet_adapter_vda5050Adapter:
         (RFC-0001 #fleet-adapter-protocol-connection-lifecycle: such a process "MUST stop every
         robot it drives" and "MUST also hold no work"). Once, whichever stream comes first:
 
-        1. Work is refused from here on (_unavailable, _on_resume), and no stream is opened
-           again.
+        1. Work is refused from here on (_unavailable, _on_resume, _on_pause), and no stream
+           is opened again. After a SafetyStream supersession the ControlStream is closed too:
+           a fence sent on it could be neither answered nor, once MQTT is released, delivered.
         2. The vehicle is stopped with ``cancelOrder``, never paused: the process that took
            over refuses work on a vehicle paused by another process ("paused at the vehicle"),
            so a pause here would leave the robot out of service. The epoch is counted, so an
@@ -1231,20 +1253,43 @@ class fleet_adapter_vda5050Adapter:
             self._superseded_why = (f"this process's {stream} was superseded by another process "
                                     f"under the same adapter identity; it holds no work")
             self._superseded.set()
+            # A SafetyStream superseded while our ControlStream is open (the process that took
+            # over hasn't opened its own yet): a fence sent on ours now could be neither
+            # answered, with no SafetyStream, nor delivered once MQTT is released. So ours is
+            # closed too, and the control plane sends the robot's stops to the process that
+            # took over. The dial records its call under this lock, so a call is either seen
+            # here or never made.
+            control = self._active_call if stream == "SafetyStream" else None
+        if control is not None:
+            control.cancel()
         print(f"error: SUPERSEDED robot={self._robot_id}: {stream} closed by the control plane: "
               f"{exc.details()}. Another process serves this adapter identity. Stopping the "
               f"vehicle, holding no work, not reconnecting; restart this process to serve "
               f"again", file=sys.stderr, flush=True)
-        with self._robot_lock:
-            self._estop_epoch += 1
-            self._robot.command_stop(self._robot_id)
-            since = self._state_seq_now()
-        self._interrupt_current("stream superseded", command_stop=False)
-        why = self._confirm_stop(since)
+        try:
+            with self._robot_lock:
+                self._estop_epoch += 1
+                self._robot.command_stop(self._robot_id)
+                since = self._state_seq_now()
+            self._interrupt_current("stream superseded", command_stop=False)
+            why = self._confirm_stop(since)
+        except Exception as fault:  # noqa: BLE001 - the release and the parking still follow
+            why = f"the stop sequence raised {fault!r}"
         print(f"error: SUPERSEDED robot={self._robot_id}: the stop "
               + ("is confirmed: the vehicle is at rest" if not why else f"is NOT confirmed: {why}")
               + "; releasing the MQTT session", file=sys.stderr, flush=True)
-        self._robot.stop()
+        try:
+            self._robot.stop()
+        except Exception as fault:  # noqa: BLE001
+            print(f"error: SUPERSEDED robot={self._robot_id}: releasing the MQTT session "
+                  f"raised {fault!r}", file=sys.stderr, flush=True)
+
+    def _park_if_superseded(self) -> None:
+        """After a supersession the ControlStream loop neither redials nor returns: the
+        process stays up, and idle, until it is terminated (main's teardown would otherwise
+        run while it is still up)."""
+        if self._superseded.is_set():
+            self._shutdown.wait()
 
     def _self_stop(self, robot_id: str) -> None:
         # Report the stop, then the action's end, before dropping it. Without them the
@@ -1580,7 +1625,11 @@ class fleet_adapter_vda5050Adapter:
             self._safety_outbox = outbox
             self._report_latch()
             try:
-                for cp in stub.SafetyStream(requests()):
+                with self._superseded_lock:  # as the ControlStream's: no dial after one
+                    if self._superseded.is_set():
+                        return
+                    stream = stub.SafetyStream(requests())
+                for cp in stream:
                     self._on_safety_message(cp)
             except grpc.RpcError as exc:
                 if self._shutdown.is_set():

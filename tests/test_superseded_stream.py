@@ -10,7 +10,8 @@ every robot it drives and hold no work. This adapter only opens a stream after t
 has ended, so a superseded close is always another process's doing: it stops the vehicle
 (cancelOrder, no pause, so the process that took over can give it work), refuses all later
 work, releases the MQTT session the two processes would otherwise fight over, and stays up
-without redialling. An ordinary drop still redials."""
+without redialling, by any path: a drop's backoff, the simulated comms' reconnect and a clean
+close included. An ordinary drop still redials."""
 
 from __future__ import annotations
 
@@ -75,10 +76,11 @@ class _Stub:
         self.scripts = {"control": list(control), "safety": list(safety)}
         self.calls = {"control": 0, "safety": 0}
         self.open: dict = {}
+        self.cancelled: list = []
 
-    def _stream(self, which: str):
+    def _stream(self, which: str, opened: dict):
         self.calls[which] += 1
-        n = self.calls[which]
+        n = opened["n"] = self.calls[which]
         script = self.scripts[which]
         msgs, error = script.pop(0) if script else ([], None)
         ev, slot = threading.Event(), {}
@@ -101,10 +103,31 @@ class _Stub:
             ev.set()
 
     def ControlStream(self, _requests):
-        return self._stream("control")
+        return _Call(self, "control")
 
     def SafetyStream(self, _requests):
-        return self._stream("safety")
+        return _Call(self, "safety")
+
+
+class _Call:
+    """One scripted stream, iterated as a gRPC response stream is; ``cancel`` ends it with
+    CANCELLED, as a cancelled call does, and is recorded."""
+
+    def __init__(self, stub: _Stub, which: str) -> None:
+        self._stub, self._which, self._opened = stub, which, {}
+        self._it = stub._stream(which, self._opened)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._it)
+
+    def cancel(self) -> None:
+        n = self._opened.get("n")
+        if n is not None:
+            self._stub.cancelled.append((self._which, n))
+            self._stub.drop(self._which, n, _Closed(grpc.StatusCode.CANCELLED, "cancelled"))
 
 
 @pytest.fixture
@@ -180,7 +203,7 @@ def test_a_superseded_safety_stream_stops_the_vehicle_and_nothing_redials(adapte
     assert a._interrupted == {"act-1": 7}
     assert not _refused_after(a).accepted
     assert stub.calls["safety"] == 1
-    # The ControlStream that is still open then drops: it isn't redialled either.
+    # The ControlStream is closed too, and a later drop of it redials nothing either.
     stub.drop("control", 1, _Closed(grpc.StatusCode.UNAVAILABLE, "connection reset"))
     time.sleep(0.8)
     assert stub.calls["control"] == 1
@@ -208,4 +231,153 @@ def test_an_ordinary_drop_still_redials_and_stops_nothing(adapter, stream, close
         assert ts.is_alive()
     assert "cancelOrder" not in _wire(b)
     assert not a.stops
+    assert tc.is_alive()
+
+
+# ── after a supersession, nothing is redialled, by any path ─────────────────
+#
+# A redial after MQTT is released takes the streams back from the process that took over, which
+# then parks the vehicle as superseded: the robot's stops come to a process that can't deliver
+# them. That is a robot that fails to stop.
+
+SUPERSEDED_SAFETY = SUPERSEDED.replace("ControlStream", "SafetyStream")
+
+
+def _both_open(a, stub) -> tuple[threading.Thread, threading.Thread]:
+    tc = _run(a.run_control_stream, stub)
+    _until(lambda: a._registered)
+    ts = _run(a.run_safety_stream, stub)
+    _until(lambda: ("safety", 1) in stub.open)
+    return tc, ts
+
+
+def test_a_safety_drop_then_a_supersession_does_not_redial_the_safety_stream(adapter) -> None:
+    a = adapter
+    stub = a.stub = _Stub(control=[(_SESSION, None)], safety=[([], None), ([], None)])
+    tc, ts = _both_open(a, stub)
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.UNAVAILABLE, "connection reset"))
+    time.sleep(0.15)  # in the 0.5 s backoff
+    stub.drop("control", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+    _until(lambda: a.stops)
+    ts.join(1)
+    assert not ts.is_alive()  # the SafetyStream loop has ended, past the backoff
+    assert stub.calls["safety"] == 1
+    assert tc.is_alive()
+
+
+def test_after_a_drop_and_a_supersession_a_stop_for_the_robot_does_not_land_here(adapter) -> None:
+    """The ControlStream drops; the SafetyStream is superseded during the backoff, and MQTT is
+    released. Redialled, the ControlStream would take the robot's fence (here, e9) away from
+    the process that took over: this process could neither deliver it (no MQTT) nor answer it
+    (no SafetyStream). Not redialled, the fence goes to the process that can."""
+    a, b = adapter, adapter._robot
+    fence = pb.ControlPlaneMessage(command=pb.Command(
+        command_id=2, robot_id=ROBOT, leader_term=1, estop=pb.Estop(estop_id="e9")))
+    stub = a.stub = _Stub(control=[(_SESSION + [_assign_cmd(1, "act-1", 7)], None),
+                                   (_SESSION + [fence], None)],
+                          safety=[([], None)])
+    tc, _ts = _both_open(a, stub)
+    _until(lambda: a._current_action == "act-1")
+    stub.drop("control", 1, _Closed(grpc.StatusCode.UNAVAILABLE, "connection reset"))
+    time.sleep(0.15)  # in the 0.5 s backoff
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED_SAFETY))
+    _until(lambda: a.stops)
+    time.sleep(0.8)  # past the backoff
+    assert stub.calls["control"] == 1  # the fence was never taken here
+    assert _wire(b) == ["order", "cancelOrder"]  # stopped by the supersession, not paused
+    assert tc.is_alive()
+
+
+class _Sim:
+    """The simulated comms' hooks the ControlStream loop and the RegisterAck read: a scenario
+    drop whose reconnect time the test moves past."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def stream_drop_window(self):
+        return (0.0, 1.0)
+
+    def elapsed(self) -> float:
+        return self.now
+
+    def reset_hardware_baseline(self) -> None:
+        pass
+
+    def hardware_delta(self) -> list:
+        return []
+
+    def manifest_hardware(self) -> list:
+        return []
+
+
+def test_the_simulated_comms_loop_does_not_redial_after_a_supersession(adapter) -> None:
+    a = adapter
+    a._sim = sim = _Sim()
+    stub = a.stub = _Stub(control=[(_SESSION, None), (_SESSION, None)], safety=[([], None)])
+    tc, _ts = _both_open(a, stub)
+    a._reconnect_pending = True  # the scenario's drop
+    stub.drop("control", 1, _Closed(grpc.StatusCode.CANCELLED, "dropped by the scenario"))
+    time.sleep(0.15)  # waiting for the reconnect time
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED_SAFETY))
+    _until(lambda: a.stops)
+    sim.now = 2.0  # the reconnect time passes
+    time.sleep(0.8)
+    assert stub.calls["control"] == 1
+    assert tc.is_alive()
+
+
+def test_a_clean_close_after_a_supersession_leaves_the_process_up(adapter) -> None:
+    a = adapter
+    stub = a.stub = _Stub(control=[(_SESSION, None)], safety=[([], None)])
+    tc, _ts = _both_open(a, stub)
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED_SAFETY))
+    _until(lambda: a.stops)
+    stub.drop("control", 1, None)  # the ControlStream ends without an error
+    time.sleep(0.3)
+    assert tc.is_alive() and not a._shutdown.is_set()
+    assert stub.calls["control"] == 1
+
+
+def test_a_pause_after_a_supersession_is_refused(adapter) -> None:
+    a, b = adapter, adapter._robot
+    stub = a.stub = _Stub(control=[(_SESSION, None)], safety=[([], None)])
+    _both_open(a, stub)
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED_SAFETY))
+    _until(lambda: a._superseded.is_set())
+    res = pb.CommandResult()
+    a._on_pause(pb.PauseCapabilities(), res)
+    assert not res.pause.paused and "superseded" in res.pause.message
+    _until(lambda: a.stops)
+    assert "startPause" not in _wire(b)  # handed over unpaused
+
+
+def test_a_fault_in_the_stop_sequence_still_releases_mqtt_and_stays_up(adapter, capsys) -> None:
+    a, b = adapter, adapter._robot
+
+    def broken(robot_id):
+        raise TypeError("command_stop is broken")
+
+    b.command_stop = broken
+    stub = a.stub = _Stub(control=[(_SESSION, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))])
+    tc = _run(a.run_control_stream, stub)
+    _until(lambda: a.stops)
+    time.sleep(0.3)
+    assert tc.is_alive()
+    assert "the stop sequence raised" in capsys.readouterr().err
+
+
+def test_a_fence_after_a_safety_only_supersession_is_not_silently_lost(adapter) -> None:
+    """Only the SafetyStream is superseded: the process that took over hasn't opened its
+    ControlStream yet, so ours is still open. A fence sent on ours now could be neither answered
+    (no SafetyStream) nor, once MQTT is released, delivered. So ours is closed at once, not
+    redialled, and the control plane sends the fence to the process that took over."""
+    a = adapter
+    stub = a.stub = _Stub(control=[(_SESSION, None), (_SESSION, None)], safety=[([], None)])
+    tc, _ts = _both_open(a, stub)
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED_SAFETY))
+    _until(lambda: ("control", 1) in stub.cancelled, timeout=2)  # closed
+    _until(lambda: a.stops)
+    time.sleep(0.8)  # past the 0.5 s a redial waits
+    assert stub.calls["control"] == 1  # and not redialled
     assert tc.is_alive()
