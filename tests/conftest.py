@@ -14,6 +14,24 @@ if str(_REPO_ROOT) not in sys.path:
 
 # ── broker-free "the transport is up" fixture ────────────────────────────────
 
+class PublishInfo:
+    """Stands in for paho's ``MQTTMessageInfo`` (paho-mqtt 2.1) without importing paho, which
+    the test run doesn't install: ``is_published()`` is True once the broker has acknowledged
+    the publish (QoS 1 PUBACK), and raises ``RuntimeError`` when the publish failed (paho's
+    ``rc > 0``, such as MQTT_ERR_NO_CONN during a broker drop), as paho's does."""
+
+    def __init__(self, published: bool = False, failed: bool = False) -> None:
+        self._published, self._failed = published, failed
+
+    def set_published(self) -> None:
+        self._published = True
+
+    def is_published(self) -> bool:
+        if self._failed:
+            raise RuntimeError("Message publish failed: The client is not currently connected.")
+        return self._published
+
+
 def mark_transport_live(binding):
     """Make a broker-free ``Vda5050Binding`` present as though ``start()`` had run and
     the robot had reported ``ONLINE``, and return it.
@@ -54,20 +72,13 @@ def mark_transport_live(binding):
         @staticmethod
         def publish(topic, payload, qos=1):
             published.append((topic, payload))
-            return acknowledged()
+            return PublishInfo(published=True)
 
         @staticmethod
         def loop_stop() -> None: ...
 
         @staticmethod
         def disconnect() -> None: ...
-
-    def acknowledged():
-        from paho.mqtt.client import MQTTMessageInfo
-
-        info = MQTTMessageInfo(len(published))
-        info._set_as_published()
-        return info
 
     binding._mqtt._client = _RecordingClient()
     binding._mqtt._up = True  # the broker session is up, as after on_connect
