@@ -22,8 +22,7 @@ import threading
 import time
 
 import pytest
-from conftest import mark_registered, mark_transport_live
-from paho.mqtt.client import MQTTErrorCode, MQTTMessageInfo
+from conftest import PublishInfo, mark_registered, mark_transport_live
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
@@ -129,9 +128,7 @@ def test_a_broker_drop_during_the_cancel_is_stop_unconfirmed() -> None:
 
     def dropped(topic, payload, qos=1):
         b.published.append((topic, payload))
-        info = MQTTMessageInfo(0)
-        info.rc = MQTTErrorCode.MQTT_ERR_NO_CONN
-        return info
+        return PublishInfo(failed=True)
 
     b._mqtt._client.publish = dropped
     _vehicle(a, b, order_id=b._last_order_id)
@@ -226,10 +223,8 @@ def _published_later(b: Vda5050Binding) -> list:
 
     def publish(topic, payload, qos=1):
         b.published.append((topic, payload))
-        info = MQTTMessageInfo(len(handles))
-        info.rc = MQTTErrorCode.MQTT_ERR_SUCCESS
-        handles.append(info)
-        return info
+        handles.append(PublishInfo())  # written, not yet acknowledged
+        return handles[-1]
 
     b._mqtt._client.publish = publish
     return handles
@@ -255,7 +250,7 @@ def test_a_puback_that_comes_during_the_wait_confirms_the_cancel() -> None:
         b.on_state(_state(order_id=b._last_order_id))
         look.n += 1
         if look.n == 3:
-            handles[-1]._set_as_published()
+            handles[-1].set_published()
 
     look.n = 0
     a._stop_confirm_sleep = look
