@@ -26,6 +26,7 @@ from conftest import mark_transport_live
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
 from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapter
+from fleet_adapter_vda5050.process import FleetProcess
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
 
 ROBOT = "amr-1"
@@ -133,7 +134,7 @@ class _Call:
 @pytest.fixture
 def adapter(monkeypatch):
     monkeypatch.setattr(Adapter, "_telemetry_loop", lambda self, stub: None)
-    monkeypatch.setattr(Adapter, "_edge_loop", lambda self: None)
+    monkeypatch.setattr(FleetProcess, "_start_edge", lambda self, link: None)
     b = mark_transport_live(Vda5050Binding(robot_id=ROBOT))
     b.start = lambda: None  # no broker: bring-up is the stand-in's
     stops = []

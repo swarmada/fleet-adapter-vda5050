@@ -323,7 +323,6 @@ class fleet_adapter_vda5050Adapter:
         self._current_generation = 0
         self._current_fencing_token = None   # echoed on task-status streaming (C6.4)
         self._last_task_state = ""           # last streamed TaskState, for transition detect
-        self._edge_addr: queue.Queue = queue.Queue()  # advertised edge endpoints (C8)
         # Contract 1.4.0: the stop latch, the retained outcome, and the work a stop interrupted
         # (action ID -> the fencing token it was assigned with; its re-delivery starts nothing).
         self._latch = StopLatch()
@@ -425,9 +424,6 @@ class fleet_adapter_vda5050Adapter:
         """The ControlStream loop, run by the process's first vehicle; every message goes to
         the process (_handle_control_plane)."""
         self.bring_up_robot()
-        # The edge loop blocks until an endpoint is advertised (C8), so starting it
-        # now is safe; it stays idle for zones with no edge node.
-        threading.Thread(target=self._edge_loop, daemon=True).start()
 
         drop_window = self._sim.stream_drop_window() if self._sim else None
         if drop_window is None:
@@ -548,8 +544,8 @@ class fleet_adapter_vda5050Adapter:
         # then was not kept.
         self._send_capabilities_snapshot()
         self._snapshot_pending = True
-        for e in ack.edge_endpoints:  # C8.1: dial each advertised edge node
-            self._edge_addr.put(e.address)
+        # C8.1: this vehicle is served through the edge nodes this ack lists, and no others.
+        self._process.edge_endpoints(self, [e.address for e in ack.edge_endpoints])
         # C2.3 — adopt the per-robot cadence the control plane returned. Only a
         # POSITIVE value is a cadence: 0 means "not specified" and a negative value
         # is malformed — clamping that to the 1s minimum would let a buggy control
@@ -1387,7 +1383,7 @@ class fleet_adapter_vda5050Adapter:
         fix, `Vda5050Binding.tick()` raises when its transport was never started — which is
         correct, and on this path alone it would make things worse if it escaped:
 
-        * `run_safety_stream` and `_edge_loop` call this from inside their response loops,
+        * `run_safety_stream` and the edge loop call this from inside their response loops,
           so an escaping exception kills that thread and the control plane gets **no
           EstopAck at all**. Silence on an estop is strictly less actionable than
           `FAILED`, which at least says "rest was not confirmed — escalate".
@@ -1935,6 +1931,13 @@ class fleet_adapter_vda5050Adapter:
 
         A fault in the first half is answered FAILED at once, and the stop uncounted once: the
         reader goes on to the next message, which may be another vehicle's stop."""
+        finish = self._begin_stop(estop_id, send)
+        if finish is not None:
+            self._lane.submit(finish)
+
+    def _begin_stop(self, estop_id: str, send):
+        """The stop's first half (_stop_and_ack). Returns the second half, for the lane, or
+        None when the first half faulted and the stop is already answered FAILED."""
         initiated_ms = _now_ms()
         counted = False
         try:
@@ -1947,8 +1950,8 @@ class fleet_adapter_vda5050Adapter:
             print(f"error: estop id={estop_id} for {self._robot_id!r} faulted before its wait: "
                   f"{exc!r}; answered FAILED", file=sys.stderr, flush=True)
             self._answer_stop(estop_id, initiated_ms, ESTOP_FAILED, send, counted)
-            return
-        self._lane.submit(lambda: self._finish_stop(estop_id, initiated_ms, since, send))
+            return None
+        return lambda: self._finish_stop(estop_id, initiated_ms, since, send)
 
     def _finish_stop(self, estop_id: str, initiated_ms: int, since, send) -> None:
         """The stop's second half, on the lane: rest confirmed, never inferred (C5), then the
@@ -2026,11 +2029,9 @@ class fleet_adapter_vda5050Adapter:
         self._send_local_report()
 
     def _edge_stop(self, estop_id: str, send) -> None:
-        """An edge stop: the robot's local latch is set (reported at once), then the same
-        confirmed stop as any other, answered on the EdgeStream."""
-        self._latch.set_local(self._robot_id)
-        self._send_local_report()
-        self._stop_and_ack(estop_id, lambda msg: send(msg.estop_ack))
+        """An edge stop for this vehicle alone: the process's edge stop with one member.
+        ``send`` takes the EstopAck."""
+        self._process.edge_stop([self], estop_id, send)
 
     # ── EdgeStream (C8) ──────────────────────────────────────────────────────
 
@@ -2040,31 +2041,16 @@ class fleet_adapter_vda5050Adapter:
             raise RuntimeError(f"no dialler configured; not dialling edge node {addr}")
         return self._dial(addr)
 
-    def _edge_loop(self) -> None:
-        pb = self._pb
-        addr = self._edge_addr.get()  # blocks until an edge endpoint is advertised (C8.1)
-        estub = self._pb_grpc.EdgeServiceStub(self._dial_edge(addr))
-        outbox: queue.Queue = queue.Queue()
-        # C8.2: tee one PositionFrame so the edge node has a pose to evaluate, fire-and-forget.
-        # Only while the robot can be observed and its position is known, as for telemetry: no
-        # frame otherwise, never a frozen one or one at the origin (C6.2).
+    def _edge_frame(self):
+        """C8.2: the PositionFrame teed to an edge node, so it has a pose to evaluate. Only
+        while the robot can be observed and its position is known, as for telemetry: None
+        otherwise, never a frozen frame or one at the origin (C6.2)."""
         with self._robot_lock:
             position = self._position_now() if self._robot.transport_alive() else None
-        if position is not None:
-            outbox.put(pb.AdapterEdgeMessage(position=pb.PositionFrame(
-                robot_id=self._robot_id, position=position, ts_ms=_now_ms())))
-
-        def requests() -> Iterator:
-            while True:
-                msg = outbox.get()
-                if msg is None:
-                    return
-                yield msg
-
-        for ec in estub.EdgeStream(requests()):
-            if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
-                self._edge_stop(ec.estop.estop_id,
-                                lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
+        if position is None:
+            return None
+        return self._pb.AdapterEdgeMessage(position=self._pb.PositionFrame(
+            robot_id=self._robot_id, position=position, ts_ms=_now_ms()))
 
 
 def dialler(args, ap):
