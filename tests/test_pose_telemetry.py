@@ -266,8 +266,8 @@ def _edge_first_message(robot):
 
     a._pb_grpc = _Grpc()
     a._dial = lambda addr: object()
-    a._edge_addr.put("edge:1")
-    a._edge_loop()
+    a._process._start_edge = a._process._edge_loop  # inline: the loop returns when the stream ends
+    a._process.edge_endpoints(a, ["edge:1"])
     return sent[0] if sent else None
 
 

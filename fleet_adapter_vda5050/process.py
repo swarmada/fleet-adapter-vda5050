@@ -17,6 +17,10 @@ routes what arrives:
   with none unanswered.
 * **A stop** is commanded on the reader that received it, and waits for rest on its
   vehicle's lane (``_Lane``), so one vehicle's wait never holds another's stop.
+* **An edge node** gets one EdgeStream, however many vehicles are served through it. Its members
+  are the vehicles whose latest accepted RegisterAck listed its address; each gets a
+  PositionFrame. Its estop names no robot: it stops every member, and is answered once
+  (:meth:`edge_stop`).
 * **An ActionOutcomeAck** is offered to every core. ``RetainedOutcomes.acknowledge`` matches the
   action id and the fencing token, so only the core that kept the outcome clears it.
 
@@ -51,6 +55,9 @@ class FleetProcess:
         self._pair_lock = threading.Lock()
         self._pending_register: deque = deque()
         self._pending_discover: deque = deque()
+        # The edge nodes dialled, by address (_EdgeLink).
+        self._edge_lock = threading.Lock()
+        self._edges: dict[str, _EdgeLink] = {}
         for c in cores:
             c._process = self
 
@@ -156,7 +163,6 @@ class FleetProcess:
         self.start_lanes()
         for c in self.cores[1:]:
             c.bring_up_robot()
-            threading.Thread(target=c._edge_loop, daemon=True).start()
         self._first._run_control_stream(stub)
 
     # ── the SafetyStream ─────────────────────────────────────────────────────
@@ -183,3 +189,120 @@ class FleetProcess:
     def unregistered(self) -> list:
         """The vehicles with no registration accepted on this session."""
         return [c for c in self.cores if not c._registered]
+
+    # ── the EdgeStreams (C8) ─────────────────────────────────────────────────
+
+    def edge_endpoints(self, core, addresses: list[str]) -> None:
+        """``core``'s latest accepted RegisterAck listed ``addresses``: from now on it is
+        served through those edge nodes and no others. An address listed for the first time
+        is dialled (one EdgeStream for it, whoever listed it); a vehicle that joins an edge
+        node's members tees it a PositionFrame (C8.2)."""
+        new, joined = [], []
+        with self._edge_lock:
+            for addr, link in self._edges.items():
+                if addr not in addresses and core in link.members:
+                    link.members.remove(core)
+            for addr in dict.fromkeys(addresses):
+                link = self._edges.get(addr)
+                if link is None:
+                    link = self._edges[addr] = _EdgeLink(addr)
+                    new.append(link)
+                if core not in link.members:
+                    link.members.append(core)
+                    joined.append(link)
+        for link in joined:
+            frame = core._edge_frame()
+            if frame is not None:
+                link.outbox.put(frame)
+        for link in new:
+            self._start_edge(link)
+
+    def _start_edge(self, link: _EdgeLink) -> None:
+        threading.Thread(target=self._edge_loop, args=(link,), daemon=True).start()
+
+    def _edge_loop(self, link: _EdgeLink) -> None:
+        """One edge node's EdgeStream, dialled as the control plane is."""
+        estub = self._first._pb_grpc.EdgeServiceStub(self._first._dial_edge(link.addr))
+
+        def send(ack) -> None:
+            link.outbox.put(self._pb.AdapterEdgeMessage(estop_ack=ack))
+
+        for ec in estub.EdgeStream(link.requests()):
+            if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
+                with self._edge_lock:
+                    members = list(link.members)
+                self.edge_stop(members, ec.estop.estop_id, send)
+
+    def edge_stop(self, members: list, estop_id: str, send) -> None:
+        """An edge estop names no robot: it stops every vehicle served through that edge node,
+        and is answered by one EstopAck (``send`` takes it). Each member's local latch is set
+        and reported, then every member's stop is commanded, and only then are they awaited, in
+        parallel on their lanes. The answer goes once the last member has answered: STOPPED
+        only if every member's rest was confirmed, else FAILED."""
+        if not members:
+            print(f"error: edge estop id={estop_id}: no vehicle served here is served through "
+                  f"that edge node; answered FAILED", file=sys.stderr, flush=True)
+            send(self._pb.EstopAck(estop_id=estop_id, state=self._pb.ESTOP_STATE_FAILED,
+                                   message="no vehicle is served through this edge node"))
+            return
+        answer = _EdgeAnswer(self._pb, members, send)
+        for c in members:
+            c._latch.set_local(c._robot_id)
+            c._send_local_report()
+        finishes = [c._begin_stop(estop_id, answer.member_answered) for c in members]
+        for c, finish in zip(members, finishes):
+            if finish is not None:
+                c._lane.submit(finish)
+
+
+class _EdgeLink:
+    """One edge node: its address, the vehicles served through it, and its EdgeStream's
+    outbox."""
+
+    def __init__(self, addr: str) -> None:
+        self.addr = addr
+        self.members: list = []  # under the process's _edge_lock
+        self.outbox: queue.Queue = queue.Queue()
+
+    def requests(self):
+        while True:
+            msg = self.outbox.get()
+            if msg is None:
+                return
+            yield msg
+
+
+class _EdgeAnswer:
+    """The one EstopAck for an edge stop, from each member's answer. It goes once every
+    member has answered: STOPPED only if every member's rest was confirmed, with the earliest
+    stop and the latest confirmation; else FAILED, naming the vehicles not confirmed."""
+
+    def __init__(self, pb, members: list, send) -> None:
+        self._pb = pb
+        self._send = send
+        self._waiting = len(members)
+        self._lock = threading.Lock()
+        self._acks: list = []
+
+    def member_answered(self, msg) -> None:
+        """A member's answer, the AdapterSafetyMessage its stop would send."""
+        with self._lock:
+            self._acks.append((msg.robot_id, msg.estop_ack))
+            self._waiting -= 1
+            if self._waiting:
+                return
+        pb = self._pb
+        acks = [a for _, a in self._acks]
+        if len(acks) == 1:
+            self._send(acks[0])
+            return
+        out = pb.EstopAck(estop_id=acks[0].estop_id,
+                          stop_initiated_at=min(a.stop_initiated_at for a in acks))
+        failed = sorted(rid for rid, a in self._acks if a.state != pb.ESTOP_STATE_STOPPED)
+        if failed:
+            out.state = pb.ESTOP_STATE_FAILED
+            out.message = "not confirmed: " + ", ".join(repr(r) for r in failed)
+        else:
+            out.state = pb.ESTOP_STATE_STOPPED
+            out.confirmed_at_ms = max(a.confirmed_at_ms for a in acks)
+        self._send(out)

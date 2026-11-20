@@ -223,7 +223,7 @@ def test_phase_hint_does_not_report_IDLE_for_a_robot_it_cannot_see() -> None:
 def test_an_inert_transport_still_answers_an_estop_with_FAILED() -> None:
     """The one place the raise must NOT escape.
 
-    `run_safety_stream` and `_edge_loop` call `confirm_estop` inside their response loops,
+    `run_safety_stream` and the edge loop call `confirm_estop` inside their response loops,
     and the safety stream is started BEFORE `bring_up_robot()` — so an estop can reach an
     un-started binding. If the raise escaped there, the thread would die and the control
     plane would get NO EstopAck. Silence on an estop is worse than FAILED: FAILED says

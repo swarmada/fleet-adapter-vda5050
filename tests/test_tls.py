@@ -139,6 +139,6 @@ def test_the_edge_loop_dials_through_the_adapters_dialler() -> None:
     robot.spawn("amr-1")
     channel = object()
     a = Adapter(pb, _PbGrpc, robot, "amr-1", dial=lambda target: opened.append(target) or channel)
-    a._edge_addr.put("edge-1:7000")
-    a._edge_loop()
+    a._process._start_edge = a._process._edge_loop  # inline
+    a._process.edge_endpoints(a, ["edge-1:7000"])
     assert opened == ["edge-1:7000"] and stubs == [channel]
