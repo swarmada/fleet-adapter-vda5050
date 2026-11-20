@@ -35,6 +35,7 @@ from collections.abc import Callable
 from concurrent import futures
 
 import grpc
+from conftest import PublishInfo
 from google.protobuf import json_format
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
@@ -459,10 +460,11 @@ class Broker:
                         broker._ticking = True
                         threading.Thread(target=broker._tick, daemon=True).start()
 
-            def publish(self, topic, payload, qos=0) -> None:
+            def publish(self, topic, payload, qos=0):
                 broker.t.wires["mqtt"].add((topic, payload))
                 for reply in broker.vehicle.on_publish(topic, payload):
                     broker.deliver(*reply)
+                return PublishInfo(published=True)  # acknowledged, as a broker does at QoS 1
 
         mod = types.ModuleType("paho.mqtt.client")
         mod.Client = Client
