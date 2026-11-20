@@ -1,5 +1,5 @@
 ## the adapter connects (ControlStream session 1)
-control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control> {"hello":{"adapter_version":"<version>","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
 control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
 control> {"register":{"robot_id":"amr-1"}}
 control< {"register_ack":{"message":"no Robot yet","rejection":"REGISTRATION_REJECTION_NOT_ADMITTED","telemetry_interval_seconds":1},"seq":"2"}

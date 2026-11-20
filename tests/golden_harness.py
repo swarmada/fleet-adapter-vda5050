@@ -70,6 +70,8 @@ def _scrub(value, key: str = ""):
             return "<t>"
         if key == "set_id" and value:  # a fresh random ID for each edge stop
             return "<set>"
+        if key == "adapter_version" and value:  # this build's version (test_contract.py)
+            return "<version>"
         if _EDGE_ADDR.match(value):
             return "<edge>"
         return _BOOT.sub(r"-<boot>-\1-", value)
