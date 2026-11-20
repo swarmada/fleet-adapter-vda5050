@@ -7,6 +7,9 @@ honour (C17), and the authoritative action state a RegisterAck hands it (C2.2, C
 
 from __future__ import annotations
 
+import pathlib
+import tomllib
+
 from conftest import mark_registered
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
@@ -43,6 +46,20 @@ def _assign(a: Adapter, token: int, action_type: str = adapter_mod.ACTION_NAVIGA
 
 def test_declares_the_current_contract_version() -> None:
     assert adapter_mod.CONTRACT_VERSION == "1.4.0"
+
+
+def test_the_adapter_version_is_the_contract_plus_its_own_fixes() -> None:
+    """X.Y of the adapter's version is the contract its hello declares; the package metadata,
+    __version__ and the hello's adapter_version are one value."""
+    pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as f:
+        packaged = tomllib.load(f)["project"]["version"]
+    version = adapter_mod.__version__
+    assert packaged == version
+    assert version.split(".")[:2] == adapter_mod.CONTRACT_VERSION.split(".")[:2]
+    hello = next(iter(Adapter(pb, None, SimulatedRobot(), ROBOT)._control_requests())).hello
+    assert hello.adapter_version == version
+    assert hello.contract_version == adapter_mod.CONTRACT_VERSION
 
 
 def test_scan_declares_the_navigate_catalog() -> None:

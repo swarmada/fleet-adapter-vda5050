@@ -41,6 +41,7 @@ from swarmada_sdk.safety import (
     await_estop_confirmation,
 )
 
+from fleet_adapter_vda5050 import __version__
 from fleet_adapter_vda5050 import task as task_map
 from fleet_adapter_vda5050.latch import StopLatch
 from fleet_adapter_vda5050.retained import Outcome, RetainedOutcomes
@@ -275,7 +276,7 @@ class fleet_adapter_vda5050Adapter:
         if outbox is None:
             outbox = self._outbox
         yield pb.AdapterMessage(hello=pb.AdapterHello(  # C1.2
-            vendor="vda5050", adapter_version="0.1.0",
+            vendor="vda5050", adapter_version=__version__,
             protocol_version="fleet_adapter.v1", contract_version=CONTRACT_VERSION,
             namespace=self._namespace))
         while True:

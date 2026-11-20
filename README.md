@@ -126,7 +126,7 @@ the run line. The broker session works like this:
   client id (`swarmada-<robot id>`) disconnects the adapter, and then no stop reaches the vehicle.
   Topic access rules for anonymous clients can't tell the adapter from anyone else. Keep the
   broker on a private network that only the adapters and vehicles reach. TLS and a login are
-  planned for 0.5.0.
+  planned for the adapter release that goes with Swarmada 0.5.0.
 
 ## Conformance roadmap (C1–C8)
 
@@ -380,8 +380,8 @@ Every other close of a stream is a drop, and the adapter reconnects.
 **While both processes run,** both connect to the broker with the client id
 `swarmada-<robot id>`. The broker keeps one session per client id, so at any moment one of the
 two is disconnected, and the superseded process's stop reaches the vehicle only if it holds the
-session at that moment. A client id per process (`--mqtt-client-id`) is planned for 0.5.0, with
-TLS and a login.
+session at that moment. A client id per process (`--mqtt-client-id`) is planned for the adapter
+release that goes with Swarmada 0.5.0, with TLS and a login.
 
 ### Routes along lanes
 
