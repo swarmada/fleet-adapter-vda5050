@@ -250,9 +250,8 @@ def test_another_robot(run) -> None:
     r.plane.send("safety", pb.ControlPlaneSafetyMessage(robot_id="amr-9", estop=pb.Estop(
         estop_id="e-10", reason="test")))
     t.expect("safety", "estop_ack")
-    t.step("a heartbeat for another robot")
+    t.step("a heartbeat for another robot is not answered")
     r.plane.send("control", pb.ControlPlaneMessage(heartbeat=pb.HeartbeatRequest(robot_id="amr-9")))
-    t.expect("control", "heartbeat")
     t.quiet("control")
     t.quiet("safety")
     t.quiet("mqtt")

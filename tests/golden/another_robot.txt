@@ -14,9 +14,8 @@ safety> {"estop_ack":{"estop_id":"e-9","message":"robot_id 'amr-9' is not served
 ## a SafetyStream estop for another robot
 safety< {"estop":{"estop_id":"e-10","reason":"test"},"robot_id":"amr-9","seq":"5"}
 safety> {"estop_ack":{"estop_id":"e-10","message":"robot_id 'amr-9' is not served by this adapter, which serves 'amr-1'; no stop was commanded and none can be confirmed","state":"ESTOP_STATE_FAILED"},"robot_id":"amr-9"}
-## a heartbeat for another robot
+## a heartbeat for another robot is not answered
 control< {"heartbeat":{"robot_id":"amr-9"},"seq":"6"}
-control> {"heartbeat":{"robot_id":"amr-9"}}
 control: quiet
 safety: quiet
 mqtt: quiet

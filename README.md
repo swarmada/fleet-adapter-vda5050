@@ -348,6 +348,9 @@ SafetyStream message names a robot by that id.
     vehicle is then stopped as well, and the stop is still answered `FAILED`. The log says "no
     accepted registration; vehicle stopped".
 - **A clear for another id** lifts nothing and is not acknowledged.
+- **A heartbeat for another id** is not answered. The control plane takes any reply that names
+  a robot as proof the robot is alive, and this adapter can't vouch for a robot it doesn't
+  serve. A heartbeat that names no robot asks whether the adapter is alive, and is answered.
 - A capabilities scan, and a command this adapter declines anyway, are answered as for any
   robot. A scan names this adapter's own robot.
 - The leader term is kept for the served robot only. A command for another id neither raises

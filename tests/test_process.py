@@ -253,3 +253,30 @@ def test_an_estop_for_a_robot_not_served_during_start_up_stops_every_vehicle() -
     assert (m.robot_id, m.estop_ack.state) == ("amr-9", pb.ESTOP_STATE_FAILED)
     assert "no registration is accepted" in m.estop_ack.message
     assert not any(c._latch.latched_ids(c._robot_id) for c in p.cores)
+
+
+def _heartbeat(p: FleetProcess, robot_id: str) -> list:
+    p.handle_control_plane(pb.ControlPlaneMessage(heartbeat=pb.HeartbeatRequest(
+        robot_id=robot_id)), None)
+    return [m.heartbeat.robot_id for m in _drain(p._streams.outbox) if m.HasField("heartbeat")]
+
+
+def test_a_heartbeat_for_a_served_robot_is_answered() -> None:
+    assert _heartbeat(_registered_fleet(), "amr-2") == ["amr-2"]
+
+
+def test_the_adapter_scoped_heartbeat_is_answered() -> None:
+    assert _heartbeat(_registered_fleet(), "") == [""]
+
+
+def test_a_heartbeat_for_a_robot_not_served_is_not_answered(capsys) -> None:
+    """A reply would tell the control plane the robot is alive (the exchange before Offline)."""
+    assert _heartbeat(_registered_fleet(), "amr-9") == []
+    assert "not answered" in capsys.readouterr().err
+
+
+def test_a_lone_vehicle_does_not_answer_a_heartbeat_for_another_robot() -> None:
+    b = mark_transport_live(Vda5050Binding(robot_id="amr-1"))
+    a = Adapter(pb, None, b, "amr-1")
+    assert _heartbeat(a._process, "amr-9") == []
+    assert _heartbeat(a._process, "amr-1") == ["amr-1"]
