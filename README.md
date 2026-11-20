@@ -116,6 +116,49 @@ the run line. The broker session works like this:
 - **No TLS, no login.** The MQTT connection is plain TCP with no login: see
   [Known limitations](#known-limitations).
 
+### A fleet from one process
+
+One process can serve several vehicles. List them in a YAML file and give it with
+`--vehicles-file`:
+
+```yaml
+- robot_id: amr-1        # the Robot's swarmada.io/robot-id
+  serial: 200-abc123     # the vehicle's VDA 5050 serialNumber
+  manufacturer: MiR      # its VDA 5050 manufacturer; swarmada if left out
+- robot_id: amr-2
+  serial: 200-abc124
+  manufacturer: MiR
+```
+
+```bash
+python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 \
+    --comms vda5050 --mqtt-host broker.local --vehicles-file vehicles.yaml
+```
+
+- **The file.** Each robot id is listed once, and so is each pair of manufacturer and serial.
+  An unknown key, a missing or empty value, or a key given twice stops the adapter at start-up,
+  naming the entry. The file takes the place of `--robot-id`, `--serial` and `--manufacturer`,
+  and giving it with any of them is refused. It needs `--comms vda5050`: the simulated comms
+  serve one vehicle.
+- **One identity for each process.** The vehicles share the process's ControlStream and
+  SafetyStream, under the identity of its client certificate. Give every process an identity of
+  its own: the control plane serves one identity on one stream, and a second process under the
+  same identity supersedes the first (see
+  [Another process under the same adapter identity](#another-process-under-the-same-adapter-identity)).
+- **One MQTT client.** The vehicles share one broker session, with the client id
+  `swarmada-<first robot id>`. It lets 14 messages for each vehicle await the broker's
+  acknowledgement at once, so a stop on every path that can reach a vehicle goes out at once for
+  the whole fleet. See [Known limitations](#known-limitations) for a broker that allows fewer.
+- **Each vehicle answers for itself.** Every command, stop and clear is for the vehicle it names,
+  and is answered from that vehicle alone. A cancel is answered `STOPPED_SAFELY` only on that
+  vehicle's own rest and the broker's acknowledgement of its own `cancelOrder`. A vehicle's stops
+  are answered in the order they arrived, each within 2 s of arriving, and a stop for one vehicle
+  doesn't wait behind another's.
+- **A robot id the process doesn't serve.** A command for it is refused, and a heartbeat for it
+  isn't answered, as for a single vehicle (see [A command for another robot](#a-command-for-another-robot)).
+  A stop for it, while some vehicles have no accepted registration, stops each of those vehicles,
+  every time it comes: 2 messages for each vehicle.
+
 ## Known limitations
 
 - **MQTT without TLS or a login.** In this release the adapter connects to the MQTT broker over
@@ -123,10 +166,20 @@ the run line. The broker session works like this:
   the broker can read every vehicle's topics, send the vehicles orders and instant actions, and
   forge a vehicle's `state` or `connection` messages. A forged `state` can make the adapter
   confirm an emergency stop the vehicle never made. A client that connects with the adapter's
-  client id (`swarmada-<robot id>`) disconnects the adapter, and then no stop reaches the vehicle.
+  client id (`swarmada-<robot id>`, or `swarmada-<first robot id>` for a fleet) disconnects the
+  adapter, and then no stop reaches the vehicle.
   Topic access rules for anonymous clients can't tell the adapter from anyone else. Keep the
   broker on a private network that only the adapters and vehicles reach. TLS and a login are
   planned for the adapter release that goes with Swarmada 0.5.0.
+
+- **A broker's own limit on unacknowledged messages.** For a fleet, the MQTT client lets 14
+  messages for each vehicle await the broker's acknowledgement at once (never fewer than 20). A
+  broker can allow fewer by its own configuration. The adapter connects with MQTT 3.1.1, which
+  gives a broker no way to announce such a limit, so the adapter can't warn about it. Past the
+  limit, messages wait their turn: a stop or a cancel whose messages haven't gone out can't be
+  confirmed in time, and is answered `FAILED` or `STOP_UNCONFIRMED`. The shared client hasn't
+  yet been run against a real broker. A warning at start-up for a broker whose limit is lower is planned
+  for the adapter release that goes with Swarmada 0.5.0.
 
 ## Conformance roadmap (C1–C8)
 
@@ -159,7 +212,7 @@ the run line. The broker session works like this:
   from a `nodeStates` list: a `state` without one isn't taken as arrived) /
   `FAILED` (FATAL error) from the robot's `state` and reports the terminal
   `TaskStatusUpdate` once — echoing the executing fencing token (C6.4) — so the
-  control-plane FleetTask lifecycle sees the order finish, not just start.
+  control-plane FleetTask lifecycle sees the order finish, not only start.
 
 VDA5050 has no native firmware/model OTA or hardware-verify action, so
 `push_firmware` / `model_update` / `verify_*` remain correctly declined (C7.1). This
@@ -329,8 +382,9 @@ warning until it accepts a new order (VDA 5050 2.0.0 6.6.4).
 
 ### A command for another robot
 
-The adapter serves one vehicle, under the robot id it registers. Every Command and every
-SafetyStream message names a robot by that id.
+The adapter serves one vehicle, or each vehicle a `--vehicles-file` lists, under the robot id it
+registers. Every Command and every SafetyStream message names a robot by that id, and "another id"
+below is one the process doesn't serve.
 
 - **A command for another id, or for none,** is refused before anything runs. Nothing reaches
   the vehicle, the stop latch, the fencing mark, the lease or the current action. Each command
@@ -346,13 +400,14 @@ SafetyStream message names a robot by that id.
     is an id mismatch: the adapter's `--robot-id` is not the Robot's `swarmada.io/robot-id`, so
     its registration was refused and every stop for that Robot arrives under the other id. The
     vehicle is then stopped as well, and the stop is still answered `FAILED`. The log says "no
-    accepted registration; vehicle stopped".
+    accepted registration; vehicle stopped". In a fleet, each vehicle with no accepted
+    registration is stopped.
 - **A clear for another id** lifts nothing and is not acknowledged.
 - **A heartbeat for another id** is not answered. The control plane takes any reply that names
   a robot as proof the robot is alive, and this adapter can't vouch for a robot it doesn't
   serve. A heartbeat that names no robot asks whether the adapter is alive, and is answered.
 - A capabilities scan, and a command this adapter declines anyway, are answered as for any
-  robot. A scan names this adapter's own robot.
+  robot. A scan names this adapter's own robot: in a fleet, the first vehicle in the file.
 - The leader term is kept for the served robot only. A command for another id neither raises
   it nor is refused by it.
 - Each one is logged at error level, naming the id received and the id served, so an id
@@ -368,11 +423,13 @@ plane accepts a second ControlStream or SafetyStream under the same identity, it
 earlier one with `ABORTED` and a message that starts `superseded:`. A process whose stream is
 closed that way:
 
-- stops its vehicle with a `cancelOrder`, without pausing it, so the process that took over can
-  give it work;
-- ends the action it held, never continues it, and refuses all later work;
-- waits up to 2 s for a `state` that shows the vehicle at rest, and logs whether one came;
-- closes its MQTT session, so it doesn't take the client id back from the process that took over;
+- stops each vehicle it serves with a `cancelOrder`, without pausing it, so the process that took
+  over can give it work;
+- ends the action each vehicle held, never continues it, and refuses all later work;
+- waits up to 2 s for a `state` that shows each vehicle at rest, all at once, and logs whether
+  one came;
+- then closes its MQTT session, once, so it doesn't take the client id back from the process that
+  took over;
 - when only its SafetyStream was superseded, closes its ControlStream too, so a stop for the robot
   goes to the process that took over and not to one that can neither deliver nor answer it;
 - doesn't open either stream again, and stays up, idle, until it's stopped. Restart it to serve
@@ -381,7 +438,7 @@ closed that way:
 Every other close of a stream is a drop, and the adapter reconnects.
 
 **While both processes run,** both connect to the broker with the client id
-`swarmada-<robot id>`. The broker keeps one session per client id, so at any moment one of the
+`swarmada-<robot id>` (for a fleet, `swarmada-<first robot id>`). The broker keeps one session per client id, so at any moment one of the
 two is disconnected, and the superseded process's stop reaches the vehicle only if it holds the
 session at that moment. A client id per process (`--mqtt-client-id`) is planned for the adapter
 release that goes with Swarmada 0.5.0, with TLS and a login.
