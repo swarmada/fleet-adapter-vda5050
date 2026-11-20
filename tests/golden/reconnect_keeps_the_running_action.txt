@@ -1,5 +1,5 @@
 ## the adapter connects (ControlStream session 1)
-control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control> {"hello":{"adapter_version":"<version>","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
 control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"1"}
 control> {"register":{"robot_id":"amr-1"}}
 control< {"register_ack":{"accepted":true,"telemetry_interval_seconds":1},"seq":"2"}
@@ -12,7 +12,7 @@ control> {"command_result":{"assign_action":{"accepted":true,"accepted_fencing_t
 ## the ControlStream drops
 -- the control plane drops the ControlStream
 ## the adapter connects (ControlStream session 2)
-control> {"hello":{"adapter_version":"0.1.0","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
+control> {"hello":{"adapter_version":"<version>","contract_version":"1.4.0","protocol_version":"fleet_adapter.v1","vendor":"vda5050"}}
 control< {"hello_ack":{"accepted":true,"negotiated_contract_version":"1.4.0","negotiated_protocol_version":"fleet_adapter.v1"},"seq":"4"}
 control> {"register":{"robot_id":"amr-1"}}
 control< {"register_ack":{"accepted":true,"authoritative_action_state":{"action_id":"act-1","fencing_token":"7","phase":"ROBOT_ACTION_PHASE_IN_PROGRESS"},"telemetry_interval_seconds":1},"seq":"5"}
