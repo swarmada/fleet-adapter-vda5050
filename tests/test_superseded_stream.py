@@ -11,7 +11,11 @@ has ended, so a superseded close is always another process's doing: it stops the
 (cancelOrder, no pause, so the process that took over can give it work), refuses all later
 work, releases the MQTT session the two processes would otherwise fight over, and stays up
 without redialling, by any path: a drop's backoff, the simulated comms' reconnect and a clean
-close included. An ordinary drop still redials."""
+close included. An ordinary drop still redials.
+
+A process serving several vehicles does all of that once, for every vehicle: the supersession is
+the process's streams', so every vehicle is stopped and refuses work, the waits for rest run at
+the same time, and each MQTT session is released once."""
 
 from __future__ import annotations
 
@@ -25,6 +29,7 @@ from conftest import mark_transport_live
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
+from fleet_adapter_vda5050.adapter import _Streams
 from fleet_adapter_vda5050.adapter import fleet_adapter_vda5050Adapter as Adapter
 from fleet_adapter_vda5050.process import FleetProcess
 from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
@@ -382,3 +387,153 @@ def test_a_fence_after_a_safety_only_supersession_is_not_silently_lost(adapter) 
     time.sleep(0.8)  # past the 0.5 s a redial waits
     assert stub.calls["control"] == 1  # and not redialled
     assert tc.is_alive()
+
+
+# ── a fleet: the rule for every vehicle ──────────────────────────────────────
+
+FLEET = ("amr-1", "amr-2", "amr-3")
+
+
+@pytest.fixture
+def fleet(monkeypatch):
+    """Three vehicles on one process's streams, each idle and live, none sending a state after
+    a stop unless a test makes it."""
+    monkeypatch.setattr(Adapter, "_telemetry_loop", lambda self, stub: None)
+    monkeypatch.setattr(FleetProcess, "_start_edge", lambda self, link: None)
+    streams, cores = _Streams(), []
+    for rid in FLEET:
+        b = mark_transport_live(Vda5050Binding(robot_id=rid, serial=rid))
+        b.start = lambda: None
+        b.stops = []
+        b.stop = (lambda b=b, real=b.stop: (b.stops.append(True), real()))
+        b.on_state(_IDLE)
+        c = Adapter(pb, None, b, rid, streams=streams)
+        c._stop_confirm_sleep = lambda s: None
+        cores.append(c)
+    p = FleetProcess(cores)
+    p.stub = None
+    yield p
+    streams.shutdown.set()
+    if p.stub is not None:
+        p.stub.close_all()
+
+
+def _fleet_session() -> list:
+    return [_SESSION[0]] + [pb.ControlPlaneMessage(register_ack=pb.RegisterAck(
+        accepted=True, telemetry_interval_seconds=1)) for _ in FLEET]
+
+
+def _working(p) -> None:
+    """Every vehicle registered on the session and driving an action of its own."""
+    _until(lambda: all(c._registered for c in p.cores))
+    for i, c in enumerate(p.cores, start=1):
+        res = pb.CommandResult()
+        c._on_assign(pb.AssignAction(action_id=f"act-{i}", action_type=adapter_mod.ACTION_NAVIGATE,
+                                     fencing_token=i, assignment_id=f"as-{i}",
+                                     payload_json=b'{"x": 5, "y": 0}'), res)
+        assert res.assign_action.accepted, c._robot_id
+
+
+def _all_released(p) -> bool:
+    return all(c._robot.stops for c in p.cores)
+
+
+def test_a_superseded_stream_stops_every_vehicle_and_none_holds_work(fleet, capsys) -> None:
+    p = fleet
+    stub = p.stub = _Stub(control=[(_fleet_session(), None)])
+    tc = _run(p.run_control_stream, stub)
+    _working(p)
+    stub.drop("control", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+    _until(lambda: _all_released(p))
+    for i, c in enumerate(p.cores, start=1):
+        assert _wire(c._robot) == ["order", "cancelOrder"], c._robot_id  # stopped, not paused
+        assert c._current_action == ""
+        assert c._interrupted == {f"act-{i}": i}
+        refused = _refused_after(c)
+        assert not refused.accepted and "superseded" in refused.message
+        res = pb.CommandResult()
+        c._on_resume(pb.ResumeCapabilities(), res)
+        assert not res.resume.resumed
+        res = pb.CommandResult()
+        c._on_pause(pb.PauseCapabilities(), res)
+        assert not res.pause.paused
+        assert c._robot.stops == [True]  # released once
+    time.sleep(0.8)  # past the 0.5 s a redial waits
+    assert stub.calls == {"control": 1, "safety": 0}  # nothing redialled
+    assert tc.is_alive()
+    err = capsys.readouterr().err
+    assert err.count("SUPERSEDED: ControlStream closed") == 1  # recorded once, for the process
+    for rid in FLEET:
+        assert f"SUPERSEDED robot={rid}: the stop is NOT confirmed" in err
+        assert f"SUPERSEDED robot={rid}: MQTT session released" in err
+
+
+def test_every_cancel_order_goes_out_before_any_wait(fleet) -> None:
+    p = fleet
+    sent_before_a_wait: list = []
+    real = Adapter._confirm_stop
+
+    def confirm(self, since, **kw):
+        sent_before_a_wait.append(sum(_wire(c._robot).count("cancelOrder") for c in p.cores))
+        return real(self, since, **kw)
+
+    p.cores[0].__class__._confirm_stop = confirm
+    try:
+        stub = p.stub = _Stub(control=[(_fleet_session(), None)])
+        _run(p.run_control_stream, stub)
+        _working(p)
+        stub.drop("control", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+        _until(lambda: _all_released(p))
+    finally:
+        p.cores[0].__class__._confirm_stop = real
+    assert sent_before_a_wait == [3, 3, 3]
+
+
+def test_the_waits_run_at_the_same_time(fleet) -> None:
+    """No vehicle sends a state after the stop, so each wait runs its whole 2 s budget. One
+    after another they would take 6 s; at the same time, about 2 s."""
+    p = fleet
+    for c in p.cores:
+        c._stop_confirm_sleep = time.sleep
+    stub = p.stub = _Stub(control=[(_fleet_session(), None)])
+    _run(p.run_control_stream, stub)
+    _working(p)
+    t0 = time.monotonic()
+    stub.drop("control", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+    _until(lambda: _all_released(p), timeout=10)
+    assert time.monotonic() - t0 < 3.5
+
+
+def test_both_streams_superseded_release_each_session_once(fleet) -> None:
+    p = fleet
+    stub = p.stub = _Stub(control=[(_fleet_session(), None)], safety=[([], None)])
+    tc = _run(p.run_control_stream, stub)
+    _until(lambda: stub.calls["control"] == 1)
+    ts = _run(p.run_safety_stream, stub)
+    _until(lambda: stub.calls["safety"] == 1)
+    stub.drop("safety", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED_SAFETY))
+    _until(lambda: ("control", 1) in stub.cancelled, timeout=2)  # ours closed: no fence lands here
+    _until(lambda: _all_released(p))
+    time.sleep(0.8)
+    assert [c._robot.stops for c in p.cores] == [[True]] * 3
+    assert stub.calls == {"control": 1, "safety": 1}
+    assert tc.is_alive()
+    ts.join(2)
+
+
+def test_a_fault_for_one_vehicle_still_stops_and_releases_the_others(fleet, capsys) -> None:
+    p = fleet
+
+    def broken(robot_id):
+        raise TypeError("command_stop is broken")
+
+    p.cores[1]._robot.command_stop = broken
+    stub = p.stub = _Stub(control=[(_fleet_session(), None)])
+    _run(p.run_control_stream, stub)
+    _working(p)
+    stub.drop("control", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+    _until(lambda: _all_released(p))
+    assert _wire(p.cores[0]._robot) == ["order", "cancelOrder"]
+    assert _wire(p.cores[2]._robot) == ["order", "cancelOrder"]
+    assert "SUPERSEDED robot=amr-2: the stop is NOT confirmed: the stop sequence raised" in (
+        capsys.readouterr().err)

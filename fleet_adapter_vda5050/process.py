@@ -34,6 +34,10 @@ import sys
 import threading
 from collections import deque
 
+# How long a supersession waits for one vehicle's lane to finish its wait: the lane may first
+# finish a stop that was already waiting there, and each wait is bounded at 2 s.
+_SUPERSEDED_WAIT_S = 10.0
+
 
 class FleetProcess:
     def __init__(self, cores: list) -> None:
@@ -185,6 +189,59 @@ class FleetProcess:
 
     def handle_safety(self, cp) -> None:
         (self.core_for(cp.robot_id) or self._first)._on_safety_message(cp)
+
+    # ── a supersession ───────────────────────────────────────────────────────
+
+    def stop_superseded(self) -> None:
+        """Stop every vehicle after the streams were superseded (the core's _on_superseded has
+        recorded it, once). Every ``cancelOrder`` is sent before any work is interrupted, and
+        all of that before any wait. Rest is then awaited on each vehicle's lane, all at once,
+        so one vehicle that can't be confirmed doesn't hold up the others; each result is
+        logged. Each MQTT session is released once, after the last wait. A fault for one
+        vehicle is logged and the rest go on."""
+        begun: list = []
+        for c in self.cores:
+            try:
+                begun.append((c, c._begin_superseded_stop(), ""))
+            except Exception as fault:  # noqa: BLE001 - every other vehicle is still stopped
+                begun.append((c, None, f"the stop sequence raised {fault!r}"))
+        for c, _since, failed in begun:
+            if not failed:
+                try:
+                    c._interrupt_current("stream superseded", command_stop=False)
+                except Exception as fault:  # noqa: BLE001
+                    print(f"error: SUPERSEDED robot={c._robot_id}: interrupting its work raised "
+                          f"{fault!r}", file=sys.stderr, flush=True)
+        waits: list = []
+        for c, since, failed in begun:
+            done, why = threading.Event(), [failed]
+
+            def wait(c=c, since=since, done=done, why=why) -> None:
+                try:
+                    if not why[0]:
+                        why[0] = c._confirm_stop(since)
+                except Exception as fault:  # noqa: BLE001
+                    why[0] = f"the stop sequence raised {fault!r}"
+                finally:
+                    done.set()
+            c._lane.submit(wait)
+            waits.append((c, done, why))
+        for c, done, why in waits:
+            # A lane runs a stop already waiting ahead first; each wait is bounded (2 s).
+            if not done.wait(_SUPERSEDED_WAIT_S):
+                why[0] = f"its wait did not end within {_SUPERSEDED_WAIT_S:g} s"
+            print(f"error: SUPERSEDED robot={c._robot_id}: the stop "
+                  + ("is confirmed: the vehicle is at rest" if not why[0]
+                     else f"is NOT confirmed: {why[0]}"),
+                  file=sys.stderr, flush=True)
+        for c in self.cores:
+            try:
+                c._robot.stop()
+                print(f"error: SUPERSEDED robot={c._robot_id}: MQTT session released",
+                      file=sys.stderr, flush=True)
+            except Exception as fault:  # noqa: BLE001
+                print(f"error: SUPERSEDED robot={c._robot_id}: releasing the MQTT session "
+                      f"raised {fault!r}", file=sys.stderr, flush=True)
 
     def unregistered(self) -> list:
         """The vehicles with no registration accepted on this session."""
