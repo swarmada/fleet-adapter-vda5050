@@ -59,6 +59,9 @@ class _FakeClient:
     def reconnect_delay_set(self, min_delay, max_delay) -> None:
         self.reconnect_delay = (min_delay, max_delay)
 
+    def max_inflight_messages_set(self, inflight: int) -> None:
+        self.max_inflight = inflight
+
     def connect(self, host, port) -> None:
         self.calls.append(f"connect {host}:{port}")
         if _FakeClient.refuse_tcp:

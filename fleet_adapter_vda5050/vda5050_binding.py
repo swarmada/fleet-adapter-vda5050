@@ -97,7 +97,7 @@ class Vda5050Binding:
                  mqtt_host: str = "localhost", mqtt_port: int = 1883,
                  preempt_timeout_s: float = _PREEMPT_TIMEOUT_S, clock=time.monotonic,
                  boot: str | None = None, route_graph: RouteGraph | None = None,
-                 state_lapse_s: float = _STATE_LAPSE_S) -> None:
+                 state_lapse_s: float = _STATE_LAPSE_S, mqtt: MqttClient | None = None) -> None:
         if not (math.isfinite(state_lapse_s) and state_lapse_s > 0):
             raise ValueError(f"state_lapse_s is {state_lapse_s!r}, not a positive number of seconds")
         self._robot_id = robot_id
@@ -195,8 +195,11 @@ class Vda5050Binding:
         self._failed_detail = ""
         self._started = False                      # True once the broker is connected
         self._never_started_raised = False          # tick()'s never-started diagnosis is one-shot
-        self._mqtt = MqttClient(mqtt_host, mqtt_port, client_id=f"swarmada-{robot_id}")
+        # The process's MQTT client, shared by every vehicle it serves, or one of its own.
+        self._mqtt = mqtt if mqtt is not None else MqttClient(
+            mqtt_host, mqtt_port, client_id=f"swarmada-{robot_id}")
         self._mqtt.on_session(self._on_broker_session)
+        self._mqtt_held = False                    # this binding counts as a user of _mqtt
 
     # ── robot-side message callbacks (also the test entry points) ─────────────
 
@@ -1140,6 +1143,7 @@ class Vda5050Binding:
                                  lambda _t, p: self.on_visualization(p))
         self._mqtt.connect()  # requires paho-mqtt + an MQTT broker
         with self._lock:
+            self._mqtt_held = True
             self._started = True  # orders now publish; before this they are cached only
 
     def stop(self) -> None:
@@ -1153,7 +1157,9 @@ class Vda5050Binding:
         observable-but-disconnected."""
         with self._lock:
             self._started = False
-        self._mqtt.stop()
+            held, self._mqtt_held = self._mqtt_held, False
+        if held:  # once: a shared client's session ends with its last user's stop
+            self._mqtt.stop()
 
     def transport_alive(self) -> bool:
         """True only while this binding can OBSERVE the robot: the broker session is up

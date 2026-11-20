@@ -75,6 +75,9 @@ def mark_transport_live(binding):
             return PublishInfo(published=True)
 
         @staticmethod
+        def subscribe(topic, qos=1) -> None: ...
+
+        @staticmethod
         def loop_stop() -> None: ...
 
         @staticmethod
@@ -82,6 +85,8 @@ def mark_transport_live(binding):
 
     binding._mqtt._client = _RecordingClient()
     binding._mqtt._up = True  # the broker session is up, as after on_connect
+    binding._mqtt._users = 1  # this binding counts as its user, as after start()
+    binding._mqtt_held = True
     binding._started = True
     binding._connection = profiles.CONN_ONLINE
     binding.published = published

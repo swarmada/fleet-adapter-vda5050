@@ -18,6 +18,12 @@ so it never reports a reading from before the drop as current.
 
 VDA5050 runs over MQTT at QoS 1 (at-least-once); the binding drops a redelivered
 ``state`` by its ``headerId`` and ``timestamp`` (``Vda5050Binding.on_state``).
+
+One client can serve every vehicle of a process: each vehicle's binding subscribes its own
+topics, adds its own session handler, and counts as a user from its :meth:`connect` to its
+:meth:`stop`. The broker session is opened by the first user and ended by the last. Each
+:meth:`publish` returns paho's own ``MQTTMessageInfo`` for that message, so one vehicle's
+acknowledgement never answers for another's.
 """
 
 from __future__ import annotations
@@ -33,6 +39,33 @@ _CONNECT_TIMEOUT_S = 10.0
 # paho's reconnect backoff after a drop, in seconds: the first retry after 1 s, then up to 10 s.
 _RECONNECT_MIN_S = 1
 _RECONNECT_MAX_S = 10
+# paho's own limit on QoS 1 messages awaiting their PUBACK (paho-mqtt 2.1: 20). Past it, a publish
+# is queued and not yet sent, so it can't be acknowledged.
+PAHO_MAX_INFLIGHT = 20
+# The most QoS 1 messages one vehicle can have awaiting their PUBACK at once when a stop reaches
+# it, each publish being one message (vda5050_binding.py: _send_order, _send_cancel,
+# _publish_action):
+#   2  its last order, and the startPause or stopPause _send_order puts before it
+#   1  a preemption's cancelOrder (the order it holds goes out only once that cancel has ended,
+#      and a stop drops it)
+#   1  a pause or a resume (startPause, stopPause)
+#   1  a factsheetRequest
+#   6  the stop's startPause and cancelOrder, on each of the three paths one stop can come by:
+#      the SafetyStream estop, its ControlStream fence and an edge node's estop
+# 11 in all. A message whose effect the vehicle has already reported (an order it drives, a
+# cancel it reports ended) is taken as acknowledged: a broker acknowledges a QoS 1 publish when
+# it takes it, before delivering it. So the late cancelOrder for an order still running after a
+# stop (on_state) adds none: it is sent only once the vehicle reports that stop's cancelOrder
+# ended, and takes its place.
+_INFLIGHT_PER_VEHICLE = 11
+
+
+def inflight_for(vehicles: int) -> int:
+    """The in-flight limit for a client that serves ``vehicles`` vehicles: never below paho's own,
+    and the most one vehicle can have in flight (_INFLIGHT_PER_VEHICLE) for each, so a whole
+    fleet's stop is sent at once and none of its messages waits, queued unsent behind other
+    vehicles' messages, for a PUBACK to free its place. The one place the limit is decided."""
+    return max(PAHO_MAX_INFLIGHT, _INFLIGHT_PER_VEHICLE * max(int(vehicles), 1))
 
 
 class MqttClient:
@@ -40,27 +73,37 @@ class MqttClient:
     loop runs on paho's own thread once connected."""
 
     def __init__(self, host: str = "localhost", port: int = 1883,
-                 client_id: str = "swarmada-vda5050") -> None:
+                 client_id: str = "swarmada-vda5050", vehicles: int = 1) -> None:
         self._host = host
         self._port = port
         self._client_id = client_id
+        # The vehicles this client serves set how many messages it may have in flight.
+        self._max_inflight = inflight_for(vehicles)
         self._client = None
         self._subs: dict[str, _Handler] = {}
         self._lock = threading.Lock()
         self._up = False                                  # the broker accepted us; subscribed
         self._first = threading.Event()                   # the first on_connect has been seen
         self._first_failure = ""                          # ...and why it failed, if it did
-        self._session_handler: Callable[[bool], None] | None = None
+        self._session_handlers: list[Callable[[bool], None]] = []
+        # The bindings that connected and haven't stopped: the session ends with the last.
+        self._users = 0
+        self._use_lock = threading.Lock()                 # connect() and stop(), one at a time
 
     def subscribe(self, topic: str, handler: _Handler) -> None:
         """Register a handler for a topic; applied on the next :meth:`connect`, and again
-        on every reconnect."""
+        on every reconnect. One registered while the session is up (another vehicle's binding
+        connected first) is subscribed at once."""
         self._subs[topic] = handler
+        client = self._client
+        if client is not None and self.connected:
+            client.subscribe(topic, qos=1)
 
     def on_session(self, handler: Callable[[bool], None]) -> None:
-        """Call ``handler(True)`` each time the broker session comes up (subscriptions
-        sent), and ``handler(False)`` each time it goes down. Called on paho's thread."""
-        self._session_handler = handler
+        """Also call ``handler(True)`` each time the broker session comes up (subscriptions
+        sent), and ``handler(False)`` each time it goes down. Called on paho's thread. Each
+        vehicle's binding adds its own."""
+        self._session_handlers.append(handler)
 
     @property
     def subscriptions(self) -> tuple[str, ...]:
@@ -80,7 +123,16 @@ class MqttClient:
         has accepted the connection and the topics are subscribed. RAISES RuntimeError when
         paho is missing, the broker cannot be reached, refuses the connection, or does not
         answer within the timeout: returning normally is the binding's evidence that it is
-        live (``RobotBinding.start``)."""
+        live (``RobotBinding.start``). Counts the caller as a user until its :meth:`stop`; for
+        a user after the first, the session is already open, and it returns at once."""
+        with self._use_lock:
+            if self._client is not None:
+                self._users += 1
+                return
+            self._open()
+            self._users = 1
+
+    def _open(self) -> None:
         try:
             import paho.mqtt.client as mqtt
         except ImportError as exc:
@@ -94,6 +146,7 @@ class MqttClient:
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
         client.reconnect_delay_set(min_delay=_RECONNECT_MIN_S, max_delay=_RECONNECT_MAX_S)
+        client.max_inflight_messages_set(self._max_inflight)
         self._first.clear()
         self._first_failure = ""
         try:
@@ -105,7 +158,7 @@ class MqttClient:
         client.loop_start()
         if not self._first.wait(_CONNECT_TIMEOUT_S) or self._first_failure:
             why = self._first_failure or f"no answer within {_CONNECT_TIMEOUT_S:g} s"
-            self.stop()
+            self._close()
             raise RuntimeError(f"MQTT broker {self._host}:{self._port} did not accept the "
                                f"connection: {why}")
 
@@ -148,9 +201,9 @@ class MqttClient:
     def _set(self, up: bool) -> None:
         with self._lock:
             changed, self._up = self._up != up, up
-        handler = self._session_handler
-        if changed and handler is not None:
-            handler(up)
+        if changed:
+            for handler in list(self._session_handlers):
+                handler(up)
 
     def _on_message(self, _client, _userdata, msg) -> None:
         handler = self._subs.get(msg.topic)
@@ -158,7 +211,24 @@ class MqttClient:
             handler(msg.topic, msg.payload)
 
     def stop(self) -> None:
-        """Disconnect and stop paho's network thread. Idempotent; a no-op before connect."""
+        """Release the caller's use. The last user's stop disconnects and stops paho's network
+        thread; an earlier one leaves the session to the others. A no-op with no user, so a
+        binding that never connected, or already stopped, can call it safely."""
+        with self._use_lock:
+            if self._users == 0:
+                return
+            self._users -= 1
+            if self._users:
+                return
+            self._close()
+
+    @property
+    def users(self) -> int:
+        """The bindings that connected and haven't stopped (test seam)."""
+        with self._use_lock:
+            return self._users
+
+    def _close(self) -> None:
         client, self._client = self._client, None
         self._set(False)
         if client is not None:
