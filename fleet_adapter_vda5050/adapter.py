@@ -2004,12 +2004,13 @@ class fleet_adapter_vda5050Adapter:
         """The fence (Command.estop) on the current ControlStream: a stop, latched; a clear
         that came first takes effect with it."""
         stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
+        lifted_ms = _now_ms()  # when the kept clear took effect, if it did
         if stop:
             self._stop_and_ack(estop_id, self._send_safety)
         if lifted:
             # After the stop's own answer, which may still be waiting on the lane: the stop is
             # answered before its clear.
-            self._lane.submit(lambda: self._send_clear_ack(estop_id))
+            self._lane.submit(lambda: self._send_clear_ack(estop_id, lifted_ms))
 
     def _on_clear(self, clear) -> None:
         """A SafetyStream clear. The latch decides it here, on the reader; the answer goes on
@@ -2018,22 +2019,29 @@ class fleet_adapter_vda5050Adapter:
         local set brings follows its EstopClearAck."""
         verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
                                        clear.ends_local_set)
+        lifted_ms = _now_ms() if verdict == "lifted" else None
         print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
               file=sys.stderr)
-        if verdict == "ack":
+        if verdict in ("lifted", "ack"):
             estop_id, ends_local = clear.estop_id, bool(clear.ends_local_set)
 
             def answer() -> None:
-                self._send_clear_ack(estop_id)
+                self._send_clear_ack(estop_id, lifted_ms)
                 if ends_local:
                     self._send_local_report()
             self._lane.submit(answer)
 
-    def _send_clear_ack(self, estop_id: str) -> None:
+    def _send_clear_ack(self, estop_id: str, lifted_ms: int | None) -> None:
+        """The EstopClearAck for ``estop_id``. ``lifted_ms`` is when the latch lifted the stop,
+        taken where it lifted: the ack itself may go up to 2 s later, after the answer of a stop
+        still waiting on the lane. None for an ack sent again for an ID lifted earlier: the
+        latch keeps no time for a lift, so that ack carries the time it is sent. RFC-0001
+        names ``lifted_at_ms`` without saying which time it holds."""
         pb = self._pb
+        at = lifted_ms if lifted_ms is not None else _now_ms()
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id,
-            estop_clear_ack=pb.EstopClearAck(estop_id=estop_id, lifted_at_ms=_now_ms())))
+            estop_clear_ack=pb.EstopClearAck(estop_id=estop_id, lifted_at_ms=at)))
 
     def _send_local_report(self) -> None:
         pb = self._pb
