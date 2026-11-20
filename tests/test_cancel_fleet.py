@@ -9,7 +9,10 @@ budget; a cancel naming an action replaced in place on that vehicle, only once a
 vehicle shows its own replacing order. Nothing another vehicle reports answers for it. The one
 ControlStream reader serves every vehicle, so a cancel's wait runs on a thread of its own: not
 on the reader, so no command for any vehicle waits behind it, and not on the vehicle's lane, so
-a stop for the same vehicle is answered without queuing behind it."""
+a stop for the same vehicle is answered without queuing behind it.
+
+The vehicles here have an MQTT client each, except where a test puts them all on one, as a
+process serving several vehicles does (fleet_on_one_client)."""
 
 from __future__ import annotations
 
@@ -18,7 +21,7 @@ import json
 import threading
 import time
 
-from conftest import mark_registered, mark_transport_live
+from conftest import fleet_on_one_client, mark_registered, mark_transport_live
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
@@ -53,11 +56,16 @@ class _Unacknowledged:
         return False
 
 
-def _fleet(monkeypatch) -> FleetProcess:
+def _fleet(monkeypatch, bindings=None) -> FleetProcess:
+    """FLEET, each vehicle driving an action of its own; on ``bindings`` if given, else on a
+    binding of its own with a client of its own."""
     monkeypatch.setattr(Adapter, "_telemetry_loop", lambda self, stub: None)
+    if bindings is None:
+        bindings = [mark_transport_live(Vda5050Binding(robot_id=rid, serial=rid))
+                    for rid in FLEET]
     streams, cores = _Streams(), []
-    for rid in FLEET:
-        b = mark_transport_live(Vda5050Binding(robot_id=rid, serial=rid))
+    for b in bindings:
+        rid = b._robot_id
         b.on_state(_state())
         c = mark_registered(Adapter(pb, None, b, rid, streams=streams))
         c._stop_confirm_sleep = lambda _s: None
@@ -180,6 +188,35 @@ def test_another_vehicles_acknowledged_cancel_order_never_confirms_this_cancel(
     _, res = _await(p, seen, 1)
     assert res.cancel_action.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
     assert "broker did not acknowledge" in res.cancel_action.message
+
+
+def test_on_one_mqtt_client_another_vehicles_acknowledgement_never_confirms_this_cancel(
+        monkeypatch) -> None:
+    """The rule above with every vehicle on one MQTT client. amr-2's cancel is confirmed, its
+    cancelOrder acknowledged. The broker never acknowledges amr-1's cancelOrder, and during
+    amr-1's wait amr-2 goes on publishing on the same client, each publish acknowledged, while
+    amr-1 is at rest: amr-1's cancel is not confirmed."""
+    _shared, broker, bindings = fleet_on_one_client(FLEET)
+    p = _fleet(monkeypatch, bindings)
+    a1, a2 = _core(p, "amr-1"), _core(p, "amr-2")
+    _looks(a2, order_id=a2._robot._last_order_id)
+    seen: dict = {}
+    p.handle_control_plane(_cancel_msg("amr-2", "act-2", 2), None)
+    _, res = _await(p, seen, 2)
+    assert res.cancel_action.disposition == pb.CANCEL_DISPOSITION_STOPPED_SAFELY
+    broker.hold = lambda topic: topic == a1._robot._topics.instant_actions
+
+    def look(_s) -> None:
+        a1._robot.on_state(_state(order_id=a1._robot._last_order_id))  # at rest
+        a2._robot.request_factsheet("amr-2")  # on the same client, acknowledged
+    a1._stop_confirm_sleep = look
+    p.handle_control_plane(_cancel_msg("amr-1", "act-1", 1), None)
+    _, res = _await(p, seen, 1)
+    assert res.cancel_action.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
+    assert "broker did not acknowledge" in res.cancel_action.message
+    topics = [t for t, _p in broker.published]
+    last_cancel = max(i for i, t in enumerate(topics) if t == a1._robot._topics.instant_actions)
+    assert a2._robot._topics.instant_actions in topics[last_cancel + 1:]  # amr-2's came after
 
 
 def test_a_fence_and_a_cancel_for_other_vehicles_during_a_cancels_wait_go_on_at_once(

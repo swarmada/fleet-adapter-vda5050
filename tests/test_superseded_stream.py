@@ -15,7 +15,9 @@ close included. An ordinary drop still redials.
 
 A process serving several vehicles does all of that once, for every vehicle: the supersession is
 the process's streams', so every vehicle is stopped and refuses work, the waits for rest run at
-the same time, and each MQTT session is released once."""
+the same time, and each MQTT session is released once. With every vehicle on one MQTT client,
+as a process serving several runs them, each releases it once and its session ends with the
+last release, after every vehicle's cancelOrder."""
 
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ import time
 
 import grpc
 import pytest
-from conftest import mark_transport_live
+from conftest import fleet_on_one_client, mark_transport_live
 
 from fleet_adapter.v1 import fleet_adapter_pb2 as pb
 from fleet_adapter_vda5050 import adapter as adapter_mod
@@ -394,26 +396,43 @@ def test_a_fence_after_a_safety_only_supersession_is_not_silently_lost(adapter) 
 FLEET = ("amr-1", "amr-2", "amr-3")
 
 
-@pytest.fixture
-def fleet(monkeypatch):
-    """Three vehicles on one process's streams, each idle and live, none sending a state after
-    a stop unless a test makes it."""
+def _fleet_process(monkeypatch, bindings) -> FleetProcess:
     monkeypatch.setattr(Adapter, "_telemetry_loop", lambda self, stub: None)
     monkeypatch.setattr(FleetProcess, "_start_edge", lambda self, link: None)
     streams, cores = _Streams(), []
-    for rid in FLEET:
-        b = mark_transport_live(Vda5050Binding(robot_id=rid, serial=rid))
+    for b in bindings:
         b.start = lambda: None
         b.stops = []
         b.stop = (lambda b=b, real=b.stop: (b.stops.append(True), real()))
         b.on_state(_IDLE)
-        c = Adapter(pb, None, b, rid, streams=streams)
+        c = Adapter(pb, None, b, b._robot_id, streams=streams)
         c._stop_confirm_sleep = lambda s: None
         cores.append(c)
     p = FleetProcess(cores)
     p.stub = None
+    return p
+
+
+@pytest.fixture
+def fleet(monkeypatch):
+    """Three vehicles on one process's streams, each idle and live with an MQTT client of its
+    own, none sending a state after a stop unless a test makes it."""
+    p = _fleet_process(monkeypatch, [mark_transport_live(Vda5050Binding(robot_id=rid, serial=rid))
+                                     for rid in FLEET])
     yield p
-    streams.shutdown.set()
+    p._streams.shutdown.set()
+    if p.stub is not None:
+        p.stub.close_all()
+
+
+@pytest.fixture
+def shared_fleet(monkeypatch):
+    """The same three vehicles, all on one MQTT client (fleet_on_one_client)."""
+    shared, broker, bindings = fleet_on_one_client(FLEET)
+    p = _fleet_process(monkeypatch, bindings)
+    p.shared, p.broker = shared, broker
+    yield p
+    p._streams.shutdown.set()
     if p.stub is not None:
         p.stub.close_all()
 
@@ -537,3 +556,21 @@ def test_a_fault_for_one_vehicle_still_stops_and_releases_the_others(fleet, caps
     assert _wire(p.cores[2]._robot) == ["order", "cancelOrder"]
     assert "SUPERSEDED robot=amr-2: the stop is NOT confirmed: the stop sequence raised" in (
         capsys.readouterr().err)
+
+
+def test_a_superseded_fleet_on_one_mqtt_client_ends_its_session_once_after_every_stop(
+        shared_fleet) -> None:
+    """Every vehicle on one MQTT client: after a supersession each is stopped and releases the
+    client once, and the client's session ends once, with the last release, after every
+    vehicle's cancelOrder has gone out."""
+    p = shared_fleet
+    stub = p.stub = _Stub(control=[(_fleet_session(), None)])
+    _run(p.run_control_stream, stub)
+    _working(p)
+    stub.drop("control", 1, _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+    _until(lambda: _all_released(p))
+    for c in p.cores:
+        assert _wire(c._robot) == ["order", "cancelOrder"], c._robot_id
+        assert c._robot.stops == [True] and not c._robot._mqtt_held, c._robot_id
+    assert p.shared.users == 0
+    assert p.broker.disconnects == [(0, len(p.broker.published))]  # once, last, after all
