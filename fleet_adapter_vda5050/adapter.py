@@ -2123,18 +2123,26 @@ def dialler(args, ap):
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="VDA5050 Fleet Adapter")
     ap.add_argument("--endpoint", default="localhost:9090")
-    ap.add_argument("--robot-id", default="robot-conformance-1")
+    ap.add_argument("--robot-id", default=None,
+                    help="the robot id this adapter serves (default: robot-conformance-1)")
+    ap.add_argument("--vehicles-file", default="",
+                    help="vda5050 comms: a YAML list of the vehicles this process serves, each "
+                         "with robot_id, serial and optionally manufacturer (vehicles.py). "
+                         "Takes the place of --robot-id, --serial and --manufacturer; every "
+                         "vehicle is served on one ControlStream and one MQTT client")
     ap.add_argument("--comms", default="simulated", choices=["simulated", "vda5050"],
                     help="robot comms: 'simulated' ($0, no broker) or 'vda5050' (MQTT/JSON)")
     ap.add_argument("--mqtt-host", default="localhost")
     ap.add_argument("--mqtt-port", type=int, default=1883)
-    ap.add_argument("--manufacturer", default="swarmada",
+    ap.add_argument("--manufacturer", default=None,
                     help="vda5050 comms: 'manufacturer' segment of the robot's MQTT topic "
                          "identity (interfaceName/version/MANUFACTURER/serialNumber). Must "
-                         "match the robot's VDA5050 identity to bind a real AMR.")
-    ap.add_argument("--serial", default="amr-1",
+                         "match the robot's VDA5050 identity to bind a real AMR "
+                         "(default: swarmada).")
+    ap.add_argument("--serial", default=None,
                     help="vda5050 comms: 'serialNumber' segment of the robot's MQTT topic "
-                         "identity. Must match the robot's VDA5050 serial to bind a real AMR.")
+                         "identity. Must match the robot's VDA5050 serial to bind a real AMR "
+                         "(default: amr-1).")
     ap.add_argument("--route-graph", default="",
                     help="vda5050 comms: a YAML lane graph (routing.py). Orders then follow its "
                          "lanes instead of one straight edge from the vehicle to the goal, and a "
@@ -2175,6 +2183,7 @@ def main(argv: list[str] | None = None) -> None:
         ap.error("--route-graph needs --comms vda5050")
     if not (math.isfinite(args.state_lapse_seconds) and args.state_lapse_seconds > 0):
         ap.error(f"--state-lapse-seconds is {args.state_lapse_seconds:g}, not a positive number")
+    vehicles = _vehicles(args, ap)
     dial = dialler(args, ap)
 
     from fleet_adapter.v1 import fleet_adapter_pb2 as pb
@@ -2192,10 +2201,21 @@ def main(argv: list[str] | None = None) -> None:
             on_map = f", map {graph.map_id}" if graph.map_id else ""
             print(f"route graph {args.route_graph}: {len(graph.node_ids)} nodes, "
                   f"{graph.edge_count} edges{on_map}", file=sys.stderr)
-        robot = Vda5050Binding(robot_id=args.robot_id,
-                               manufacturer=args.manufacturer, serial=args.serial,
-                               mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
-                               route_graph=graph, state_lapse_s=args.state_lapse_seconds)
+        # A fleet's vehicles share one MQTT client and its session (mqtt_client.py), under the
+        # first vehicle's client id; a lone vehicle keeps a client of its own, as before.
+        shared = None
+        if len(vehicles) > 1:
+            from fleet_adapter_vda5050.mqtt_client import MqttClient
+            shared = MqttClient(args.mqtt_host, args.mqtt_port,
+                                client_id=f"swarmada-{vehicles[0].robot_id}",
+                                vehicles=len(vehicles))
+        robots = [Vda5050Binding(robot_id=v.robot_id,
+                                 manufacturer=v.manufacturer, serial=v.serial,
+                                 mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
+                                 route_graph=graph, state_lapse_s=args.state_lapse_seconds,
+                                 mqtt=shared)
+                  for v in vehicles]
+        robot = robots[0]
     else:
         # Scenarios are additive tooling, not a safety requirement (ADR-0005): if
         # scenario support is unavailable (e.g. PyYAML missing) run the $0 skeleton.
@@ -2215,9 +2235,23 @@ def main(argv: list[str] | None = None) -> None:
                 component=args.fault_component, fault_at=args.fault_at, recover_at=args.recover_at))
             engine = ScenarioEngine(scenario)
         robot = SimulatedRobot(engine)  # $0 skeleton; scenario-driven when an engine is set
-    adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id,
-                                           state_dir=args.state_dir or None, dial=dial,
-                                           namespace=args.namespace)
+        robots = [robot]
+    if len(robots) == 1:
+        adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, vehicles[0].robot_id,
+                                               state_dir=args.state_dir or None, dial=dial,
+                                               namespace=args.namespace)
+    else:
+        # One process for the fleet: its streams, one ControlStream and one SafetyStream, are
+        # every vehicle's; the first vehicle runs them, as a lone vehicle does (process.py).
+        streams = _Streams(dial, args.namespace)
+        cores = [fleet_adapter_vda5050Adapter(pb, pb_grpc, r, v.robot_id,
+                                              state_dir=args.state_dir or None, streams=streams)
+                 for r, v in zip(robots, vehicles)]
+        FleetProcess(cores)
+        adapter = cores[0]
+        print(f"serving {len(cores)} vehicles from {args.vehicles_file} on one MQTT client "
+              f"(swarmada-{vehicles[0].robot_id}): {adapter._process.served_text()}",
+              file=sys.stderr)
     if args.comms == "simulated":
         # The simulated vehicle's reset: a local command at the vehicle, never a message.
         signal.signal(signal.SIGUSR1, lambda signum, frame: robot.request_reset())
@@ -2238,8 +2272,35 @@ def main(argv: list[str] | None = None) -> None:
         # there was no `stop()` anywhere in this adapter, so a `--comms vda5050` run left
         # paho's network thread and the broker session to the interpreter's exit. Calling
         # it here makes the shutdown explicit at the level that owns the robot; `stop()`
-        # is idempotent and safe when `start()` never ran.
-        robot.stop()
+        # is idempotent and safe when `start()` never ran. Every vehicle's: a shared client's
+        # session ends with the last.
+        for r in robots:
+            r.stop()
+
+
+def _vehicles(args, ap) -> list:
+    """The vehicles this process serves: those --vehicles-file lists, or the one --robot-id,
+    --serial and --manufacturer give (or their defaults). The file takes the place of those
+    flags, so giving it with any of them is refused, as is giving it for the simulated comms,
+    which serve one vehicle (ap.error exits 2)."""
+    from fleet_adapter_vda5050.vehicles import DEFAULT_MANUFACTURER, Vehicle, load_vehicles
+
+    if not args.vehicles_file:
+        return [Vehicle(robot_id="robot-conformance-1" if args.robot_id is None else args.robot_id,
+                        serial="amr-1" if args.serial is None else args.serial,
+                        manufacturer=(DEFAULT_MANUFACTURER if args.manufacturer is None
+                                      else args.manufacturer))]
+    if args.comms != "vda5050":
+        ap.error("--vehicles-file needs --comms vda5050: the simulated comms serve one vehicle")
+    given = [flag for flag, value in (("--robot-id", args.robot_id), ("--serial", args.serial),
+                                      ("--manufacturer", args.manufacturer)) if value is not None]
+    if given:
+        ap.error(f"--vehicles-file and {', '.join(given)} together: the file gives each "
+                 f"vehicle's robot_id, serial and manufacturer")
+    try:
+        return load_vehicles(args.vehicles_file)
+    except ValueError as exc:
+        ap.error(str(exc))
 
 
 if __name__ == "__main__":
