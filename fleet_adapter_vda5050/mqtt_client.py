@@ -81,6 +81,8 @@ class MqttClient:
         self._max_inflight = inflight_for(vehicles)
         self._client = None
         self._subs: dict[str, _Handler] = {}
+        # Held over a topic's registration and, on a connect, over the snapshot of the topics,
+        # their subscribes and the session coming up: a topic is subscribed by one or the other.
         self._lock = threading.Lock()
         self._up = False                                  # the broker accepted us; subscribed
         self._first = threading.Event()                   # the first on_connect has been seen
@@ -93,11 +95,18 @@ class MqttClient:
     def subscribe(self, topic: str, handler: _Handler) -> None:
         """Register a handler for a topic; applied on the next :meth:`connect`, and again
         on every reconnect. One registered while the session is up (another vehicle's binding
-        connected first) is subscribed at once."""
-        self._subs[topic] = handler
-        client = self._client
-        if client is not None and self.connected:
-            client.subscribe(topic, qos=1)
+        connected first) is subscribed at once.
+
+        Under the lock :meth:`_on_connect` holds from its snapshot of the topics until the
+        session is up: a topic registered while the session comes up is in that snapshot, or
+        is registered once the session is up and subscribed here. Without it, a topic
+        registered after the snapshot but before the session was up was subscribed by
+        neither, and its vehicle heard nothing until the next reconnect."""
+        with self._lock:
+            self._subs[topic] = handler
+            client = self._client
+            if client is not None and self._up:
+                client.subscribe(topic, qos=1)
 
     def on_session(self, handler: Callable[[bool], None]) -> None:
         """Also call ``handler(True)`` each time the broker session comes up (subscriptions
@@ -181,10 +190,13 @@ class MqttClient:
                 print(f"vda5050: MQTT broker refused the reconnect: {reason_code}",
                       file=sys.stderr)
             return
-        for topic in list(self._subs):
-            client.subscribe(topic, qos=1)  # at-least-once; a clean session kept none
+        with self._lock:  # with subscribe(): no topic registered meanwhile is missed
+            for topic in list(self._subs):
+                client.subscribe(topic, qos=1)  # at-least-once; a clean session kept none
+            changed, self._up = not self._up, True
         reconnect = self._first.is_set()
-        self._set(True)
+        if changed:
+            self._tell(True)
         self._first.set()
         if reconnect:
             print("vda5050: MQTT broker session is back; topics subscribed again",
@@ -202,8 +214,12 @@ class MqttClient:
         with self._lock:
             changed, self._up = self._up != up, up
         if changed:
-            for handler in list(self._session_handlers):
-                handler(up)
+            self._tell(up)
+
+    def _tell(self, up: bool) -> None:
+        """Each binding's session handler, outside the lock."""
+        for handler in list(self._session_handlers):
+            handler(up)
 
     def _on_message(self, _client, _userdata, msg) -> None:
         handler = self._subs.get(msg.topic)

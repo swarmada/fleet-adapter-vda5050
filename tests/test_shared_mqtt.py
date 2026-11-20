@@ -7,7 +7,8 @@
   answers for another's cancelOrder.
 * Each vehicle's messages reach that vehicle's binding only, and each binding hears the
   session go down and come back.
-* A vehicle whose binding starts after the session is up has its topics subscribed at once.
+* A vehicle whose binding starts after the session is up has its topics subscribed at once, and
+  one whose topic is registered while the session comes up has it subscribed too.
 * The session ends with the last binding's stop, not the first.
 * The in-flight limit follows the fleet's size (inflight_for). paho sends at most that many QoS 1
   messages awaiting their PUBACK and queues the rest unsent, so with the limit at paho's 20, a
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 import types
 from typing import ClassVar
@@ -292,3 +294,42 @@ def test_a_namespace_stop_of_25_vehicles_at_their_worst_is_sent_at_once_and_ackn
     for b in bs:
         assert Vda5050Binding.cancel_accepted(tickets[b._robot_id]), b._robot_id
         assert fc.sent.count(b._topics.instant_actions) == 1 + 1 + 1 + 1 + 6, b._robot_id
+
+
+@pytest.mark.parametrize("when", ["first connect", "reconnect"])
+def test_a_topic_registered_while_the_session_comes_up_is_subscribed(paho, monkeypatch,
+                                                                     when) -> None:
+    """Another vehicle's binding registers its topic while on_connect is subscribing the topics
+    it found: the topic is subscribed, by on_connect or by the registration, never by neither."""
+    entered, gate, gated = threading.Event(), threading.Event(), [when == "first connect"]
+    plain = _Paho.subscribe
+
+    def subscribe(self, topic, qos=0) -> None:
+        if gated[0] and topic == "uagv/v2/acme/amr-1/state":
+            entered.set()
+            gate.wait(5)  # on_connect, between its snapshot of the topics and the session up
+        plain(self, topic, qos)
+
+    monkeypatch.setattr(_Paho, "subscribe", subscribe)
+    mc = MqttClient(vehicles=2)
+    mc.subscribe("uagv/v2/acme/amr-1/state", lambda t, p: None)
+    if when == "first connect":
+        coming_up = threading.Thread(target=mc.connect)
+    else:
+        mc.connect()
+        p = _Paho.instances[0]
+        p.drop()
+        gated[0] = True
+        coming_up = threading.Thread(target=p.on_connect, args=(p, None, {}, _RC(), None))
+    coming_up.start()
+    assert entered.wait(5)
+    joining = threading.Thread(target=mc.subscribe,
+                               args=("uagv/v2/acme/amr-2/state", lambda t, p: None))
+    joining.start()
+    joining.join(0.3)  # amr-2's binding registers its topic meanwhile
+    gate.set()
+    coming_up.join(5)
+    joining.join(5)
+    assert not coming_up.is_alive() and not joining.is_alive()
+    assert mc.connected
+    assert "uagv/v2/acme/amr-2/state" in _Paho.instances[0].subscribed
