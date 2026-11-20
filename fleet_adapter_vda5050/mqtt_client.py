@@ -42,29 +42,41 @@ _RECONNECT_MAX_S = 10
 # paho's own limit on QoS 1 messages awaiting their PUBACK (paho-mqtt 2.1: 20). Past it, a publish
 # is queued and not yet sent, so it can't be acknowledged.
 PAHO_MAX_INFLIGHT = 20
-# The most QoS 1 messages one vehicle can have awaiting their PUBACK at once when a stop reaches
-# it, each publish being one message (vda5050_binding.py: _send_order, _send_cancel,
-# _publish_action):
+# The most QoS 1 messages one vehicle can have awaiting their PUBACK at once in one incident, each
+# publish being one message (vda5050_binding.py: _send_order, _send_cancel, _publish_action),
+# with every path that can stop it delivering its stop once:
 #   2  its last order, and the startPause or stopPause _send_order puts before it
 #   1  a preemption's cancelOrder (the order it holds goes out only once that cancel has ended,
 #      and a stop drops it)
 #   1  a pause or a resume (startPause, stopPause)
 #   1  a factsheetRequest
-#   6  the stop's startPause and cancelOrder, on each of the three paths one stop can come by:
-#      the SafetyStream estop, its ControlStream fence and an edge node's estop
-# 11 in all. A message whose effect the vehicle has already reported (an order it drives, a
-# cancel it reports ended) is taken as acknowledged: a broker acknowledges a QoS 1 publish when
-# it takes it, before delivering it. So the late cancelOrder for an order still running after a
-# stop (on_state) adds none: it is sent only once the vehicle reports that stop's cancelOrder
-# ended, and takes its place.
-_INFLIGHT_PER_VEHICLE = 11
+#   6  an emergency stop's startPause and cancelOrder, on each of the three paths one can come
+#      by: the SafetyStream estop, its ControlStream fence and an edge node's estop
+#   3  a cancelOrder for each of the other stops: a ControlStream cancel, the lease expiring,
+#      and a supersession
+# 14 in all. The estop drill adds none on this binding: it runs only on a binding that can
+# inject a fault (hardware_delta), which this one can't. A message whose effect the vehicle has
+# already reported (an order it drives, a cancel it reports ended) is taken as acknowledged: a
+# broker acknowledges a QoS 1 publish when it takes it, before delivering it. So the late
+# cancelOrder for an order still running after a stop (on_state) adds none: it is sent only once
+# the vehicle reports that stop's cancelOrder ended, and takes its place.
+#
+# Two cases have no bound, so no factor covers them, and past it messages wait their turn:
+#   * an estop or fence for a robot_id this process doesn't serve, while some vehicles have no
+#     accepted registration, stops each of them (2 messages each) every time it comes, the same
+#     stop again included;
+#   * an estop or fence under a new estop_id stops the vehicle again (2 each time).
+# A stop that waits is still answered: FAILED or STOP_UNCONFIRMED if not acknowledged in time,
+# never STOPPED.
+_INFLIGHT_PER_VEHICLE = 14
 
 
 def inflight_for(vehicles: int) -> int:
     """The in-flight limit for a client that serves ``vehicles`` vehicles: never below paho's own,
-    and the most one vehicle can have in flight (_INFLIGHT_PER_VEHICLE) for each, so a whole
-    fleet's stop is sent at once and none of its messages waits, queued unsent behind other
-    vehicles' messages, for a PUBACK to free its place. The one place the limit is decided."""
+    and the most one vehicle can have in flight in one incident (_INFLIGHT_PER_VEHICLE) for
+    each, so a whole fleet's stop is sent at once and none of its messages waits, queued unsent
+    behind other vehicles' messages, for a PUBACK to free its place. The one place the limit is
+    decided."""
     return max(PAHO_MAX_INFLIGHT, _INFLIGHT_PER_VEHICLE * max(int(vehicles), 1))
 
 

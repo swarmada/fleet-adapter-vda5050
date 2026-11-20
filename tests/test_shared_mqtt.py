@@ -12,10 +12,15 @@
 * The session ends with the last binding's stop, not the first.
 * The in-flight limit follows the fleet's size (inflight_for). paho sends at most that many QoS 1
   messages awaiting their PUBACK and queues the rest unsent, so with the limit at paho's 20, a
-  fleet's other traffic can keep a vehicle's stop from leaving the client within its 2 s."""
+  fleet's other traffic can keep a vehicle's stop from leaving the client within its 2 s.
+* Under a broker that acknowledges each message a fixed time after it is sent, every vehicle's
+  stop and cancelOrder in a namespace stop is acknowledged within 2 s of the stop: with each
+  vehicle at the most one incident can put in flight, and with a burst of stops for robot ids
+  this process doesn't serve on top."""
 
 from __future__ import annotations
 
+import heapq
 import json
 import sys
 import threading
@@ -120,11 +125,57 @@ class _Paho:
         self.on_message(self, None, types.SimpleNamespace(topic=topic, payload=payload.encode()))
 
 
-@pytest.fixture
-def paho(monkeypatch):
-    _Paho.instances = []
+class _TimedPaho(_Paho):
+    """A broker that acknowledges each message ``ack_s`` after paho sends it, on a thread of its
+    own; paho's in-flight limit and queue as in _Paho. Each message's info records when it was
+    published and when its PUBACK came."""
+
+    ack_s = 1.0
+
+    def __init__(self, callback_api_version, client_id="") -> None:
+        super().__init__(callback_api_version, client_id)
+        self.lock = threading.RLock()
+        self.published: list[_Info] = []
+        self._due: list = []  # (when, seq, info)
+        self._seq = 0
+        self._wake = threading.Condition(self.lock)
+        self.closed = False
+        threading.Thread(target=self._broker, daemon=True).start()
+
+    def publish(self, topic, payload, qos=0) -> _Info:
+        with self.lock:
+            info = super().publish(topic, payload, qos)
+            info.published_at = time.monotonic()
+            info.acked_at = None
+            self.published.append(info)
+            return info
+
+    def _send(self, info: _Info) -> None:
+        self.sent.append(info.topic)
+        self.inflight.append(info)
+        self._seq += 1
+        heapq.heappush(self._due, (time.monotonic() + self.ack_s, self._seq, info))
+        self._wake.notify()
+
+    def _broker(self) -> None:
+        with self.lock:
+            while not self.closed:
+                if not self._due:
+                    self._wake.wait(0.05)
+                    continue
+                when, _seq, info = self._due[0]
+                now = time.monotonic()
+                if now < when:
+                    self._wake.wait(when - now)
+                    continue
+                heapq.heappop(self._due)
+                info.acked_at = now
+                self.puback(info)
+
+
+def _install(monkeypatch, client_cls) -> None:
     client_mod = types.ModuleType("paho.mqtt.client")
-    client_mod.Client = _Paho
+    client_mod.Client = client_cls
     client_mod.CallbackAPIVersion = types.SimpleNamespace(VERSION1="v1", VERSION2="v2")
     mqtt_mod = types.ModuleType("paho.mqtt")
     mqtt_mod.client = client_mod
@@ -133,7 +184,23 @@ def paho(monkeypatch):
     monkeypatch.setitem(sys.modules, "paho", paho_mod)
     monkeypatch.setitem(sys.modules, "paho.mqtt", mqtt_mod)
     monkeypatch.setitem(sys.modules, "paho.mqtt.client", client_mod)
+
+
+@pytest.fixture
+def paho(monkeypatch):
+    _Paho.instances = []
+    _install(monkeypatch, _Paho)
     return _Paho
+
+
+@pytest.fixture
+def timed_paho(monkeypatch):
+    _Paho.instances = []
+    _install(monkeypatch, _TimedPaho)
+    yield _TimedPaho
+    for fc in _Paho.instances:
+        with fc.lock:
+            fc.closed = True
 
 
 def _state(header: int, driving: bool = False, order_id: str = "") -> str:
@@ -234,12 +301,13 @@ def test_a_lone_vehicle_keeps_its_own_client_and_pahos_limit(paho) -> None:
 # ── the in-flight limit follows the fleet ────────────────────────────────────
 
 def test_the_in_flight_limit_follows_the_fleets_size(paho) -> None:
-    """Eleven for each vehicle (the most one can have in flight), never below paho's 20."""
+    """Fourteen for each vehicle (the most one incident can put in flight), never below paho's
+    20."""
     assert inflight_for(1) == PAHO_MAX_INFLIGHT
-    assert inflight_for(2) == 22
-    assert inflight_for(25) == 275
+    assert inflight_for(2) == 28
+    assert inflight_for(25) == 350
     _shared, _bs, fc = _fleet(25)
-    assert fc.max_inflight == 275
+    assert fc.max_inflight == 350
 
 
 def test_a_stop_is_sent_within_its_window_with_the_others_orders_in_flight(paho) -> None:
@@ -264,36 +332,74 @@ def test_a_stop_is_sent_within_its_window_with_the_others_orders_in_flight(paho)
     assert fc.sent.count(b._topics.instant_actions) == 2  # startPause and cancelOrder both sent
 
 
-def test_a_namespace_stop_of_25_vehicles_at_their_worst_is_sent_at_once_and_acknowledged(
-        paho) -> None:
-    """Every vehicle at the most it can have in flight (mqtt_client._INFLIGHT_PER_VEHICLE): a
-    pause, an order with the startPause before it, a preemption's cancelOrder and a
-    factsheetRequest, all awaiting their PUBACK from a broker that is behind. Then a namespace
-    stop reaches all 25 by its three paths (SafetyStream estop, ControlStream fence, edge
-    estop): each vehicle's startPause and cancelOrder, three times over. Not one message may
-    wait, queued unsent, for a place; and once the broker catches up, every vehicle's stop
-    and cancelOrder is acknowledged, within the stop's 2 s."""
-    _shared, bs, fc = _fleet(25)
-    fc.hold = lambda topic: True  # the broker acknowledges nothing yet
-    t0 = time.monotonic()
+# Each vehicle's messages in one incident, at the most it can have in flight
+# (mqtt_client._INFLIGHT_PER_VEHICLE): 5 of its own work, then its stops.
+_WORK = 5
+_STOPS = 9  # 3 x (startPause, cancelOrder) for the emergency stops, 3 cancelOrders
+
+
+def _incident(bs: list[Vda5050Binding], unserved: int) -> dict[str, list]:
+    """Every vehicle at the most one incident can put in flight, all at once, with ``unserved``
+    stops for a robot id this process doesn't serve coming before the stops (each stops every
+    vehicle: startPause, cancelOrder). Returns each vehicle's stop messages, as paho's infos."""
+    fc = _Paho.instances[0]
     for b in bs:
         rid = b._robot_id
         b.command_pause(rid)                   # startPause
         b.command_move(rid, 5.0, 0.0)          # startPause, order
         b.command_move(rid, 6.0, 0.0)          # in place: cancelOrder, the order held
         b.request_factsheet(rid)               # factsheetRequest
-    tickets = {}
-    for _path in ("SafetyStream estop", "ControlStream fence", "edge estop"):
+    for _ in range(unserved):
         for b in bs:
             b.command_estop(b._robot_id)       # startPause, cancelOrder
-            tickets[b._robot_id] = b.stop_cancel(b._robot_id)
-    assert len(fc.inflight) == 25 * 11
-    assert not fc.queued, f"{len(fc.queued)} messages queued unsent behind the limit"
-    fc.release()
-    assert time.monotonic() - t0 < 2.0
+    stops: dict[str, list] = {b._robot_id: [] for b in bs}
+    for path in ("SafetyStream estop", "ControlStream fence", "edge estop",
+                 "ControlStream cancel", "lease expiry", "supersession"):
+        for b in bs:
+            before = len(fc.published)
+            if path.endswith(("estop", "fence")):
+                b.command_estop(b._robot_id)   # startPause, cancelOrder
+            else:
+                b.command_stop(b._robot_id)    # cancelOrder
+            stops[b._robot_id] += fc.published[before:]
+    return stops
+
+
+@pytest.mark.parametrize(("case", "ack_s", "unserved"), [
+    # One incident: 25 x 14 messages, all sent at once at the limit; the broker takes 1.2 s, so
+    # a message queued for one round, past a limit one short per vehicle, is acknowledged at
+    # 2.4 s, past the stop's 2 s.
+    ("one incident", 1.2, 0),
+    # The same with 3 stops for an unserved robot id on top (150 more messages, unbounded by
+    # the factor, so some queue): with a broker that takes 0.5 s, every stop still makes it.
+    ("one incident and an unserved-id burst", 0.5, 3),
+])
+def test_a_namespace_stop_of_25_vehicles_is_acknowledged_within_2_s(timed_paho, case, ack_s,
+                                                                    unserved) -> None:
+    """Every vehicle's stop and cancelOrder is acknowledged within 2 s of the stop."""
+    timed_paho.ack_s = ack_s
+    _shared, bs, fc = _fleet(25)
+    with fc.lock:  # the whole incident at once, as one burst
+        stops = _incident(bs, unserved)
+        assert len(fc.published) == 25 * (_WORK + 2 * unserved + _STOPS)
+        assert len(fc.inflight) == min(len(fc.published), fc.max_inflight)
+    deadline = time.monotonic() + 2.5
+    while time.monotonic() < deadline:
+        with fc.lock:
+            if all(i.acked_at is not None for msgs in stops.values() for i in msgs):
+                break
+        time.sleep(0.02)
+    with fc.lock:
+        late = {rid: [round((i.acked_at or float("inf")) - i.published_at, 2) for i in msgs
+                      if i.acked_at is None or i.acked_at - i.published_at > 2.0]
+                for rid, msgs in stops.items()}
+        worst = max((i.acked_at - i.published_at for msgs in stops.values() for i in msgs
+                     if i.acked_at is not None), default=float("nan"))
+    print(f"{case}: limit {fc.max_inflight}, worst stop acknowledged after {worst:.2f} s")
+    late = {rid: v for rid, v in late.items() if v}
+    assert not late, f"{len(late)} vehicles' stops not acknowledged within 2 s: {late}"
     for b in bs:
-        assert Vda5050Binding.cancel_accepted(tickets[b._robot_id]), b._robot_id
-        assert fc.sent.count(b._topics.instant_actions) == 1 + 1 + 1 + 1 + 6, b._robot_id
+        assert len(stops[b._robot_id]) == _STOPS
 
 
 @pytest.mark.parametrize("when", ["first connect", "reconnect"])
