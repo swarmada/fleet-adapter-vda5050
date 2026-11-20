@@ -44,6 +44,7 @@ from swarmada_sdk.safety import (
 from fleet_adapter_vda5050 import __version__
 from fleet_adapter_vda5050 import task as task_map
 from fleet_adapter_vda5050.latch import StopLatch
+from fleet_adapter_vda5050.process import FleetProcess
 from fleet_adapter_vda5050.retained import Outcome, RetainedOutcomes
 from fleet_adapter_vda5050.robot import SimulatedRobot
 
@@ -234,6 +235,9 @@ class fleet_adapter_vda5050Adapter:
     def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None,
                  namespace: str = "", streams: _Streams | None = None) -> None:
         self._streams = streams if streams is not None else _Streams(dial, namespace)
+        # The process this vehicle is served by (FleetProcess sets it). A vehicle built without
+        # streams is a process of one, built at the end of __init__.
+        self._process: FleetProcess | None = None
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
@@ -306,6 +310,8 @@ class fleet_adapter_vda5050Adapter:
         self._transport_was_live = True
         self._clock = time.monotonic
         self._last_tick: float | None = None
+        if streams is None:
+            FleetProcess([self])
 
     # ── ControlStream ────────────────────────────────────────────────────────
 
@@ -357,6 +363,13 @@ class fleet_adapter_vda5050Adapter:
             self._robot.spawn(self._robot_id)
 
     def run_control_stream(self, stub) -> None:
+        """Run the process this vehicle is served by: bring every vehicle up, then the
+        ControlStream."""
+        self._process.run_control_stream(stub)
+
+    def _run_control_stream(self, stub) -> None:
+        """The ControlStream loop, run by the process's first vehicle; every message goes to
+        the process (_handle_control_plane)."""
         self.bring_up_robot()
         # The edge loop blocks until an endpoint is advertised (C8), so starting it
         # now is safe; it stays idle for zones with no edge node.
@@ -452,71 +465,66 @@ class fleet_adapter_vda5050Adapter:
         self._shutdown.set()
 
     def _new_session(self) -> None:
-        """A ControlStream session opens: nothing is registered on it yet."""
-        self._session += 1
-        self._registered = False
-        self._latch.new_control_stream(self._robot_id)
+        """A ControlStream session opens: nothing is registered on it yet, for any vehicle."""
+        self._process.new_session()
 
     def _handle_control_plane(self, cp, stub) -> None:
-        pb = self._pb
-        kind = cp.WhichOneof("payload")
-        if kind == "hello_ack":
-            if not cp.hello_ack.accepted:
-                raise RuntimeError(f"handshake rejected: {cp.hello_ack.message}")
-            self._negotiated = cp.hello_ack.negotiated_contract_version
-            self._outbox.put(pb.AdapterMessage(  # C2.1: register
-                register=pb.RegisterRobot(robot_id=self._robot_id)))
-            # A fresh ControlStream: the next payload must be a full snapshot (C6.1).
-            self._snapshot_pending = True
-            if not self._telemetry_started:  # C6: stream telemetry once registered
-                self._telemetry_started = True
-                threading.Thread(target=self._telemetry_loop, args=(stub,), daemon=True).start()
-        elif kind == "register_ack":
-            ack = cp.register_ack
-            if not ack.accepted:
-                self._on_register_refused(ack)
-                return
-            self._registered = True
-            self._registered_outbox = self._outbox
-            # Registered: the catalog, and any hardware manifest (C12.2), and a full snapshot
-            # next (C6.1). Sent here rather than at the hello, because a robot admitted through
-            # the provisioning loop had no Robot when the hello came, and what was sent for it
-            # then was not kept.
-            self._send_capabilities_snapshot()
-            self._snapshot_pending = True
-            for e in cp.register_ack.edge_endpoints:  # C8.1: dial each advertised edge node
-                self._edge_addr.put(e.address)
-            # C2.3 — adopt the per-robot cadence the control plane returned. Only a
-            # POSITIVE value is a cadence: 0 means "not specified" and a negative value
-            # is malformed — clamping that to the 1s minimum would let a buggy control
-            # plane force the fastest permitted rate. Legitimate values are clamped to
-            # the protocol's 1-30s range.
-            secs = cp.register_ack.telemetry_interval_seconds
-            if secs > 0:
-                self._telemetry_interval = max(1.0, min(30.0, float(secs)))
-            # The one line that says the robot is now under management on this session: until
-            # it, work for the robot is refused here (C13.2) and the control plane cannot push it.
-            print(f"REGISTERED robot={self._robot_id}; under management on this session "
-                  f"(contract {self._negotiated or 'not negotiated'}, telemetry every "
-                  f"{self._telemetry_interval:g} s)", file=sys.stderr, flush=True)
-            self._reconcile_action_state(cp.register_ack)
-            self._send_retained()
-        elif kind == "discover_ack":
-            # Announced. The robot is not under management until a register is accepted.
-            da = cp.discover_ack
-            if not da.accepted:
-                print(f"announce refused robot={self._robot_id}: {da.message}", file=sys.stderr)
-            self._discover_ttl = da.ttl_seconds
-            self._discover_acked.set()
-        elif kind == "outcome_ack":
-            oa = cp.outcome_ack
-            if self._retained.acknowledge(self._robot_id, oa.action_id, oa.fencing_token):
-                print(f"retained outcome acknowledged: action={oa.action_id}", file=sys.stderr)
-        elif kind == "heartbeat":
-            self._outbox.put(pb.AdapterMessage(
-                heartbeat=pb.HeartbeatResponse(robot_id=cp.heartbeat.robot_id)))
-        elif kind == "command":
-            self._handle_command(cp.command)
+        """A message on the ControlStream, for the process to route."""
+        self._process.handle_control_plane(cp, stub)
+
+    def _on_hello_ack(self, stub) -> None:
+        """The hello is accepted (the process has kept the contract version): register."""
+        self._process.send_register(self, self._outbox, self._session)  # C2.1
+        # A fresh ControlStream: the next payload must be a full snapshot (C6.1).
+        self._snapshot_pending = True
+        if not self._telemetry_started:  # C6: stream telemetry once registered
+            self._telemetry_started = True
+            threading.Thread(target=self._telemetry_loop, args=(stub,), daemon=True).start()
+
+    def _on_register_ack(self, ack) -> None:
+        """The RegisterAck that answers this vehicle's register."""
+        if not ack.accepted:
+            self._on_register_refused(ack)
+            return
+        self._registered = True
+        self._registered_outbox = self._outbox
+        # Registered: the catalog, and any hardware manifest (C12.2), and a full snapshot
+        # next (C6.1). Sent here rather than at the hello, because a robot admitted through
+        # the provisioning loop had no Robot when the hello came, and what was sent for it
+        # then was not kept.
+        self._send_capabilities_snapshot()
+        self._snapshot_pending = True
+        for e in ack.edge_endpoints:  # C8.1: dial each advertised edge node
+            self._edge_addr.put(e.address)
+        # C2.3 — adopt the per-robot cadence the control plane returned. Only a
+        # POSITIVE value is a cadence: 0 means "not specified" and a negative value
+        # is malformed — clamping that to the 1s minimum would let a buggy control
+        # plane force the fastest permitted rate. Legitimate values are clamped to
+        # the protocol's 1-30s range.
+        secs = ack.telemetry_interval_seconds
+        if secs > 0:
+            self._telemetry_interval = max(1.0, min(30.0, float(secs)))
+        # The one line that says the robot is now under management on this session: until
+        # it, work for the robot is refused here (C13.2) and the control plane cannot push it.
+        print(f"REGISTERED robot={self._robot_id}; under management on this session "
+              f"(contract {self._negotiated or 'not negotiated'}, telemetry every "
+              f"{self._telemetry_interval:g} s)", file=sys.stderr, flush=True)
+        self._reconcile_action_state(ack)
+        self._send_retained()
+
+    def _on_discover_ack(self, da) -> None:
+        """The DiscoverAck that answers this vehicle's announcement. The robot is not under
+        management until a register is accepted."""
+        if not da.accepted:
+            print(f"announce refused robot={self._robot_id}: {da.message}", file=sys.stderr)
+        self._discover_ttl = da.ttl_seconds
+        self._discover_acked.set()
+
+    def _on_outcome_ack(self, oa) -> None:
+        """An ActionOutcomeAck, offered to every vehicle: it clears only the outcome this
+        vehicle kept under that action id and fencing token."""
+        if self._retained.acknowledge(self._robot_id, oa.action_id, oa.fencing_token):
+            print(f"retained outcome acknowledged: action={oa.action_id}", file=sys.stderr)
 
     def _on_register_refused(self, ack) -> None:
         """A refused register (RFC-0001 #fleet-adapter-protocol-the-stop-latch, "A refused
@@ -540,8 +548,9 @@ class fleet_adapter_vda5050Adapter:
                   file=sys.stderr)
             return
         self._discover_acked.clear()
-        self._outbox.put(pb.AdapterMessage(discover=pb.DiscoverRobot(
-            robot_id=self._robot_id, hardware=self._capability_components())))
+        self._process.send_discover(self, self._outbox, self._session, pb.AdapterMessage(
+            discover=pb.DiscoverRobot(robot_id=self._robot_id,
+                                      hardware=self._capability_components())))
         threading.Thread(target=self._provisioning_iteration,
                          args=(self._session, self._outbox), daemon=True).start()
         print(f"NOT_ADMITTED robot={self._robot_id}; announced for operator admission (C2.1)",
@@ -557,10 +566,9 @@ class fleet_adapter_vda5050Adapter:
         self._discover_acked.wait(_DISCOVER_ACK_WAIT_S)
         if self._shutdown.wait(_provisioning_interval(self._discover_ttl)):
             return
-        if self._registered or session != self._session:
+        if self._registered:
             return
-        outbox.put(self._pb.AdapterMessage(
-            register=self._pb.RegisterRobot(robot_id=self._robot_id)))
+        self._process.send_register(self, outbox, session)  # nothing once the session is replaced
 
     def _handle_command(self, command) -> None:
         pb = self._pb
@@ -622,7 +630,7 @@ class fleet_adapter_vda5050Adapter:
     def _log_unserved(self, received: str, what: str, outcome: str) -> None:
         """Every message for a robot this adapter does not serve, at error level, naming both
         ids: an id mismatch with the control plane is loud, not silent."""
-        print(f"error: UNSERVED robot={self._robot_id!r} addressed={received!r} {what}: "
+        print(f"error: UNSERVED robot={self._process.served_text()} addressed={received!r} {what}: "
               f"{outcome}", file=sys.stderr, flush=True)
 
     def _refuse_unserved(self, command, which: str, result) -> None:
@@ -638,7 +646,7 @@ class fleet_adapter_vda5050Adapter:
         to reschedule; INVALID_ACTION would wrongly say the action could not be served."""
         pb = self._pb
         why = (f"robot_id {command.robot_id!r} is not served by this adapter, which serves "
-               f"{self._robot_id!r}; nothing was done")
+               f"{self._process.served_text()}; nothing was done")
         if which == "assign_action":
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
@@ -673,17 +681,23 @@ class fleet_adapter_vda5050Adapter:
         pb = self._pb
         ack = pb.EstopAck(estop_id=estop_id, state=pb.ESTOP_STATE_FAILED)
         why = (f"robot_id {received!r} is not served by this adapter, which serves "
-               f"{self._robot_id!r}")
-        if self._registered:
+               f"{self._process.served_text()}")
+        unregistered = self._process.unregistered()
+        if not unregistered:
             self._log_unserved(received, f"{via} id={estop_id}",
                                "answered FAILED; no stop was commanded")
             ack.message = f"{why}; no stop was commanded and none can be confirmed"
         else:
+            # Every vehicle with no accepted registration is stopped: any of them may be the
+            # one the stop was meant for, under an id this adapter doesn't know it by. Each is
+            # commanded before any is interrupted.
             ack.stop_initiated_at = _now_ms()
-            with self._robot_lock:
-                self._command_estop()  # its token is not needed: this stop is not confirmed
-            self._interrupt_current("emergency stop under a robot_id this adapter does not serve",
-                                    command_stop=False)
+            for c in unregistered:
+                with c._robot_lock:
+                    c._command_estop()  # its token is not needed: this stop is not confirmed
+            for c in unregistered:
+                c._interrupt_current("emergency stop under a robot_id this adapter does not "
+                                     "serve", command_stop=False)
             self._log_unserved(received, f"{via} id={estop_id}",
                                "answered FAILED; no accepted registration; vehicle stopped")
             ack.message = (f"{why}; no registration is accepted on this session, so this "
@@ -1772,14 +1786,14 @@ class fleet_adapter_vda5050Adapter:
                     yield msg
 
             self._safety_outbox = outbox
-            self._report_latch()
+            self._process.on_safety_stream_open()
             try:
                 with self._superseded_lock:  # as the ControlStream's: no dial after one
                     if self._superseded.is_set():
                         return
                     stream = stub.SafetyStream(requests())
                 for cp in stream:
-                    self._on_safety_message(cp)
+                    self._process.handle_safety(cp)
             except grpc.RpcError as exc:
                 if self._shutdown.is_set():
                     return
