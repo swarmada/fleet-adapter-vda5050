@@ -1916,9 +1916,16 @@ class fleet_adapter_vda5050Adapter:
         if kind == "estop":
             if _at_least_14(self._negotiated):
                 self._latch.on_estop(self._robot_id, cp.estop.estop_id)
-            self._stop_and_ack(cp.estop.estop_id, self._safety_outbox.put)
+            self._stop_and_ack(cp.estop.estop_id, self._send_safety)
         elif kind == "estop_clear":
             self._on_clear(cp.estop_clear)
+
+    def _send_safety(self, msg) -> None:
+        """Put ``msg`` on the SafetyStream open now. A stop is answered from its lane once its
+        wait ends, up to 2 s after it arrived, and the SafetyStream may have dropped and reopened
+        meanwhile: an answer bound to the outbox of the stream it came on would go to a stream
+        that has ended, and the stream open now would only ever have reported it STOPPING."""
+        self._safety_outbox.put(msg)
 
     def _stop_and_ack(self, estop_id: str, send) -> None:
         """A stop, in two halves. The first runs here, on the reader that received it: the
@@ -1985,7 +1992,7 @@ class fleet_adapter_vda5050Adapter:
         that came first takes effect with it."""
         stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
         if stop:
-            self._stop_and_ack(estop_id, self._safety_outbox.put)
+            self._stop_and_ack(estop_id, self._send_safety)
         if lifted:
             # After the stop's own answer, which may still be waiting on the lane: the stop is
             # answered before its clear.
