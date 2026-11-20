@@ -7,7 +7,10 @@ A stop is commanded on the reader and answered from the vehicle's lane once rest
 up to 2 s later. A clear for that stop can arrive on the SafetyStream meanwhile. Its
 EstopClearAck, and the local report a clear that ends the local set brings, must come after the
 stop's final EstopAck (STOPPED or FAILED), in that order, whichever stream the stop came on and
-whether the clear came before or after its fence."""
+whether the clear came before or after its fence.
+
+Its lifted_at_ms is the time the latch lifted the stop, not the time the ack was sent; an ack
+sent again for an ID lifted earlier carries the time it is sent."""
 
 from __future__ import annotations
 
@@ -155,3 +158,49 @@ def test_a_stop_is_answered_before_its_clear(adapter, case) -> None:
     final = [m.estop_ack.state for m in s.sent if m.WhichOneof("payload") == "estop_ack"
              and m.estop_ack.estop_id == "e1" and m.estop_ack.state != pb.ESTOP_STATE_STOPPING]
     assert set(final) == {pb.ESTOP_STATE_FAILED if "never" in case else pb.ESTOP_STATE_STOPPED}
+
+
+def _clear_acks(stream, estop_id: str, start: int) -> list:
+    return [m.estop_clear_ack for m in list(stream.sent)[start:]
+            if m.WhichOneof("payload") == "estop_clear_ack"
+            and m.estop_clear_ack.estop_id == estop_id]
+
+
+@pytest.mark.parametrize("path", ["fence, clear", "clear, fence"])
+def test_a_clear_ack_carries_the_time_the_latch_lifted(adapter, path) -> None:
+    """The latch lifts when the clear arrives (its fence already in) or when the fence arrives
+    (its clear kept until then); the ack goes about 0.8 s later, after the stop's answer, and
+    carries the lift's time. An ack sent again carries the time it is sent."""
+    a, b, stub = adapter, adapter._robot, adapter.stub
+    threading.Thread(target=a.run_safety_stream, args=(stub,), daemon=True).start()
+    _until(lambda: len(stub.streams) == 1)
+    s = stub.streams[0]
+    _until(lambda: any(m.WhichOneof("payload") == "local_stop" for m in list(s.sent)))
+    time.sleep(0.1)  # the opening report is all sent
+    start = len(s.sent)
+    clear = pb.EstopClear(estop_id="e1", leader_term=1)
+    if path == "fence, clear":
+        b.rest_at = time.monotonic() + 1.6
+        _fence(a, "e1")
+        time.sleep(0.8)  # into the stop's wait
+        lifted_ms = time.time() * 1000
+        _safety(s, estop_clear=clear)
+    else:
+        _safety(s, estop_clear=clear)
+        _until(lambda: "e1" in a._latch._r(ROBOT).pending)
+        b.rest_at = time.monotonic() + 0.8
+        lifted_ms = time.time() * 1000
+        _fence(a, "e1")
+    _until(lambda: _clear_acks(s, "e1", start), timeout=4)
+    seen_ms = time.time() * 1000
+    assert seen_ms - lifted_ms >= 500  # the ack really went late, after the stop's wait
+    assert s.events("e1", start) == ["final", "clear"]  # and after the stop's answer
+    first = _clear_acks(s, "e1", start)[0]
+    assert abs(first.lifted_at_ms - lifted_ms) <= 100, first.lifted_at_ms - lifted_ms
+
+    time.sleep(0.3)
+    resent_ms = time.time() * 1000
+    _safety(s, estop_clear=clear)  # the same clear again: lifted already
+    _until(lambda: len(_clear_acks(s, "e1", start)) == 2)
+    again = _clear_acks(s, "e1", start)[1]
+    assert abs(again.lifted_at_ms - resent_ms) <= 100, again.lifted_at_ms - resent_ms

@@ -101,9 +101,9 @@ class StopLatch:
 
     def on_clear(self, robot_id: str, estop_id: str, leader_term: int,
                  ends_local_set: str = "") -> str:
-        """An EstopClear: "stale" (below the highest term: lifts nothing, not answered), "ack"
-        (lifted now, or already: answer EstopClearAck) or "pending" (its fence has not
-        arrived: kept)."""
+        """An EstopClear: "stale" (below the highest term: lifts nothing, not answered),
+        "lifted" (lifted now: answer EstopClearAck), "ack" (lifted already: answer it again)
+        or "pending" (its fence has not arrived: kept)."""
         with self._lock:
             r = self._r(robot_id)
             if 0 < leader_term < r.highest_term:
@@ -113,7 +113,7 @@ class StopLatch:
                 verdict = "ack"
             elif estop_id in r.fenced:
                 self._lift(r, estop_id)
-                verdict = "ack"
+                verdict = "lifted"
             else:
                 r.pending.add(estop_id)
                 return "pending"
