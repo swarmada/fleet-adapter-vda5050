@@ -1443,13 +1443,19 @@ class fleet_adapter_vda5050Adapter:
             return None
         return EstopToken(self._robot_id, seq, id(self._robot))
 
-    def _await_estop(self, since: EstopToken | None) -> str:
+    def _await_estop(self, since: EstopToken | None, deadline: float | None = None) -> str:
         """Wait for confirmed rest after `_command_estop`, given the token it returned:
         STOPPED, or FAILED. The caller does not hold the robot lock. It is taken for each look
         and released between looks, as `_confirm_stop` does, so a command for this vehicle
         waits for one look at most, never for the stop's whole budget. Each look is the SDK's
         own check (`await_estop_confirmation`, one tick, against the same token); the budget
-        is the SDK's default, _STOP_CONFIRM_TICKS looks _STOP_CONFIRM_TICK_S apart."""
+        is the SDK's default, _STOP_CONFIRM_TICKS looks _STOP_CONFIRM_TICK_S apart.
+
+        ``deadline`` (``time.monotonic()``) also ends the wait, after one look at least: a stop
+        on a lane is awaited until its own arrival plus the budget (_begin_stop), not for a full
+        budget from when its turn comes, so a stop queued behind another stop's wait is still
+        answered within its budget of arriving. The look after the deadline is still made: an
+        answer is FAILED only once rest has been looked for and not found."""
         if since is None:
             # Read once, after the stop, as the SDK reads it on entry. Read again at every look,
             # a count would almost never be passed within the look.
@@ -1467,6 +1473,8 @@ class fleet_adapter_vda5050Adapter:
                     return ESTOP_FAILED
             if state == ESTOP_STOPPED:
                 return state
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
         return ESTOP_FAILED
 
@@ -1944,8 +1952,11 @@ class fleet_adapter_vda5050Adapter:
 
     def _begin_stop(self, estop_id: str, send):
         """The stop's first half (_stop_and_ack). Returns the second half, for the lane, or
-        None when the first half faulted and the stop is already answered FAILED."""
+        None when the first half faulted and the stop is already answered FAILED. The stop's
+        deadline is set here, on arrival: its wait ends then, however long it waited on the
+        lane behind the stops before it (_await_estop)."""
         initiated_ms = _now_ms()
+        deadline = time.monotonic() + _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
         counted = False
         try:
             with self._robot_lock:
@@ -1958,13 +1969,15 @@ class fleet_adapter_vda5050Adapter:
                   f"{exc!r}; answered FAILED", file=sys.stderr, flush=True)
             self._answer_stop(estop_id, initiated_ms, ESTOP_FAILED, send, counted)
             return None
-        return lambda: self._finish_stop(estop_id, initiated_ms, since, send)
+        return lambda: self._finish_stop(estop_id, initiated_ms, since, send, deadline)
 
-    def _finish_stop(self, estop_id: str, initiated_ms: int, since, send) -> None:
-        """The stop's second half, on the lane: rest confirmed, never inferred (C5), then the
-        answer."""
+    def _finish_stop(self, estop_id: str, initiated_ms: int, since, send,
+                     deadline: float) -> None:
+        """The stop's second half, on the lane: rest confirmed, never inferred (C5), by the
+        stop's own deadline, then the answer. The lane runs stops in the order they arrived, so
+        they are answered in that order."""
         try:
-            state = self._await_estop(since)
+            state = self._await_estop(since, deadline)
         except Exception as exc:  # noqa: BLE001 - a stop is answered, never left silent
             print(f"error: estop id={estop_id} for {self._robot_id!r}: its wait raised {exc!r}; "
                   f"answered FAILED", file=sys.stderr, flush=True)
