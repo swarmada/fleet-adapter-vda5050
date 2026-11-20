@@ -167,7 +167,7 @@ def test_a_command_reaches_only_the_vehicle_it_names() -> None:
 
 def test_an_estop_stops_only_the_vehicle_it_names(monkeypatch) -> None:
     monkeypatch.setattr(adapter_mod, "await_estop_confirmation",
-                        lambda robot, rid, since=None: ESTOP_STOPPED)
+                        lambda robot, rid, since=None, **_: ESTOP_STOPPED)
     p = _registered_fleet()
     p.handle_safety(pb.ControlPlaneSafetyMessage(robot_id="amr-3", estop=pb.Estop(estop_id="e1")))
     assert [_wire(c) for c in p.cores] == [[], [], ["startPause", "cancelOrder"]]
@@ -178,7 +178,7 @@ def test_an_estop_stops_only_the_vehicle_it_names(monkeypatch) -> None:
 
 def test_a_fence_stops_only_the_vehicle_it_names(monkeypatch) -> None:
     monkeypatch.setattr(adapter_mod, "await_estop_confirmation",
-                        lambda robot, rid, since=None: ESTOP_STOPPED)
+                        lambda robot, rid, since=None, **_: ESTOP_STOPPED)
     p = _registered_fleet()
     p.handle_control_plane(pb.ControlPlaneMessage(command=pb.Command(
         command_id=1, robot_id="amr-1", leader_term=1, estop=pb.Estop(estop_id="e1"))), None)

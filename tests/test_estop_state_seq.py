@@ -238,12 +238,14 @@ def test_the_adapter_passes_the_count_read_after_the_stop_was_sent(monkeypatch) 
     b.command_estop = command_estop
     got = {}
 
-    def wait(robot, rid, since=None):
+    def wait(robot, rid, since=None, **_):
         got["since"] = since
         return ESTOP_FAILED
 
     monkeypatch.setattr(adapter_mod, "await_estop_confirmation", wait)
-    Adapter(None, None, b, ROBOT)._confirm_estop()
+    a = Adapter(None, None, b, ROBOT)
+    a._stop_confirm_sleep = lambda _s: None
+    a._confirm_estop()
     assert got["since"] == EstopToken(ROBOT, 2, id(b))
 
 

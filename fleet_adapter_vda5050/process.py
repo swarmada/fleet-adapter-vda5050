@@ -15,6 +15,8 @@ routes what arrives:
   discover) still unanswered on the session, so every register and discover is sent through
   :meth:`send_register` and :meth:`send_discover`, which record the order. A new session starts
   with none unanswered.
+* **A stop** is commanded on the reader that received it, and waits for rest on its
+  vehicle's lane (``_Lane``), so one vehicle's wait never holds another's stop.
 * **An ActionOutcomeAck** is offered to every core. ``RetainedOutcomes.acknowledge`` matches the
   action id and the fencing token, so only the core that kept the outcome clears it.
 
@@ -151,12 +153,19 @@ class FleetProcess:
     def run_control_stream(self, stub) -> None:
         """Bring every vehicle up, then run the ControlStream. The first core runs the stream
         loop, as a lone vehicle always has; it hands every message here."""
+        self.start_lanes()
         for c in self.cores[1:]:
             c.bring_up_robot()
             threading.Thread(target=c._edge_loop, daemon=True).start()
         self._first._run_control_stream(stub)
 
     # ── the SafetyStream ─────────────────────────────────────────────────────
+
+    def start_lanes(self) -> None:
+        """Each vehicle's lane gets its thread: from now on a stop's wait and its answer run
+        there, and the reader that received the stop goes on at once."""
+        for c in self.cores:
+            c._lane.start()
 
     def run_safety_stream(self, stub) -> None:
         """The one SafetyStream, run by the first vehicle as a lone vehicle always has; every

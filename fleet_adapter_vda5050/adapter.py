@@ -217,6 +217,54 @@ class _Shared:
         setattr(obj._streams, self._key, value)
 
 
+def _no_wait(_seconds: float) -> None:
+    """The SDK's sleep for one look at a stop: the wait between looks is the adapter's own,
+    taken with the robot lock released (_await_estop)."""
+
+
+class _Lane:
+    """One vehicle's worker. The part of a stop that waits (rest confirmed, then the answer)
+    runs here, in the order the stops arrived, so the stream reader that began the stop goes on
+    to the next message at once: with fifty vehicles on one SafetyStream, the fiftieth estop is
+    commanded when it arrives, not after the waits of the forty-nine before it. Until the
+    process starts it, a job runs in its caller, as every stop did before lanes."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._jobs: queue.Queue | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._jobs is not None:
+                return
+            self._jobs = queue.Queue()
+            threading.Thread(target=self._run, args=(self._jobs,), name=f"lane-{self._name}",
+                             daemon=True).start()
+
+    def submit(self, job) -> None:
+        jobs = self._jobs
+        if jobs is None:
+            job()
+        else:
+            jobs.put(job)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until every job submitted so far has run. True if they all did in time."""
+        done = threading.Event()
+        self.submit(done.set)
+        return done.wait(timeout)
+
+    def _run(self, jobs: queue.Queue) -> None:
+        while True:
+            job = jobs.get()
+            try:
+                job()
+            except Exception as exc:  # noqa: BLE001 - one job's fault must not end the lane
+                print(f"error: vehicle {self._name}: a job on its lane raised {exc!r}",
+                      file=sys.stderr, flush=True)
+
+
 class fleet_adapter_vda5050Adapter:
     """One vehicle: its binding, its action, fence, lease, latch and retained outcome, and the
     logic that serves it. The streams it is served on are a _Streams, its own unless one is
@@ -256,6 +304,10 @@ class fleet_adapter_vda5050Adapter:
         # a resume already past its checks re-reads this under _robot_lock and gives up rather
         # than send an order or a stopPause after the stop.
         self._estop_epoch = 0
+        # The stops commanded and not yet answered, under _robot_lock: counted with the command,
+        # uncounted once the answer is sent. While any is in flight, no work is taken and no
+        # pause is lifted, at every contract version (_on_assign, _on_resume).
+        self._stops_in_flight = 0
         # Set once a stream is closed as superseded by another process under this adapter
         # identity (_on_superseded): the vehicle is stopped, no work is held or taken, and no
         # stream is opened again.
@@ -263,6 +315,8 @@ class fleet_adapter_vda5050Adapter:
         self._superseded_lock = threading.Lock()
         self._superseded_why = ""
         self._robot_id = robot_id
+        # Where this vehicle's stops wait for rest and are answered (_stop_and_ack).
+        self._lane = _Lane(robot_id)
         self._fence = FenceGuard()                              # C3
         self._lease = LeaseMonitor(on_expiry=self._self_stop)   # C4
         self._current_action = ""
@@ -731,12 +785,13 @@ class fleet_adapter_vda5050Adapter:
         if self._superseded.is_set():
             result.resume.CopyFrom(pb.ResumeResult(resumed=False, message=self._superseded_why))
             return
-        if self._latch.refuses_work(self._robot_id):
+        if self._latch.refuses_work(self._robot_id) or self._stops_in_flight:
             result.resume.CopyFrom(pb.ResumeResult(resumed=False, message="under a stop"))
             return
         with self._robot_lock:
             # Again where it counts: a stop commanded since the check above must not be lifted.
-            if self._estop_epoch != epoch or self._latch.refuses_work(self._robot_id):
+            if (self._estop_epoch != epoch or self._stops_in_flight
+                    or self._latch.refuses_work(self._robot_id)):
                 result.resume.CopyFrom(pb.ResumeResult(resumed=False, message="under a stop"))
                 return
             self._robot.command_resume(self._robot_id)
@@ -765,6 +820,14 @@ class fleet_adapter_vda5050Adapter:
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
                 message="under a stop: " + (", ".join(ids) if ids else "local latch")))
             self._report_latch()
+            return
+        if self._stops_in_flight:
+            # A stop is commanded and not yet answered: refused whatever the fencing token, at
+            # every contract version. Below 1.4.0 nothing else would refuse it, and an order
+            # taken now would follow the stop and drive on.
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
+                message="under a stop: in flight"))
             return
         unavailable = self._unavailable()
         if (unavailable and task.HasField("fencing_token")
@@ -833,7 +896,7 @@ class fleet_adapter_vda5050Adapter:
                 message=refusal))
             return
         with self._robot_lock:
-            if self._estop_epoch != epoch:
+            if self._estop_epoch != epoch or self._stops_in_flight:
                 # An emergency stop was commanded while this assignment was being checked. The
                 # vehicle is paused and its order cancelled; an order now would follow the
                 # stop (and, after an estop, lift the pause). Refused: the robot never took it.
@@ -1381,14 +1444,42 @@ class fleet_adapter_vda5050Adapter:
 
     def _await_estop(self, since: EstopToken | None) -> str:
         """Wait for confirmed rest after `_command_estop`, given the token it returned:
-        STOPPED, or FAILED. The caller holds the robot lock."""
+        STOPPED, or FAILED. The caller does not hold the robot lock. It is taken for each look
+        and released between looks, as `_confirm_stop` does, so a command for this vehicle
+        waits for one look at most, never for the stop's whole budget. Each look is the SDK's
+        own check (`await_estop_confirmation`, one tick, against the same token); the budget
+        is the SDK's default, _STOP_CONFIRM_TICKS looks _STOP_CONFIRM_TICK_S apart."""
+        if since is None:
+            # Read once, after the stop, as the SDK reads it on entry. Read again at every look,
+            # a count would almost never be passed within the look.
+            with self._robot_lock:
+                since = self._estop_token_now()
+        for _ in range(_STOP_CONFIRM_TICKS):
+            with self._robot_lock:
+                try:
+                    state = await_estop_confirmation(self._robot, self._robot_id, since=since,
+                                                     max_ticks=1, sleep=_no_wait)
+                except RuntimeError as exc:
+                    print(f"estop could not be confirmed - the robot binding's transport is "
+                          f"not live, so rest cannot be read from the robot and C5.3 forbids "
+                          f"inferring it: {exc}", file=sys.stderr)
+                    return ESTOP_FAILED
+            if state == ESTOP_STOPPED:
+                return state
+            self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
+        return ESTOP_FAILED
+
+    def _estop_token_now(self) -> EstopToken | None:
+        """The token for a stop already sent: the binding's count now. None when the binding
+        has no count or it can't be read as an int (the SDK then reads it, and answers)."""
+        state_seq = getattr(self._robot, "state_seq", None)
+        if not callable(state_seq):
+            return None
         try:
-            return await_estop_confirmation(self._robot, self._robot_id, since=since)
-        except RuntimeError as exc:
-            print(f"estop could not be confirmed - the robot binding's transport is not "
-                  f"live, so rest cannot be read from the robot and C5.3 forbids "
-                  f"inferring it: {exc}", file=sys.stderr)
-            return ESTOP_FAILED
+            seq = state_seq(self._robot_id)
+        except Exception:  # noqa: BLE001 - the SDK reads it again, and its error is the answer
+            return None
+        return EstopToken(self._robot_id, seq, id(self._robot)) if type(seq) is int else None
 
     def _on_superseded(self, stream: str, exc) -> None:
         """A stream closed as superseded by another process under this adapter identity
@@ -1738,11 +1829,18 @@ class fleet_adapter_vda5050Adapter:
         # reporting STOPPED with nothing attesting a hardware stop is exactly the
         # "inferred, not confirmed" case the estop protocol forbids.
         initiated_ms = int(time.time() * 1000)
-        with self._robot_lock:
-            since = self._command_estop()
-        self._interrupt_current("estop drill (scenario)", command_stop=False)  # like a real estop
-        with self._robot_lock:
+        counted = False
+        try:
+            with self._robot_lock:
+                self._stops_in_flight += 1
+                counted = True
+                since = self._command_estop()
+            self._interrupt_current("estop drill (scenario)", command_stop=False)  # as an estop
             state = self._await_estop(since)  # C5 discipline: never faked
+        finally:
+            if counted:
+                with self._robot_lock:
+                    self._stops_in_flight -= 1
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id, estop_ack=pb.EstopAck(
                 estop_id=f"drill-{self._robot_id}",
@@ -1775,6 +1873,7 @@ class fleet_adapter_vda5050Adapter:
     def run_safety_stream(self, stub) -> None:
         """One SafetyStream at a time, re-opened when it drops. Each that opens is told what
         is latched first (contract 1.4.0)."""
+        self._process.start_lanes()
         while not self._shutdown.is_set():
             outbox: queue.Queue = queue.Queue()  # fresh per stream, as the ControlStream's
 
@@ -1826,25 +1925,57 @@ class fleet_adapter_vda5050Adapter:
             self._on_clear(cp.estop_clear)
 
     def _stop_and_ack(self, estop_id: str, send) -> None:
-        """Interrupt the work held, command the stop and answer it: STOPPED only once rest is
-        confirmed, else FAILED. Stamped around the hardware stop so the ack carries evidence
-        the stop was commanded, not merely asserted (C5.3)."""
-        pb = self._pb
-        # The stop first: the vehicle is halted before anything is recorded or reported. Then
-        # the work it held is interrupted, and then rest is confirmed.
+        """A stop, in two halves. The first runs here, on the reader that received it: the
+        stop is counted in flight and commanded, so the vehicle is halted before anything is
+        recorded or reported, and then the work it held is interrupted. The second runs on the
+        vehicle's lane (_finish_stop): rest is awaited, the stop is answered STOPPED only once
+        rest is confirmed, else FAILED, and then it is uncounted. ``stop_initiated_at`` is
+        stamped around the hardware stop, so the ack carries evidence the stop was commanded,
+        not merely asserted (C5.3).
+
+        A fault in the first half is answered FAILED at once, and the stop uncounted once: the
+        reader goes on to the next message, which may be another vehicle's stop."""
         initiated_ms = _now_ms()
-        with self._robot_lock:
-            since = self._command_estop()
-        self._interrupt_current("emergency stop", command_stop=False)
-        with self._robot_lock:
-            state = self._await_estop(since)  # C5: confirmed, never inferred
-        stopped = state == ESTOP_STOPPED
-        self._latch.record_state(self._robot_id, estop_id, "STOPPED" if stopped else "FAILED")
-        ack = pb.EstopAck(estop_id=estop_id, stop_initiated_at=initiated_ms,
-                          state=pb.ESTOP_STATE_STOPPED if stopped else pb.ESTOP_STATE_FAILED)
-        if stopped:
-            ack.confirmed_at_ms = _now_ms()
-        send(pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack))
+        counted = False
+        try:
+            with self._robot_lock:
+                self._stops_in_flight += 1
+                counted = True
+                since = self._command_estop()
+            self._interrupt_current("emergency stop", command_stop=False)
+        except Exception as exc:  # noqa: BLE001 - a stop is answered, never left silent
+            print(f"error: estop id={estop_id} for {self._robot_id!r} faulted before its wait: "
+                  f"{exc!r}; answered FAILED", file=sys.stderr, flush=True)
+            self._answer_stop(estop_id, initiated_ms, ESTOP_FAILED, send, counted)
+            return
+        self._lane.submit(lambda: self._finish_stop(estop_id, initiated_ms, since, send))
+
+    def _finish_stop(self, estop_id: str, initiated_ms: int, since, send) -> None:
+        """The stop's second half, on the lane: rest confirmed, never inferred (C5), then the
+        answer."""
+        try:
+            state = self._await_estop(since)
+        except Exception as exc:  # noqa: BLE001 - a stop is answered, never left silent
+            print(f"error: estop id={estop_id} for {self._robot_id!r}: its wait raised {exc!r}; "
+                  f"answered FAILED", file=sys.stderr, flush=True)
+            state = ESTOP_FAILED
+        self._answer_stop(estop_id, initiated_ms, state, send, True)
+
+    def _answer_stop(self, estop_id: str, initiated_ms: int, state: str, send,
+                     counted: bool) -> None:
+        pb = self._pb
+        try:
+            stopped = state == ESTOP_STOPPED
+            self._latch.record_state(self._robot_id, estop_id, "STOPPED" if stopped else "FAILED")
+            ack = pb.EstopAck(estop_id=estop_id, stop_initiated_at=initiated_ms,
+                              state=pb.ESTOP_STATE_STOPPED if stopped else pb.ESTOP_STATE_FAILED)
+            if stopped:
+                ack.confirmed_at_ms = _now_ms()
+            send(pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack))
+        finally:
+            if counted:
+                with self._robot_lock:
+                    self._stops_in_flight -= 1
 
     def _on_fence(self, estop_id: str) -> None:
         """The fence (Command.estop) on the current ControlStream: a stop, latched; a clear
@@ -1853,7 +1984,9 @@ class fleet_adapter_vda5050Adapter:
         if stop:
             self._stop_and_ack(estop_id, self._safety_outbox.put)
         if lifted:
-            self._send_clear_ack(estop_id)
+            # After the stop's own answer, which may still be waiting on the lane: the stop is
+            # answered before its clear.
+            self._lane.submit(lambda: self._send_clear_ack(estop_id))
 
     def _on_clear(self, clear) -> None:
         verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
