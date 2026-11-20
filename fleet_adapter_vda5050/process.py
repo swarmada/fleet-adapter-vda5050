@@ -133,8 +133,18 @@ class FleetProcess:
             for c in self.cores:
                 c._on_outcome_ack(cp.outcome_ack)
         elif kind == "heartbeat":
+            rid = cp.heartbeat.robot_id
+            if rid and self.core_for(rid) is None:
+                # A per-robot heartbeat asks "is robot_id alive?", and the control plane takes
+                # any reply naming the robot as yes: it's the exchange that decides whether a
+                # robot is declared Offline. This adapter can't vouch for a robot it doesn't
+                # serve, so it doesn't answer, and the exchange times out. An empty id is the
+                # adapter-scoped question, and is answered.
+                self._first._log_unserved(rid, "heartbeat",
+                                          "not answered: this adapter can't say that robot is alive")
+                return
             self._streams.outbox.put(self._pb.AdapterMessage(
-                heartbeat=self._pb.HeartbeatResponse(robot_id=cp.heartbeat.robot_id)))
+                heartbeat=self._pb.HeartbeatResponse(robot_id=rid)))
         elif kind == "command":
             (self.core_for(cp.command.robot_id) or self._first)._handle_command(cp.command)
 
