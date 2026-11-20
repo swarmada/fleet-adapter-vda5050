@@ -199,6 +199,12 @@ class _Streams:
         self.session = 0
         self.reconnect_pending = False
         self.active_call = None
+        # Set once one of these streams is closed as superseded by another process under this
+        # adapter identity (_on_superseded): every vehicle is stopped, no work is held or taken
+        # for any of them, and no stream is opened again. Of the streams, so of every vehicle.
+        self.superseded = threading.Event()
+        self.superseded_lock = threading.Lock()
+        self.superseded_why = ""
 
 
 class _Shared:
@@ -279,6 +285,9 @@ class fleet_adapter_vda5050Adapter:
     _session = _Shared()
     _reconnect_pending = _Shared()
     _active_call = _Shared()
+    _superseded = _Shared()
+    _superseded_lock = _Shared()
+    _superseded_why = _Shared()
 
     def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None,
                  namespace: str = "", streams: _Streams | None = None) -> None:
@@ -308,12 +317,8 @@ class fleet_adapter_vda5050Adapter:
         # uncounted once the answer is sent. While any is in flight, no work is taken and no
         # pause is lifted, at every contract version (_on_assign, _on_resume).
         self._stops_in_flight = 0
-        # Set once a stream is closed as superseded by another process under this adapter
-        # identity (_on_superseded): the vehicle is stopped, no work is held or taken, and no
-        # stream is opened again.
-        self._superseded = threading.Event()
-        self._superseded_lock = threading.Lock()
-        self._superseded_why = ""
+        # Whether the streams were superseded (_on_superseded) is the streams' own
+        # (_Streams.superseded): every vehicle served on them reads it.
         self._robot_id = robot_id
         # Where this vehicle's stops wait for rest and are answered (_stop_and_ack).
         self._lane = _Lane(robot_id)
@@ -1480,20 +1485,23 @@ class fleet_adapter_vda5050Adapter:
     def _on_superseded(self, stream: str, exc) -> None:
         """A stream closed as superseded by another process under this adapter identity
         (RFC-0001 #fleet-adapter-protocol-connection-lifecycle: such a process "MUST stop every
-        robot it drives" and "MUST also hold no work"). Once, whichever stream comes first:
+        robot it drives" and "MUST also hold no work"). Once for the process, whichever stream
+        comes first, and for every vehicle it serves (FleetProcess.stop_superseded):
 
-        1. Work is refused from here on (_unavailable, _on_resume, _on_pause), and no stream
-           is opened again. After a SafetyStream supersession the ControlStream is closed too:
-           a fence sent on it could be neither answered nor, once MQTT is released, delivered.
-        2. The vehicle is stopped with ``cancelOrder``, never paused: the process that took
+        1. Work is refused from here on, for every vehicle (_unavailable, _on_resume,
+           _on_pause read the streams' state), and no stream is opened again. After a
+           SafetyStream supersession the ControlStream is closed too: a fence sent on it could
+           be neither answered nor, once MQTT is released, delivered.
+        2. Every vehicle is stopped with ``cancelOrder``, never paused: the process that took
            over refuses work on a vehicle paused by another process ("paused at the vehicle"),
-           so a pause here would leave the robot out of service. The epoch is counted, so an
+           so a pause here would leave the robot out of service. Each epoch is counted, so an
            assignment or a resume already past its checks gives up rather than send after it.
-        3. The work it held is interrupted ("stream superseded"); its reports go nowhere now.
-        4. Rest is awaited, and logged: no stream is left to report it on.
-        5. The MQTT session is released. Both processes use the client id
-           ``swarmada-<robot id>``, and an idle process that kept it would take it back on
-           every reconnect, cutting the process that took over off the vehicle.
+        3. The work each held is interrupted ("stream superseded"); its reports go nowhere now.
+        4. Rest is awaited for all of them at once, and each result logged: no stream is left
+           to report it on.
+        5. Each MQTT session is released, once, after the last wait. Both processes use the
+           client id ``swarmada-<robot id>``, and an idle process that kept it would take it
+           back on every reconnect, cutting the process that took over off the vehicle.
 
         This adapter opens a stream only after the previous one ended, so a superseded close
         is always a stream it did not open."""
@@ -1512,27 +1520,19 @@ class fleet_adapter_vda5050Adapter:
             control = self._active_call if stream == "SafetyStream" else None
         if control is not None:
             control.cancel()
-        print(f"error: SUPERSEDED robot={self._robot_id}: {stream} closed by the control plane: "
-              f"{exc.details()}. Another process serves this adapter identity. Stopping the "
-              f"vehicle, holding no work, not reconnecting; restart this process to serve "
-              f"again", file=sys.stderr, flush=True)
-        try:
-            with self._robot_lock:
-                self._estop_epoch += 1
-                self._robot.command_stop(self._robot_id)
-                since = self._state_seq_now()
-            self._interrupt_current("stream superseded", command_stop=False)
-            why = self._confirm_stop(since)
-        except Exception as fault:  # noqa: BLE001 - the release and the parking still follow
-            why = f"the stop sequence raised {fault!r}"
-        print(f"error: SUPERSEDED robot={self._robot_id}: the stop "
-              + ("is confirmed: the vehicle is at rest" if not why else f"is NOT confirmed: {why}")
-              + "; releasing the MQTT session", file=sys.stderr, flush=True)
-        try:
-            self._robot.stop()
-        except Exception as fault:  # noqa: BLE001
-            print(f"error: SUPERSEDED robot={self._robot_id}: releasing the MQTT session "
-                  f"raised {fault!r}", file=sys.stderr, flush=True)
+        print(f"error: SUPERSEDED: {stream} closed by the control plane: {exc.details()}. "
+              f"Another process serves this adapter identity. Stopping every vehicle "
+              f"({self._process.served_text()}), holding no work, not reconnecting; restart "
+              f"this process to serve again", file=sys.stderr, flush=True)
+        self._process.stop_superseded()
+
+    def _begin_superseded_stop(self) -> int | None:
+        """This vehicle's part of a supersession's stop, before any wait: ``cancelOrder``, the
+        epoch counted. Returns the state count to confirm rest against (_confirm_stop)."""
+        with self._robot_lock:
+            self._estop_epoch += 1
+            self._robot.command_stop(self._robot_id)
+            return self._state_seq_now()
 
     def _park_if_superseded(self) -> None:
         """After a supersession the ControlStream loop neither redials nor returns: the
