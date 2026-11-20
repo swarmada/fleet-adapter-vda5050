@@ -1999,14 +1999,22 @@ class fleet_adapter_vda5050Adapter:
             self._lane.submit(lambda: self._send_clear_ack(estop_id))
 
     def _on_clear(self, clear) -> None:
+        """A SafetyStream clear. The latch decides it here, on the reader; the answer goes on
+        the vehicle's lane, after the answer of any stop still waiting there, so a stop is
+        answered before its clear (as in _on_fence). The local report a clear that ends the
+        local set brings follows its EstopClearAck."""
         verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
                                        clear.ends_local_set)
         print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
               file=sys.stderr)
         if verdict == "ack":
-            self._send_clear_ack(clear.estop_id)
-            if clear.ends_local_set:
-                self._send_local_report()
+            estop_id, ends_local = clear.estop_id, bool(clear.ends_local_set)
+
+            def answer() -> None:
+                self._send_clear_ack(estop_id)
+                if ends_local:
+                    self._send_local_report()
+            self._lane.submit(answer)
 
     def _send_clear_ack(self, estop_id: str) -> None:
         pb = self._pb
