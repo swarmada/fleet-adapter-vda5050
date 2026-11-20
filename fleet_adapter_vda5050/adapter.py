@@ -176,11 +176,64 @@ def zone_constraints_ack(pb, push) -> object:
                  "cannot comply with") if subjects else "")
 
 
-class fleet_adapter_vda5050Adapter:
-    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None, namespace: str = "") -> None:
+class _Streams:
+    """What belongs to the process's streams rather than to one vehicle: the ControlStream and
+    SafetyStream outboxes, the session count, the contract version the hello agreed, the
+    shutdown, the dialler and the reconnect state. Every vehicle served on these streams shares
+    one; a vehicle reads and writes it through attributes of the same names (_Shared)."""
+
+    def __init__(self, dial=None, namespace: str = "") -> None:
         # The namespace in AdapterHello: empty takes it from the client certificate, the control
         # plane's binding. A name that differs from the certificate's is refused.
-        self._namespace = namespace
+        self.namespace = namespace
+        # How a channel is opened, ControlStream and EdgeStream alike: mutual TLS, or plaintext
+        # only when --insecure said so (main builds it). None dials nothing.
+        self.dial = dial
+        self.outbox: queue.Queue = queue.Queue()
+        self.safety_outbox: queue.Queue = queue.Queue()  # → SafetyStream (acks + drills)
+        self.negotiated = ""
+        self.shutdown = threading.Event()
+        # The ControlStream session, counted. The provisioning loop registers again only on the
+        # session that was refused; a newer session registers on its own (C2.4).
+        self.session = 0
+        self.reconnect_pending = False
+        self.active_call = None
+
+
+class _Shared:
+    """An attribute of the vehicle that lives on its _Streams: ``self._outbox`` reads and
+    writes ``self._streams.outbox``."""
+
+    def __set_name__(self, owner, name: str) -> None:
+        self._key = name.lstrip("_")
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return getattr(obj._streams, self._key)
+
+    def __set__(self, obj, value) -> None:
+        setattr(obj._streams, self._key, value)
+
+
+class fleet_adapter_vda5050Adapter:
+    """One vehicle: its binding, its action, fence, lease, latch and retained outcome, and the
+    logic that serves it. The streams it is served on are a _Streams, its own unless one is
+    given."""
+
+    _namespace = _Shared()
+    _dial = _Shared()
+    _outbox = _Shared()
+    _safety_outbox = _Shared()
+    _negotiated = _Shared()
+    _shutdown = _Shared()
+    _session = _Shared()
+    _reconnect_pending = _Shared()
+    _active_call = _Shared()
+
+    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None,
+                 namespace: str = "", streams: _Streams | None = None) -> None:
+        self._streams = streams if streams is not None else _Streams(dial, namespace)
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
@@ -213,14 +266,8 @@ class fleet_adapter_vda5050Adapter:
         self._current_fencing_token = None   # echoed on task-status streaming (C6.4)
         self._last_task_state = ""           # last streamed TaskState, for transition detect
         self._edge_addr: queue.Queue = queue.Queue()  # advertised edge endpoints (C8)
-        self._outbox: queue.Queue = queue.Queue()
-        self._safety_outbox: queue.Queue = queue.Queue()  # → SafetyStream (acks + drills)
         # Contract 1.4.0: the stop latch, the retained outcome, and the work a stop interrupted
         # (action ID -> the fencing token it was assigned with; its re-delivery starts nothing).
-        # How a channel is opened, ControlStream and EdgeStream alike: mutual TLS, or plaintext
-        # only when --insecure said so (main builds it). None dials nothing.
-        self._dial = dial
-        self._negotiated = ""
         self._latch = StopLatch()
         self._retained = RetainedOutcomes(state_dir)
         self._interrupted: dict[str, int] = {}
@@ -229,7 +276,6 @@ class fleet_adapter_vda5050Adapter:
         # thread of its own (_end_superseded); kept so a test can join it.
         self._superseded_threads: list[threading.Thread] = []
         self._stop_confirm_sleep = time.sleep
-        self._shutdown = threading.Event()
         self._telemetry_started = False
         # True only between an ACCEPTED RegisterAck and the end of that ControlStream session.
         # A robot whose registration was refused, or not yet answered, is not under management
@@ -239,9 +285,6 @@ class fleet_adapter_vda5050Adapter:
         # thread goes out only on it, and only while it is still the current session's: the
         # reconnect loop installs a new session's outbox before that session registers (C2.1).
         self._registered_outbox: queue.Queue | None = None
-        # The ControlStream session, counted. The provisioning loop registers again only on the
-        # session that was refused; a newer session registers on its own (C2.4).
-        self._session = 0
         # The provisioning loop: the latest DiscoverAck's ttl_seconds, and an event set when a
         # DiscoverAck arrives, which the loop waits on before it picks its interval.
         self._discover_ttl = 0
@@ -258,8 +301,6 @@ class fleet_adapter_vda5050Adapter:
         # with no --scenario) → the streams run exactly as before.
         self._sim = robot if hasattr(robot, "hardware_delta") else None
         self._estop_drilled = False
-        self._reconnect_pending = False
-        self._active_call = None
         # Transport-liveness log state: True so the FIRST degrade is announced, and so
         # the announcement is a transition rather than 5 lines a second.
         self._transport_was_live = True
