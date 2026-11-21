@@ -6,7 +6,8 @@
 A stop is commanded on the reader and answered from the vehicle's lane once rest is confirmed,
 up to 2 s later. If the SafetyStream drops and reopens meanwhile, the stream that reopened is
 told the stop is latched, STOPPING; its final answer, STOPPED or FAILED, must come on that
-stream too, not on the one that ended."""
+stream too, not on the one that ended. An answer sent while no stream is open, in the backoff
+before the reopen, goes out on the stream that opens next."""
 
 from __future__ import annotations
 
@@ -130,3 +131,29 @@ def test_a_stop_answered_after_the_safety_stream_reopened_is_answered_on_the_new
     assert [k.message for k in first.acks("e1")] in ([], ["latched"])  # nothing final on the old
     assert [k.state for k in second.acks("e1") if k.message == "latched"] == [
         pb.ESTOP_STATE_STOPPING]  # the reopened stream was told it was latched, STOPPING
+
+
+@pytest.mark.parametrize("contract", ["1.3.0", "1.4.0"])
+def test_a_stop_answered_while_the_safety_stream_is_down_goes_out_on_the_next(
+        adapter, contract) -> None:
+    """The SafetyStream drops during a stop's wait, and the vehicle comes to rest in the 0.5 s
+    before it reopens, so the stop is answered while no stream is open. That answer must go out
+    on the stream that opens next, as the stop's own answer: below 1.4.0 nothing else reports
+    it, and at 1.4.0 the latched report is not the answer."""
+    a, b, stub = adapter, adapter._robot, adapter.stub
+    a._negotiated = contract
+    threading.Thread(target=a.run_safety_stream, args=(stub,), daemon=True).start()
+    _until(lambda: len(stub.streams) == 1)
+    first = stub.streams[0]
+    first.inbox.put(pb.ControlPlaneSafetyMessage(robot_id=ROBOT, estop=pb.Estop(estop_id="e1")))
+    _until(lambda: a._stops_in_flight == 1)
+    b.rest_at = time.monotonic() + 0.2  # inside the 0.5 s backoff
+    first.inbox.put(None)  # the SafetyStream drops during the stop's wait
+    _until(lambda: a._stops_in_flight == 0, timeout=3)  # answered
+    assert len(stub.streams) == 1  # while no stream was open
+    _until(lambda: len(stub.streams) == 2)
+    second = stub.streams[1]
+    _until(lambda: any(k.message != "latched" for k in second.acks("e1")), timeout=3)
+    final = [k for k in second.acks("e1") if k.message != "latched"]
+    assert [k.state for k in final] == [pb.ESTOP_STATE_STOPPED]
+    assert [k for k in first.acks("e1") if k.message != "latched"] == []

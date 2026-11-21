@@ -1876,19 +1876,26 @@ class fleet_adapter_vda5050Adapter:
 
     def run_safety_stream(self, stub) -> None:
         """One SafetyStream at a time, re-opened when it drops. Each that opens is told what
-        is latched first (contract 1.4.0)."""
-        self._process.start_lanes()
-        while not self._shutdown.is_set():
-            outbox: queue.Queue = queue.Queue()  # fresh per stream, as the ControlStream's
+        is latched first (contract 1.4.0).
 
-            def requests(_o=outbox) -> Iterator:
+        Each stream has an outbox of its own, and the next one's is made the moment a stream
+        drops, before the backoff: a stop answered from its lane while no stream is open waits
+        there and goes out on the stream that opens next. Made after the backoff, it left that
+        answer on the outbox of the stream that had ended, and below contract 1.4.0 nothing
+        reported the stop's outcome again."""
+        self._process.start_lanes()
+        outbox: queue.Queue = queue.Queue()  # fresh per stream, as the ControlStream's
+        self._safety_outbox = outbox
+        while not self._shutdown.is_set():
+            current = outbox
+
+            def requests(_o=current) -> Iterator:
                 while True:
                     msg = _o.get()
                     if msg is None:
                         return
                     yield msg
 
-            self._safety_outbox = outbox
             self._process.on_safety_stream_open()
             try:
                 with self._superseded_lock:  # as the ControlStream's: no dial after one
@@ -1904,11 +1911,13 @@ class fleet_adapter_vda5050Adapter:
                     self._on_superseded("SafetyStream", exc)
                 if self._superseded.is_set():
                     return  # never reopened: another process serves this identity now
+                outbox = queue.Queue()  # the next stream's, from now: before the backoff
+                self._safety_outbox = outbox
                 print(f"safety stream dropped ({exc.code()}); reconnecting", file=sys.stderr)
                 time.sleep(0.5)
                 continue
             finally:
-                outbox.put(None)
+                current.put(None)
             return
 
     def _on_safety_message(self, cp) -> None:
