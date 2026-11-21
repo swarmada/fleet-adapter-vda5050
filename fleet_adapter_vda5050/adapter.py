@@ -44,6 +44,7 @@ from swarmada_sdk.safety import (
 from fleet_adapter_vda5050 import __version__
 from fleet_adapter_vda5050 import task as task_map
 from fleet_adapter_vda5050.latch import StopLatch
+from fleet_adapter_vda5050.process import FleetProcess
 from fleet_adapter_vda5050.retained import Outcome, RetainedOutcomes
 from fleet_adapter_vda5050.robot import SimulatedRobot
 
@@ -86,6 +87,11 @@ _TERMINAL = (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED, task_map.TASK_CANCEL
 # (swarmada_sdk.safety.await_estop_confirmation's default, 40 x 0.05 s).
 _STOP_CONFIRM_TICK_S = 0.05
 _STOP_CONFIRM_TICKS = 40
+# A cancel's answer is due within this long of the cancel's arrival. The control plane waits 2 s
+# for it (swarmada internal/controller/fleetaction_controller.go, wireTimeout) and drops an answer
+# that comes later, holding the action until its lease is provably dead; the 0.5 s left over is
+# for the answer's way back. An estop keeps the 2 s above.
+_CANCEL_BUDGET_S = 1.5
 
 # The Command arms this adapter implements that act on the robot (its motion, its lease, a hold)
 # or attest something about it (zone_constraints). Each is refused, before anything else runs,
@@ -176,15 +182,134 @@ def zone_constraints_ack(pb, push) -> object:
                  "cannot comply with") if subjects else "")
 
 
-class fleet_adapter_vda5050Adapter:
-    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None, namespace: str = "") -> None:
+class _Streams:
+    """What belongs to the process's streams rather than to one vehicle: the ControlStream and
+    SafetyStream outboxes, the session count, the contract version the hello agreed, the
+    shutdown, the dialler and the reconnect state. Every vehicle served on these streams shares
+    one; a vehicle reads and writes it through attributes of the same names (_Shared)."""
+
+    def __init__(self, dial=None, namespace: str = "") -> None:
         # The namespace in AdapterHello: empty takes it from the client certificate, the control
         # plane's binding. A name that differs from the certificate's is refused.
-        self._namespace = namespace
+        self.namespace = namespace
+        # How a channel is opened, ControlStream and EdgeStream alike: mutual TLS, or plaintext
+        # only when --insecure said so (main builds it). None dials nothing.
+        self.dial = dial
+        self.outbox: queue.Queue = queue.Queue()
+        self.safety_outbox: queue.Queue = queue.Queue()  # → SafetyStream (acks + drills)
+        self.negotiated = ""
+        self.shutdown = threading.Event()
+        # The ControlStream session, counted. The provisioning loop registers again only on the
+        # session that was refused; a newer session registers on its own (C2.4).
+        self.session = 0
+        self.reconnect_pending = False
+        self.active_call = None
+        # Set once one of these streams is closed as superseded by another process under this
+        # adapter identity (_on_superseded): every vehicle is stopped, no work is held or taken
+        # for any of them, and no stream is opened again. Of the streams, so of every vehicle.
+        self.superseded = threading.Event()
+        self.superseded_lock = threading.Lock()
+        self.superseded_why = ""
+
+
+class _Shared:
+    """An attribute of the vehicle that lives on its _Streams: ``self._outbox`` reads and
+    writes ``self._streams.outbox``."""
+
+    def __set_name__(self, owner, name: str) -> None:
+        self._key = name.lstrip("_")
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return getattr(obj._streams, self._key)
+
+    def __set__(self, obj, value) -> None:
+        setattr(obj._streams, self._key, value)
+
+
+def _no_wait(_seconds: float) -> None:
+    """The SDK's sleep for one look at a stop: the wait between looks is the adapter's own,
+    taken with the robot lock released (_await_estop)."""
+
+
+class _Lane:
+    """One vehicle's worker. The part of a stop that waits (rest confirmed, then the answer)
+    runs here, in the order the stops arrived, so the stream reader that began the stop goes on
+    to the next message at once: with fifty vehicles on one SafetyStream, the fiftieth estop is
+    commanded when it arrives, not after the waits of the forty-nine before it. Until the
+    process starts it, a job runs in its caller, as every stop did before lanes."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._jobs: queue.Queue | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._lock:
+            if self._jobs is not None:
+                return
+            self._jobs = queue.Queue()
+            threading.Thread(target=self._run, args=(self._jobs,), name=f"lane-{self._name}",
+                             daemon=True).start()
+
+    def submit(self, job) -> None:
+        jobs = self._jobs
+        if jobs is None:
+            job()
+        else:
+            jobs.put(job)
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """Wait until every job submitted so far has run. True if they all did in time."""
+        done = threading.Event()
+        self.submit(done.set)
+        return done.wait(timeout)
+
+    def _run(self, jobs: queue.Queue) -> None:
+        while True:
+            job = jobs.get()
+            try:
+                job()
+            except Exception as exc:  # noqa: BLE001 - one job's fault must not end the lane
+                print(f"error: vehicle {self._name}: a job on its lane raised {exc!r}",
+                      file=sys.stderr, flush=True)
+
+
+class fleet_adapter_vda5050Adapter:
+    """One vehicle: its binding, its action, fence, lease, latch and retained outcome, and the
+    logic that serves it. The streams it is served on are a _Streams, its own unless one is
+    given."""
+
+    _namespace = _Shared()
+    _dial = _Shared()
+    _outbox = _Shared()
+    _safety_outbox = _Shared()
+    _negotiated = _Shared()
+    _shutdown = _Shared()
+    _session = _Shared()
+    _reconnect_pending = _Shared()
+    _active_call = _Shared()
+    _superseded = _Shared()
+    _superseded_lock = _Shared()
+    _superseded_why = _Shared()
+
+    def __init__(self, pb, pb_grpc, robot, robot_id: str, state_dir=None, dial=None,
+                 namespace: str = "", streams: _Streams | None = None) -> None:
+        self._streams = streams if streams is not None else _Streams(dial, namespace)
+        # The process this vehicle is served by (FleetProcess sets it). A vehicle built without
+        # streams is a process of one, built at the end of __init__.
+        self._process: FleetProcess | None = None
         self._pb = pb
         self._pb_grpc = pb_grpc
         self._robot = robot
         self._robot_lock = threading.Lock()
+        # Held from a stop's or a clear's latch decision until its answer has its place on the
+        # lane (_on_fence, _on_safety_message, _on_clear): a fence is read on the ControlStream
+        # and its clear on the SafetyStream, and without it a clear read while the fence's stop
+        # was being commanded could take the lane ahead of that stop and be answered first.
+        # Taken before _robot_lock; never while holding it.
+        self._stop_order_lock = threading.Lock()
         # The action the robot holds, and what is kept about it (_current_action, its token and
         # last state, _action_tokens, _interrupted), changes only under this lock. Several
         # threads end an action -- the SafetyStream and the EdgeStream (a stop), the telemetry
@@ -199,28 +324,23 @@ class fleet_adapter_vda5050Adapter:
         # a resume already past its checks re-reads this under _robot_lock and gives up rather
         # than send an order or a stopPause after the stop.
         self._estop_epoch = 0
-        # Set once a stream is closed as superseded by another process under this adapter
-        # identity (_on_superseded): the vehicle is stopped, no work is held or taken, and no
-        # stream is opened again.
-        self._superseded = threading.Event()
-        self._superseded_lock = threading.Lock()
-        self._superseded_why = ""
+        # The stops commanded and not yet answered, under _robot_lock: counted with the command,
+        # uncounted once the answer is sent. While any is in flight, no work is taken and no
+        # pause is lifted, at every contract version (_on_assign, _on_resume).
+        self._stops_in_flight = 0
+        # Whether the streams were superseded (_on_superseded) is the streams' own
+        # (_Streams.superseded): every vehicle served on them reads it.
         self._robot_id = robot_id
+        # Where this vehicle's stops wait for rest and are answered (_stop_and_ack).
+        self._lane = _Lane(robot_id)
         self._fence = FenceGuard()                              # C3
         self._lease = LeaseMonitor(on_expiry=self._self_stop)   # C4
         self._current_action = ""
         self._current_generation = 0
         self._current_fencing_token = None   # echoed on task-status streaming (C6.4)
         self._last_task_state = ""           # last streamed TaskState, for transition detect
-        self._edge_addr: queue.Queue = queue.Queue()  # advertised edge endpoints (C8)
-        self._outbox: queue.Queue = queue.Queue()
-        self._safety_outbox: queue.Queue = queue.Queue()  # → SafetyStream (acks + drills)
         # Contract 1.4.0: the stop latch, the retained outcome, and the work a stop interrupted
         # (action ID -> the fencing token it was assigned with; its re-delivery starts nothing).
-        # How a channel is opened, ControlStream and EdgeStream alike: mutual TLS, or plaintext
-        # only when --insecure said so (main builds it). None dials nothing.
-        self._dial = dial
-        self._negotiated = ""
         self._latch = StopLatch()
         self._retained = RetainedOutcomes(state_dir)
         self._interrupted: dict[str, int] = {}
@@ -229,7 +349,6 @@ class fleet_adapter_vda5050Adapter:
         # thread of its own (_end_superseded); kept so a test can join it.
         self._superseded_threads: list[threading.Thread] = []
         self._stop_confirm_sleep = time.sleep
-        self._shutdown = threading.Event()
         self._telemetry_started = False
         # True only between an ACCEPTED RegisterAck and the end of that ControlStream session.
         # A robot whose registration was refused, or not yet answered, is not under management
@@ -239,9 +358,6 @@ class fleet_adapter_vda5050Adapter:
         # thread goes out only on it, and only while it is still the current session's: the
         # reconnect loop installs a new session's outbox before that session registers (C2.1).
         self._registered_outbox: queue.Queue | None = None
-        # The ControlStream session, counted. The provisioning loop registers again only on the
-        # session that was refused; a newer session registers on its own (C2.4).
-        self._session = 0
         # The provisioning loop: the latest DiscoverAck's ttl_seconds, and an event set when a
         # DiscoverAck arrives, which the loop waits on before it picks its interval.
         self._discover_ttl = 0
@@ -258,13 +374,13 @@ class fleet_adapter_vda5050Adapter:
         # with no --scenario) → the streams run exactly as before.
         self._sim = robot if hasattr(robot, "hardware_delta") else None
         self._estop_drilled = False
-        self._reconnect_pending = False
-        self._active_call = None
         # Transport-liveness log state: True so the FIRST degrade is announced, and so
         # the announcement is a transition rather than 5 lines a second.
         self._transport_was_live = True
         self._clock = time.monotonic
         self._last_tick: float | None = None
+        if streams is None:
+            FleetProcess([self])
 
     # ── ControlStream ────────────────────────────────────────────────────────
 
@@ -310,16 +426,31 @@ class fleet_adapter_vda5050Adapter:
         A failure here is fatal on purpose: `start()` raising stops the run, rather than
         letting the adapter register and stream plausible telemetry (pose `(0,0,0)`,
         battery `0`, phase `IDLE`, `is_stopped` permanently False) read off a binding
-        connected to no broker."""
+        connected to no broker.
+
+        Not after a supersession. The streams can be superseded while the process is still
+        bringing its vehicles up (the SafetyStream opens alongside), and the supersession
+        releases only the bindings started by then (FleetProcess.stop_superseded). A binding
+        started after it would take the MQTT session back, under the client id the process that
+        took over uses. So a vehicle isn't started once the streams are superseded. One whose
+        start is under way when they are is released by the supersession itself: its stop of
+        the vehicle takes this lock, held here across the start, so it runs once the start has
+        returned. Starting outside the lock would need a check after the start as well."""
         with self._robot_lock:
+            if self._superseded.is_set():
+                return
             self._robot.start()
             self._robot.spawn(self._robot_id)
 
     def run_control_stream(self, stub) -> None:
+        """Run the process this vehicle is served by: bring every vehicle up, then the
+        ControlStream."""
+        self._process.run_control_stream(stub)
+
+    def _run_control_stream(self, stub) -> None:
+        """The ControlStream loop, run by the process's first vehicle; every message goes to
+        the process (_handle_control_plane)."""
         self.bring_up_robot()
-        # The edge loop blocks until an endpoint is advertised (C8), so starting it
-        # now is safe; it stays idle for zones with no edge node.
-        threading.Thread(target=self._edge_loop, daemon=True).start()
 
         drop_window = self._sim.stream_drop_window() if self._sim else None
         if drop_window is None:
@@ -411,71 +542,66 @@ class fleet_adapter_vda5050Adapter:
         self._shutdown.set()
 
     def _new_session(self) -> None:
-        """A ControlStream session opens: nothing is registered on it yet."""
-        self._session += 1
-        self._registered = False
-        self._latch.new_control_stream(self._robot_id)
+        """A ControlStream session opens: nothing is registered on it yet, for any vehicle."""
+        self._process.new_session()
 
     def _handle_control_plane(self, cp, stub) -> None:
-        pb = self._pb
-        kind = cp.WhichOneof("payload")
-        if kind == "hello_ack":
-            if not cp.hello_ack.accepted:
-                raise RuntimeError(f"handshake rejected: {cp.hello_ack.message}")
-            self._negotiated = cp.hello_ack.negotiated_contract_version
-            self._outbox.put(pb.AdapterMessage(  # C2.1: register
-                register=pb.RegisterRobot(robot_id=self._robot_id)))
-            # A fresh ControlStream: the next payload must be a full snapshot (C6.1).
-            self._snapshot_pending = True
-            if not self._telemetry_started:  # C6: stream telemetry once registered
-                self._telemetry_started = True
-                threading.Thread(target=self._telemetry_loop, args=(stub,), daemon=True).start()
-        elif kind == "register_ack":
-            ack = cp.register_ack
-            if not ack.accepted:
-                self._on_register_refused(ack)
-                return
-            self._registered = True
-            self._registered_outbox = self._outbox
-            # Registered: the catalog, and any hardware manifest (C12.2), and a full snapshot
-            # next (C6.1). Sent here rather than at the hello, because a robot admitted through
-            # the provisioning loop had no Robot when the hello came, and what was sent for it
-            # then was not kept.
-            self._send_capabilities_snapshot()
-            self._snapshot_pending = True
-            for e in cp.register_ack.edge_endpoints:  # C8.1: dial each advertised edge node
-                self._edge_addr.put(e.address)
-            # C2.3 — adopt the per-robot cadence the control plane returned. Only a
-            # POSITIVE value is a cadence: 0 means "not specified" and a negative value
-            # is malformed — clamping that to the 1s minimum would let a buggy control
-            # plane force the fastest permitted rate. Legitimate values are clamped to
-            # the protocol's 1-30s range.
-            secs = cp.register_ack.telemetry_interval_seconds
-            if secs > 0:
-                self._telemetry_interval = max(1.0, min(30.0, float(secs)))
-            # The one line that says the robot is now under management on this session: until
-            # it, work for the robot is refused here (C13.2) and the control plane cannot push it.
-            print(f"REGISTERED robot={self._robot_id}; under management on this session "
-                  f"(contract {self._negotiated or 'not negotiated'}, telemetry every "
-                  f"{self._telemetry_interval:g} s)", file=sys.stderr, flush=True)
-            self._reconcile_action_state(cp.register_ack)
-            self._send_retained()
-        elif kind == "discover_ack":
-            # Announced. The robot is not under management until a register is accepted.
-            da = cp.discover_ack
-            if not da.accepted:
-                print(f"announce refused robot={self._robot_id}: {da.message}", file=sys.stderr)
-            self._discover_ttl = da.ttl_seconds
-            self._discover_acked.set()
-        elif kind == "outcome_ack":
-            oa = cp.outcome_ack
-            if self._retained.acknowledge(self._robot_id, oa.action_id, oa.fencing_token):
-                print(f"retained outcome acknowledged: action={oa.action_id}", file=sys.stderr)
-        elif kind == "heartbeat":
-            self._outbox.put(pb.AdapterMessage(
-                heartbeat=pb.HeartbeatResponse(robot_id=cp.heartbeat.robot_id)))
-        elif kind == "command":
-            self._handle_command(cp.command)
+        """A message on the ControlStream, for the process to route."""
+        self._process.handle_control_plane(cp, stub)
+
+    def _on_hello_ack(self, stub) -> None:
+        """The hello is accepted (the process has kept the contract version): register."""
+        self._process.send_register(self, self._outbox, self._session)  # C2.1
+        # A fresh ControlStream: the next payload must be a full snapshot (C6.1).
+        self._snapshot_pending = True
+        if not self._telemetry_started:  # C6: stream telemetry once registered
+            self._telemetry_started = True
+            threading.Thread(target=self._telemetry_loop, args=(stub,), daemon=True).start()
+
+    def _on_register_ack(self, ack) -> None:
+        """The RegisterAck that answers this vehicle's register."""
+        if not ack.accepted:
+            self._on_register_refused(ack)
+            return
+        self._registered = True
+        self._registered_outbox = self._outbox
+        # Registered: the catalog, and any hardware manifest (C12.2), and a full snapshot
+        # next (C6.1). Sent here rather than at the hello, because a robot admitted through
+        # the provisioning loop had no Robot when the hello came, and what was sent for it
+        # then was not kept.
+        self._send_capabilities_snapshot()
+        self._snapshot_pending = True
+        # C8.1: this vehicle is served through the edge nodes this ack lists, and no others.
+        self._process.edge_endpoints(self, [e.address for e in ack.edge_endpoints])
+        # C2.3 — adopt the per-robot cadence the control plane returned. Only a
+        # POSITIVE value is a cadence: 0 means "not specified" and a negative value
+        # is malformed — clamping that to the 1s minimum would let a buggy control
+        # plane force the fastest permitted rate. Legitimate values are clamped to
+        # the protocol's 1-30s range.
+        secs = ack.telemetry_interval_seconds
+        if secs > 0:
+            self._telemetry_interval = max(1.0, min(30.0, float(secs)))
+        # The one line that says the robot is now under management on this session: until
+        # it, work for the robot is refused here (C13.2) and the control plane cannot push it.
+        print(f"REGISTERED robot={self._robot_id}; under management on this session "
+              f"(contract {self._negotiated or 'not negotiated'}, telemetry every "
+              f"{self._telemetry_interval:g} s)", file=sys.stderr, flush=True)
+        self._reconcile_action_state(ack)
+        self._send_retained()
+
+    def _on_discover_ack(self, da) -> None:
+        """The DiscoverAck that answers this vehicle's announcement. The robot is not under
+        management until a register is accepted."""
+        if not da.accepted:
+            print(f"announce refused robot={self._robot_id}: {da.message}", file=sys.stderr)
+        self._discover_ttl = da.ttl_seconds
+        self._discover_acked.set()
+
+    def _on_outcome_ack(self, oa) -> None:
+        """An ActionOutcomeAck, offered to every vehicle: it clears only the outcome this
+        vehicle kept under that action id and fencing token."""
+        if self._retained.acknowledge(self._robot_id, oa.action_id, oa.fencing_token):
+            print(f"retained outcome acknowledged: action={oa.action_id}", file=sys.stderr)
 
     def _on_register_refused(self, ack) -> None:
         """A refused register (RFC-0001 #fleet-adapter-protocol-the-stop-latch, "A refused
@@ -499,8 +625,9 @@ class fleet_adapter_vda5050Adapter:
                   file=sys.stderr)
             return
         self._discover_acked.clear()
-        self._outbox.put(pb.AdapterMessage(discover=pb.DiscoverRobot(
-            robot_id=self._robot_id, hardware=self._capability_components())))
+        self._process.send_discover(self, self._outbox, self._session, pb.AdapterMessage(
+            discover=pb.DiscoverRobot(robot_id=self._robot_id,
+                                      hardware=self._capability_components())))
         threading.Thread(target=self._provisioning_iteration,
                          args=(self._session, self._outbox), daemon=True).start()
         print(f"NOT_ADMITTED robot={self._robot_id}; announced for operator admission (C2.1)",
@@ -516,10 +643,9 @@ class fleet_adapter_vda5050Adapter:
         self._discover_acked.wait(_DISCOVER_ACK_WAIT_S)
         if self._shutdown.wait(_provisioning_interval(self._discover_ttl)):
             return
-        if self._registered or session != self._session:
+        if self._registered:
             return
-        outbox.put(self._pb.AdapterMessage(
-            register=self._pb.RegisterRobot(robot_id=self._robot_id)))
+        self._process.send_register(self, outbox, session)  # nothing once the session is replaced
 
     def _handle_command(self, command) -> None:
         pb = self._pb
@@ -581,7 +707,7 @@ class fleet_adapter_vda5050Adapter:
     def _log_unserved(self, received: str, what: str, outcome: str) -> None:
         """Every message for a robot this adapter does not serve, at error level, naming both
         ids: an id mismatch with the control plane is loud, not silent."""
-        print(f"error: UNSERVED robot={self._robot_id!r} addressed={received!r} {what}: "
+        print(f"error: UNSERVED robot={self._process.served_text()} addressed={received!r} {what}: "
               f"{outcome}", file=sys.stderr, flush=True)
 
     def _refuse_unserved(self, command, which: str, result) -> None:
@@ -597,7 +723,7 @@ class fleet_adapter_vda5050Adapter:
         to reschedule; INVALID_ACTION would wrongly say the action could not be served."""
         pb = self._pb
         why = (f"robot_id {command.robot_id!r} is not served by this adapter, which serves "
-               f"{self._robot_id!r}; nothing was done")
+               f"{self._process.served_text()}; nothing was done")
         if which == "assign_action":
             result.assign_action.CopyFrom(pb.AssignActionResult(
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
@@ -632,17 +758,23 @@ class fleet_adapter_vda5050Adapter:
         pb = self._pb
         ack = pb.EstopAck(estop_id=estop_id, state=pb.ESTOP_STATE_FAILED)
         why = (f"robot_id {received!r} is not served by this adapter, which serves "
-               f"{self._robot_id!r}")
-        if self._registered:
+               f"{self._process.served_text()}")
+        unregistered = self._process.unregistered()
+        if not unregistered:
             self._log_unserved(received, f"{via} id={estop_id}",
                                "answered FAILED; no stop was commanded")
             ack.message = f"{why}; no stop was commanded and none can be confirmed"
         else:
+            # Every vehicle with no accepted registration is stopped: any of them may be the
+            # one the stop was meant for, under an id this adapter doesn't know it by. Each is
+            # commanded before any is interrupted.
             ack.stop_initiated_at = _now_ms()
-            with self._robot_lock:
-                self._command_estop()  # its token is not needed: this stop is not confirmed
-            self._interrupt_current("emergency stop under a robot_id this adapter does not serve",
-                                    command_stop=False)
+            for c in unregistered:
+                with c._robot_lock:
+                    c._command_estop()  # its token is not needed: this stop is not confirmed
+            for c in unregistered:
+                c._interrupt_current("emergency stop under a robot_id this adapter does not "
+                                     "serve", command_stop=False)
             self._log_unserved(received, f"{via} id={estop_id}",
                                "answered FAILED; no accepted registration; vehicle stopped")
             ack.message = (f"{why}; no registration is accepted on this session, so this "
@@ -676,12 +808,13 @@ class fleet_adapter_vda5050Adapter:
         if self._superseded.is_set():
             result.resume.CopyFrom(pb.ResumeResult(resumed=False, message=self._superseded_why))
             return
-        if self._latch.refuses_work(self._robot_id):
+        if self._latch.refuses_work(self._robot_id) or self._stops_in_flight:
             result.resume.CopyFrom(pb.ResumeResult(resumed=False, message="under a stop"))
             return
         with self._robot_lock:
             # Again where it counts: a stop commanded since the check above must not be lifted.
-            if self._estop_epoch != epoch or self._latch.refuses_work(self._robot_id):
+            if (self._estop_epoch != epoch or self._stops_in_flight
+                    or self._latch.refuses_work(self._robot_id)):
                 result.resume.CopyFrom(pb.ResumeResult(resumed=False, message="under a stop"))
                 return
             self._robot.command_resume(self._robot_id)
@@ -710,6 +843,14 @@ class fleet_adapter_vda5050Adapter:
                 accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
                 message="under a stop: " + (", ".join(ids) if ids else "local latch")))
             self._report_latch()
+            return
+        if self._stops_in_flight:
+            # A stop is commanded and not yet answered: refused whatever the fencing token, at
+            # every contract version. Below 1.4.0 nothing else would refuse it, and an order
+            # taken now would follow the stop and drive on.
+            result.assign_action.CopyFrom(pb.AssignActionResult(
+                accepted=False, rejection=pb.ASSIGN_ACTION_REJECTION_ROBOT_UNAVAILABLE,
+                message="under a stop: in flight"))
             return
         unavailable = self._unavailable()
         if (unavailable and task.HasField("fencing_token")
@@ -778,7 +919,7 @@ class fleet_adapter_vda5050Adapter:
                 message=refusal))
             return
         with self._robot_lock:
-            if self._estop_epoch != epoch:
+            if self._estop_epoch != epoch or self._stops_in_flight:
                 # An emergency stop was commanded while this assignment was being checked. The
                 # vehicle is paused and its order cancelled; an order now would follow the
                 # stop (and, after an estop, lift the pause). Refused: the robot never took it.
@@ -1044,7 +1185,11 @@ class fleet_adapter_vda5050Adapter:
 
         One look is taken here, on the reader. If it doesn't settle the answer, the rest of the
         wait and the answer run on a thread of their own, so no command behind the cancel waits
-        for it, a fence least of all. Returns True when the answer is left to that thread."""
+        for it, a fence least of all. Returns True when the answer is left to that thread.
+
+        Either wait ends _CANCEL_BUDGET_S after the cancel arrived, after one look at least, so
+        the answer reaches the control plane while it still waits for it."""
+        deadline = time.monotonic() + _CANCEL_BUDGET_S  # from the cancel's arrival
         replaced = ""
         with self._action_lock:
             named = cancel.action_id
@@ -1072,7 +1217,7 @@ class fleet_adapter_vda5050Adapter:
                 return False
 
             def confirm(looks: int = _STOP_CONFIRM_TICKS) -> str:
-                return self._witness_replaced(since, replaced, looks)
+                return self._witness_replaced(since, replaced, looks, deadline)
         else:
             action, cause = named or cancelled, cancel.cause
             accepted = None
@@ -1081,7 +1226,8 @@ class fleet_adapter_vda5050Adapter:
                     return self._robot.cancel_accepted(ticket)
 
             def confirm(looks: int = _STOP_CONFIRM_TICKS) -> str:
-                return self._confirm_stop(since, accepted=accepted, looks=looks)
+                return self._confirm_stop(since, accepted=accepted, looks=looks,
+                                          deadline=deadline)
         if not confirm(looks=1):
             self._answer_cancel(result, action, "", cause=cause)
             return False
@@ -1100,12 +1246,14 @@ class fleet_adapter_vda5050Adapter:
         self._answer_cancel(result, action, why, cause=cause)
         outbox.put(self._pb.AdapterMessage(command_result=result))
 
-    def _witness_replaced(self, since: int | None, replaced: str, looks: int) -> str:
+    def _witness_replaced(self, since: int | None, replaced: str, looks: int,
+                          deadline: float | None = None) -> str:
         """C3.9: "" once a state received after the cancel (``state_seq`` > ``since``) shows
         the vehicle on the order the binding sent last, the one that replaced the action
         named, and none held behind a cancel (``runs_last_order``); else why not, within the
-        estop's budget. A state that still shows the old order, or comes from before the
-        cancel, witnesses nothing."""
+        estop's budget, or by ``deadline`` (``time.monotonic()``, the cancel's) after one look
+        at least. A state that still shows the old order, or comes from before the cancel,
+        witnesses nothing."""
         on_order = self._robot.runs_last_order
         state_seq = getattr(self._robot, "state_seq", None)
         if not callable(state_seq) or since is None:
@@ -1117,7 +1265,10 @@ class fleet_adapter_vda5050Adapter:
                 seen = state_seq(self._robot_id)
                 if type(seen) is int and seen > since and on_order(self._robot_id):
                     return ""
-        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+        budget = (_CANCEL_BUDGET_S if deadline is not None
+                  else _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S)
         return (f"no state after the cancel showed the vehicle on the order of {replaced}, "
                 f"which replaced it, within {budget:g} s")
 
@@ -1142,7 +1293,7 @@ class fleet_adapter_vda5050Adapter:
         result.cancel_action.CopyFrom(answer)
 
     def _confirm_stop(self, since: int | None, accepted=None,
-                      looks: int = _STOP_CONFIRM_TICKS) -> str:
+                      looks: int = _STOP_CONFIRM_TICKS, deadline: float | None = None) -> str:
         """Wait for the vehicle's own confirmation of a cancelOrder stop: "" when a state
         counted after the stop (``state_seq`` > ``since``) shows it at rest
         (``stop_confirmed``, else ``is_stopped``), or the reason it was not confirmed within
@@ -1154,7 +1305,8 @@ class fleet_adapter_vda5050Adapter:
 
         ``accepted`` (a cancel's): the stop is confirmed only once it also answers True, the
         broker having accepted the cancelOrder, within the same budget. ``looks`` = 1 takes one
-        look and doesn't wait."""
+        look and doesn't wait. ``deadline`` (``time.monotonic()``, a cancel's) also ends the
+        wait, after one look at least."""
         confirmed = getattr(self._robot, "stop_confirmed", None) or self._robot.is_stopped
         rested = False
         state_seq = getattr(self._robot, "state_seq", None)
@@ -1172,7 +1324,10 @@ class fleet_adapter_vda5050Adapter:
                     self._robot_id))
                 if rested and (accepted is None or accepted(self._robot_id)):
                     return ""
-        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+        budget = (_CANCEL_BUDGET_S if deadline is not None
+                  else _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S)
         if rested:
             return f"the broker did not acknowledge the cancelOrder within {budget:g} s"
         if counted and not self._robot.transport_alive():
@@ -1269,7 +1424,7 @@ class fleet_adapter_vda5050Adapter:
         fix, `Vda5050Binding.tick()` raises when its transport was never started — which is
         correct, and on this path alone it would make things worse if it escaped:
 
-        * `run_safety_stream` and `_edge_loop` call this from inside their response loops,
+        * `run_safety_stream` and the edge loop call this from inside their response loops,
           so an escaping exception kills that thread and the control plane gets **no
           EstopAck at all**. Silence on an estop is strictly less actionable than
           `FAILED`, which at least says "rest was not confirmed — escalate".
@@ -1324,34 +1479,73 @@ class fleet_adapter_vda5050Adapter:
             return None
         return EstopToken(self._robot_id, seq, id(self._robot))
 
-    def _await_estop(self, since: EstopToken | None) -> str:
+    def _await_estop(self, since: EstopToken | None, deadline: float | None = None) -> str:
         """Wait for confirmed rest after `_command_estop`, given the token it returned:
-        STOPPED, or FAILED. The caller holds the robot lock."""
+        STOPPED, or FAILED. The caller does not hold the robot lock. It is taken for each look
+        and released between looks, as `_confirm_stop` does, so a command for this vehicle
+        waits for one look at most, never for the stop's whole budget. Each look is the SDK's
+        own check (`await_estop_confirmation`, one tick, against the same token); the budget
+        is the SDK's default, _STOP_CONFIRM_TICKS looks _STOP_CONFIRM_TICK_S apart.
+
+        ``deadline`` (``time.monotonic()``) also ends the wait, after one look at least: a stop
+        on a lane is awaited until its own arrival plus the budget (_begin_stop), not for a full
+        budget from when its turn comes, so a stop queued behind another stop's wait is still
+        answered within its budget of arriving. The look after the deadline is still made: an
+        answer is FAILED only once rest has been looked for and not found."""
+        if since is None:
+            # Read once, after the stop, as the SDK reads it on entry. Read again at every look,
+            # a count would almost never be passed within the look.
+            with self._robot_lock:
+                since = self._estop_token_now()
+        for _ in range(_STOP_CONFIRM_TICKS):
+            with self._robot_lock:
+                try:
+                    state = await_estop_confirmation(self._robot, self._robot_id, since=since,
+                                                     max_ticks=1, sleep=_no_wait)
+                except RuntimeError as exc:
+                    print(f"estop could not be confirmed - the robot binding's transport is "
+                          f"not live, so rest cannot be read from the robot and C5.3 forbids "
+                          f"inferring it: {exc}", file=sys.stderr)
+                    return ESTOP_FAILED
+            if state == ESTOP_STOPPED:
+                return state
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            self._stop_confirm_sleep(_STOP_CONFIRM_TICK_S)
+        return ESTOP_FAILED
+
+    def _estop_token_now(self) -> EstopToken | None:
+        """The token for a stop already sent: the binding's count now. None when the binding
+        has no count or it can't be read as an int (the SDK then reads it, and answers)."""
+        state_seq = getattr(self._robot, "state_seq", None)
+        if not callable(state_seq):
+            return None
         try:
-            return await_estop_confirmation(self._robot, self._robot_id, since=since)
-        except RuntimeError as exc:
-            print(f"estop could not be confirmed - the robot binding's transport is not "
-                  f"live, so rest cannot be read from the robot and C5.3 forbids "
-                  f"inferring it: {exc}", file=sys.stderr)
-            return ESTOP_FAILED
+            seq = state_seq(self._robot_id)
+        except Exception:  # noqa: BLE001 - the SDK reads it again, and its error is the answer
+            return None
+        return EstopToken(self._robot_id, seq, id(self._robot)) if type(seq) is int else None
 
     def _on_superseded(self, stream: str, exc) -> None:
         """A stream closed as superseded by another process under this adapter identity
         (RFC-0001 #fleet-adapter-protocol-connection-lifecycle: such a process "MUST stop every
-        robot it drives" and "MUST also hold no work"). Once, whichever stream comes first:
+        robot it drives" and "MUST also hold no work"). Once for the process, whichever stream
+        comes first, and for every vehicle it serves (FleetProcess.stop_superseded):
 
-        1. Work is refused from here on (_unavailable, _on_resume, _on_pause), and no stream
-           is opened again. After a SafetyStream supersession the ControlStream is closed too:
-           a fence sent on it could be neither answered nor, once MQTT is released, delivered.
-        2. The vehicle is stopped with ``cancelOrder``, never paused: the process that took
+        1. Work is refused from here on, for every vehicle (_unavailable, _on_resume,
+           _on_pause read the streams' state), and no stream is opened again. After a
+           SafetyStream supersession the ControlStream is closed too: a fence sent on it could
+           be neither answered nor, once MQTT is released, delivered.
+        2. Every vehicle is stopped with ``cancelOrder``, never paused: the process that took
            over refuses work on a vehicle paused by another process ("paused at the vehicle"),
-           so a pause here would leave the robot out of service. The epoch is counted, so an
+           so a pause here would leave the robot out of service. Each epoch is counted, so an
            assignment or a resume already past its checks gives up rather than send after it.
-        3. The work it held is interrupted ("stream superseded"); its reports go nowhere now.
-        4. Rest is awaited, and logged: no stream is left to report it on.
-        5. The MQTT session is released. Both processes use the client id
-           ``swarmada-<robot id>``, and an idle process that kept it would take it back on
-           every reconnect, cutting the process that took over off the vehicle.
+        3. The work each held is interrupted ("stream superseded"); its reports go nowhere now.
+        4. Rest is awaited for all of them at once, and each result logged: no stream is left
+           to report it on.
+        5. Each MQTT session is released, once, after the last wait. Both processes use the
+           client id ``swarmada-<robot id>``, and an idle process that kept it would take it
+           back on every reconnect, cutting the process that took over off the vehicle.
 
         This adapter opens a stream only after the previous one ended, so a superseded close
         is always a stream it did not open."""
@@ -1370,27 +1564,19 @@ class fleet_adapter_vda5050Adapter:
             control = self._active_call if stream == "SafetyStream" else None
         if control is not None:
             control.cancel()
-        print(f"error: SUPERSEDED robot={self._robot_id}: {stream} closed by the control plane: "
-              f"{exc.details()}. Another process serves this adapter identity. Stopping the "
-              f"vehicle, holding no work, not reconnecting; restart this process to serve "
-              f"again", file=sys.stderr, flush=True)
-        try:
-            with self._robot_lock:
-                self._estop_epoch += 1
-                self._robot.command_stop(self._robot_id)
-                since = self._state_seq_now()
-            self._interrupt_current("stream superseded", command_stop=False)
-            why = self._confirm_stop(since)
-        except Exception as fault:  # noqa: BLE001 - the release and the parking still follow
-            why = f"the stop sequence raised {fault!r}"
-        print(f"error: SUPERSEDED robot={self._robot_id}: the stop "
-              + ("is confirmed: the vehicle is at rest" if not why else f"is NOT confirmed: {why}")
-              + "; releasing the MQTT session", file=sys.stderr, flush=True)
-        try:
-            self._robot.stop()
-        except Exception as fault:  # noqa: BLE001
-            print(f"error: SUPERSEDED robot={self._robot_id}: releasing the MQTT session "
-                  f"raised {fault!r}", file=sys.stderr, flush=True)
+        print(f"error: SUPERSEDED: {stream} closed by the control plane: {exc.details()}. "
+              f"Another process serves this adapter identity. Stopping every vehicle "
+              f"({self._process.served_text()}), holding no work, not reconnecting; restart "
+              f"this process to serve again", file=sys.stderr, flush=True)
+        self._process.stop_superseded()
+
+    def _begin_superseded_stop(self) -> int | None:
+        """This vehicle's part of a supersession's stop, before any wait: ``cancelOrder``, the
+        epoch counted. Returns the state count to confirm rest against (_confirm_stop)."""
+        with self._robot_lock:
+            self._estop_epoch += 1
+            self._robot.command_stop(self._robot_id)
+            return self._state_seq_now()
 
     def _park_if_superseded(self) -> None:
         """After a supersession the ControlStream loop neither redials nor returns: the
@@ -1683,11 +1869,18 @@ class fleet_adapter_vda5050Adapter:
         # reporting STOPPED with nothing attesting a hardware stop is exactly the
         # "inferred, not confirmed" case the estop protocol forbids.
         initiated_ms = int(time.time() * 1000)
-        with self._robot_lock:
-            since = self._command_estop()
-        self._interrupt_current("estop drill (scenario)", command_stop=False)  # like a real estop
-        with self._robot_lock:
+        counted = False
+        try:
+            with self._robot_lock:
+                self._stops_in_flight += 1
+                counted = True
+                since = self._command_estop()
+            self._interrupt_current("estop drill (scenario)", command_stop=False)  # as an estop
             state = self._await_estop(since)  # C5 discipline: never faked
+        finally:
+            if counted:
+                with self._robot_lock:
+                    self._stops_in_flight -= 1
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id, estop_ack=pb.EstopAck(
                 estop_id=f"drill-{self._robot_id}",
@@ -1719,26 +1912,34 @@ class fleet_adapter_vda5050Adapter:
 
     def run_safety_stream(self, stub) -> None:
         """One SafetyStream at a time, re-opened when it drops. Each that opens is told what
-        is latched first (contract 1.4.0)."""
-        while not self._shutdown.is_set():
-            outbox: queue.Queue = queue.Queue()  # fresh per stream, as the ControlStream's
+        is latched first (contract 1.4.0).
 
-            def requests(_o=outbox) -> Iterator:
+        Each stream has an outbox of its own, and the next one's is made the moment a stream
+        drops, before the backoff: a stop answered from its lane while no stream is open waits
+        there and goes out on the stream that opens next. Made after the backoff, it left that
+        answer on the outbox of the stream that had ended, and below contract 1.4.0 nothing
+        reported the stop's outcome again."""
+        self._process.start_lanes()
+        outbox: queue.Queue = queue.Queue()  # fresh per stream, as the ControlStream's
+        self._safety_outbox = outbox
+        while not self._shutdown.is_set():
+            current = outbox
+
+            def requests(_o=current) -> Iterator:
                 while True:
                     msg = _o.get()
                     if msg is None:
                         return
                     yield msg
 
-            self._safety_outbox = outbox
-            self._report_latch()
+            self._process.on_safety_stream_open()
             try:
                 with self._superseded_lock:  # as the ControlStream's: no dial after one
                     if self._superseded.is_set():
                         return
                     stream = stub.SafetyStream(requests())
                 for cp in stream:
-                    self._on_safety_message(cp)
+                    self._process.handle_safety(cp)
             except grpc.RpcError as exc:
                 if self._shutdown.is_set():
                     return
@@ -1746,11 +1947,13 @@ class fleet_adapter_vda5050Adapter:
                     self._on_superseded("SafetyStream", exc)
                 if self._superseded.is_set():
                     return  # never reopened: another process serves this identity now
+                outbox = queue.Queue()  # the next stream's, from now: before the backoff
+                self._safety_outbox = outbox
                 print(f"safety stream dropped ({exc.code()}); reconnecting", file=sys.stderr)
                 time.sleep(0.5)
                 continue
             finally:
-                outbox.put(None)
+                current.put(None)
             return
 
     def _on_safety_message(self, cp) -> None:
@@ -1764,57 +1967,133 @@ class fleet_adapter_vda5050Adapter:
                                    "ignored; nothing was lifted")
             return
         if kind == "estop":
-            if _at_least_14(self._negotiated):
-                self._latch.on_estop(self._robot_id, cp.estop.estop_id)
-            self._stop_and_ack(cp.estop.estop_id, self._safety_outbox.put)
+            with self._stop_order_lock:
+                if _at_least_14(self._negotiated):
+                    self._latch.on_estop(self._robot_id, cp.estop.estop_id)
+                self._stop_and_ack(cp.estop.estop_id, self._send_safety)
         elif kind == "estop_clear":
             self._on_clear(cp.estop_clear)
 
+    def _send_safety(self, msg) -> None:
+        """Put ``msg`` on the SafetyStream open now. A stop is answered from its lane once its
+        wait ends, up to 2 s after it arrived, and the SafetyStream may have dropped and reopened
+        meanwhile: an answer bound to the outbox of the stream it came on would go to a stream
+        that has ended, and the stream open now would only ever have reported it STOPPING."""
+        self._safety_outbox.put(msg)
+
     def _stop_and_ack(self, estop_id: str, send) -> None:
-        """Interrupt the work held, command the stop and answer it: STOPPED only once rest is
-        confirmed, else FAILED. Stamped around the hardware stop so the ack carries evidence
-        the stop was commanded, not merely asserted (C5.3)."""
-        pb = self._pb
-        # The stop first: the vehicle is halted before anything is recorded or reported. Then
-        # the work it held is interrupted, and then rest is confirmed.
+        """A stop, in two halves. The first runs here, on the reader that received it: the
+        stop is counted in flight and commanded, so the vehicle is halted before anything is
+        recorded or reported, and then the work it held is interrupted. The second runs on the
+        vehicle's lane (_finish_stop): rest is awaited, the stop is answered STOPPED only once
+        rest is confirmed, else FAILED, and then it is uncounted. ``stop_initiated_at`` is
+        stamped around the hardware stop, so the ack carries evidence the stop was commanded,
+        not merely asserted (C5.3).
+
+        A fault in the first half is answered FAILED at once, and the stop uncounted once: the
+        reader goes on to the next message, which may be another vehicle's stop."""
+        finish = self._begin_stop(estop_id, send)
+        if finish is not None:
+            self._lane.submit(finish)
+
+    def _begin_stop(self, estop_id: str, send):
+        """The stop's first half (_stop_and_ack). Returns the second half, for the lane, or
+        None when the first half faulted and the stop is already answered FAILED. The stop's
+        deadline is set here, on arrival: its wait ends then, however long it waited on the
+        lane behind the stops before it (_await_estop)."""
         initiated_ms = _now_ms()
-        with self._robot_lock:
-            since = self._command_estop()
-        self._interrupt_current("emergency stop", command_stop=False)
-        with self._robot_lock:
-            state = self._await_estop(since)  # C5: confirmed, never inferred
-        stopped = state == ESTOP_STOPPED
-        self._latch.record_state(self._robot_id, estop_id, "STOPPED" if stopped else "FAILED")
-        ack = pb.EstopAck(estop_id=estop_id, stop_initiated_at=initiated_ms,
-                          state=pb.ESTOP_STATE_STOPPED if stopped else pb.ESTOP_STATE_FAILED)
-        if stopped:
-            ack.confirmed_at_ms = _now_ms()
-        send(pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack))
+        deadline = time.monotonic() + _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+        counted = False
+        try:
+            with self._robot_lock:
+                self._stops_in_flight += 1
+                counted = True
+                since = self._command_estop()
+            self._interrupt_current("emergency stop", command_stop=False)
+        except Exception as exc:  # noqa: BLE001 - a stop is answered, never left silent
+            print(f"error: estop id={estop_id} for {self._robot_id!r} faulted before its wait: "
+                  f"{exc!r}; answered FAILED", file=sys.stderr, flush=True)
+            self._answer_stop(estop_id, initiated_ms, ESTOP_FAILED, send, counted)
+            return None
+        return lambda: self._finish_stop(estop_id, initiated_ms, since, send, deadline)
+
+    def _finish_stop(self, estop_id: str, initiated_ms: int, since, send,
+                     deadline: float) -> None:
+        """The stop's second half, on the lane: rest confirmed, never inferred (C5), by the
+        stop's own deadline, then the answer. The lane runs stops in the order they arrived, so
+        they are answered in that order."""
+        try:
+            state = self._await_estop(since, deadline)
+        except Exception as exc:  # noqa: BLE001 - a stop is answered, never left silent
+            print(f"error: estop id={estop_id} for {self._robot_id!r}: its wait raised {exc!r}; "
+                  f"answered FAILED", file=sys.stderr, flush=True)
+            state = ESTOP_FAILED
+        self._answer_stop(estop_id, initiated_ms, state, send, True)
+
+    def _answer_stop(self, estop_id: str, initiated_ms: int, state: str, send,
+                     counted: bool) -> None:
+        pb = self._pb
+        try:
+            stopped = state == ESTOP_STOPPED
+            self._latch.record_state(self._robot_id, estop_id, "STOPPED" if stopped else "FAILED")
+            ack = pb.EstopAck(estop_id=estop_id, stop_initiated_at=initiated_ms,
+                              state=pb.ESTOP_STATE_STOPPED if stopped else pb.ESTOP_STATE_FAILED)
+            if stopped:
+                ack.confirmed_at_ms = _now_ms()
+            send(pb.AdapterSafetyMessage(robot_id=self._robot_id, estop_ack=ack))
+        finally:
+            if counted:
+                with self._robot_lock:
+                    self._stops_in_flight -= 1
 
     def _on_fence(self, estop_id: str) -> None:
         """The fence (Command.estop) on the current ControlStream: a stop, latched; a clear
-        that came first takes effect with it."""
-        stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
-        if stop:
-            self._stop_and_ack(estop_id, self._safety_outbox.put)
-        if lifted:
-            self._send_clear_ack(estop_id)
+        that came first takes effect with it. Under _stop_order_lock from the latch decision
+        until the stop's answer has its place on the lane, so a clear for it read meanwhile on
+        the SafetyStream (_on_clear) is answered after it."""
+        with self._stop_order_lock:
+            stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
+            lifted_ms = _now_ms()  # when the kept clear took effect, if it did
+            if stop:
+                self._stop_and_ack(estop_id, self._send_safety)
+            if lifted:
+                # After the stop's own answer, which may still be waiting on the lane: the stop
+                # is answered before its clear.
+                self._lane.submit(lambda: self._send_clear_ack(estop_id, lifted_ms))
 
     def _on_clear(self, clear) -> None:
-        verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
-                                       clear.ends_local_set)
-        print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
-              file=sys.stderr)
-        if verdict == "ack":
-            self._send_clear_ack(clear.estop_id)
-            if clear.ends_local_set:
-                self._send_local_report()
+        """A SafetyStream clear. The latch decides it here, on the reader; the answer goes on
+        the vehicle's lane, after the answer of any stop still waiting there, so a stop is
+        answered before its clear (as in _on_fence). The local report a clear that ends the
+        local set brings follows its EstopClearAck. Under _stop_order_lock, so a clear read
+        while its fence's stop is being commanded on the ControlStream waits until that stop has
+        its place on the lane."""
+        with self._stop_order_lock:
+            verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
+                                           clear.ends_local_set)
+            lifted_ms = _now_ms() if verdict == "lifted" else None
+            print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
+                  file=sys.stderr)
+            if verdict in ("lifted", "ack"):
+                estop_id, ends_local = clear.estop_id, bool(clear.ends_local_set)
 
-    def _send_clear_ack(self, estop_id: str) -> None:
+                def answer() -> None:
+                    self._send_clear_ack(estop_id, lifted_ms)
+                    if ends_local:
+                        self._send_local_report()
+                self._lane.submit(answer)
+
+    def _send_clear_ack(self, estop_id: str, lifted_ms: int | None) -> None:
+        """The EstopClearAck for ``estop_id``. ``lifted_ms`` is when the latch lifted the stop,
+        taken where it lifted: the ack itself may go up to 2 s later, after the answer of a stop
+        still waiting on the lane. None for an ack sent again for an ID lifted earlier: the
+        latch keeps no time for a lift, so that ack carries the time it is sent. RFC-0001
+        names ``lifted_at_ms`` without saying which time it holds."""
         pb = self._pb
+        at = lifted_ms if lifted_ms is not None else _now_ms()
         self._safety_outbox.put(pb.AdapterSafetyMessage(
             robot_id=self._robot_id,
-            estop_clear_ack=pb.EstopClearAck(estop_id=estop_id, lifted_at_ms=_now_ms())))
+            estop_clear_ack=pb.EstopClearAck(estop_id=estop_id, lifted_at_ms=at)))
 
     def _send_local_report(self) -> None:
         pb = self._pb
@@ -1838,11 +2117,9 @@ class fleet_adapter_vda5050Adapter:
         self._send_local_report()
 
     def _edge_stop(self, estop_id: str, send) -> None:
-        """An edge stop: the robot's local latch is set (reported at once), then the same
-        confirmed stop as any other, answered on the EdgeStream."""
-        self._latch.set_local(self._robot_id)
-        self._send_local_report()
-        self._stop_and_ack(estop_id, lambda msg: send(msg.estop_ack))
+        """An edge stop for this vehicle alone: the process's edge stop with one member.
+        ``send`` takes the EstopAck."""
+        self._process.edge_stop([self], estop_id, send)
 
     # ── EdgeStream (C8) ──────────────────────────────────────────────────────
 
@@ -1852,31 +2129,16 @@ class fleet_adapter_vda5050Adapter:
             raise RuntimeError(f"no dialler configured; not dialling edge node {addr}")
         return self._dial(addr)
 
-    def _edge_loop(self) -> None:
-        pb = self._pb
-        addr = self._edge_addr.get()  # blocks until an edge endpoint is advertised (C8.1)
-        estub = self._pb_grpc.EdgeServiceStub(self._dial_edge(addr))
-        outbox: queue.Queue = queue.Queue()
-        # C8.2: tee one PositionFrame so the edge node has a pose to evaluate, fire-and-forget.
-        # Only while the robot can be observed and its position is known, as for telemetry: no
-        # frame otherwise, never a frozen one or one at the origin (C6.2).
+    def _edge_frame(self):
+        """C8.2: the PositionFrame teed to an edge node, so it has a pose to evaluate. Only
+        while the robot can be observed and its position is known, as for telemetry: None
+        otherwise, never a frozen frame or one at the origin (C6.2)."""
         with self._robot_lock:
             position = self._position_now() if self._robot.transport_alive() else None
-        if position is not None:
-            outbox.put(pb.AdapterEdgeMessage(position=pb.PositionFrame(
-                robot_id=self._robot_id, position=position, ts_ms=_now_ms())))
-
-        def requests() -> Iterator:
-            while True:
-                msg = outbox.get()
-                if msg is None:
-                    return
-                yield msg
-
-        for ec in estub.EdgeStream(requests()):
-            if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
-                self._edge_stop(ec.estop.estop_id,
-                                lambda ack: outbox.put(pb.AdapterEdgeMessage(estop_ack=ack)))
+        if position is None:
+            return None
+        return self._pb.AdapterEdgeMessage(position=self._pb.PositionFrame(
+            robot_id=self._robot_id, position=position, ts_ms=_now_ms()))
 
 
 def dialler(args, ap):
@@ -1913,18 +2175,26 @@ def dialler(args, ap):
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(description="VDA5050 Fleet Adapter")
     ap.add_argument("--endpoint", default="localhost:9090")
-    ap.add_argument("--robot-id", default="robot-conformance-1")
+    ap.add_argument("--robot-id", default=None,
+                    help="the robot id this adapter serves (default: robot-conformance-1)")
+    ap.add_argument("--vehicles-file", default="",
+                    help="vda5050 comms: a YAML list of the vehicles this process serves, each "
+                         "with robot_id, serial and optionally manufacturer (vehicles.py). "
+                         "Takes the place of --robot-id, --serial and --manufacturer; every "
+                         "vehicle is served on one ControlStream and one MQTT client")
     ap.add_argument("--comms", default="simulated", choices=["simulated", "vda5050"],
                     help="robot comms: 'simulated' ($0, no broker) or 'vda5050' (MQTT/JSON)")
     ap.add_argument("--mqtt-host", default="localhost")
     ap.add_argument("--mqtt-port", type=int, default=1883)
-    ap.add_argument("--manufacturer", default="swarmada",
+    ap.add_argument("--manufacturer", default=None,
                     help="vda5050 comms: 'manufacturer' segment of the robot's MQTT topic "
                          "identity (interfaceName/version/MANUFACTURER/serialNumber). Must "
-                         "match the robot's VDA5050 identity to bind a real AMR.")
-    ap.add_argument("--serial", default="amr-1",
+                         "match the robot's VDA5050 identity to bind a real AMR "
+                         "(default: swarmada).")
+    ap.add_argument("--serial", default=None,
                     help="vda5050 comms: 'serialNumber' segment of the robot's MQTT topic "
-                         "identity. Must match the robot's VDA5050 serial to bind a real AMR.")
+                         "identity. Must match the robot's VDA5050 serial to bind a real AMR "
+                         "(default: amr-1).")
     ap.add_argument("--route-graph", default="",
                     help="vda5050 comms: a YAML lane graph (routing.py). Orders then follow its "
                          "lanes instead of one straight edge from the vehicle to the goal, and a "
@@ -1965,6 +2235,7 @@ def main(argv: list[str] | None = None) -> None:
         ap.error("--route-graph needs --comms vda5050")
     if not (math.isfinite(args.state_lapse_seconds) and args.state_lapse_seconds > 0):
         ap.error(f"--state-lapse-seconds is {args.state_lapse_seconds:g}, not a positive number")
+    vehicles = _vehicles(args, ap)
     dial = dialler(args, ap)
 
     from fleet_adapter.v1 import fleet_adapter_pb2 as pb
@@ -1982,10 +2253,21 @@ def main(argv: list[str] | None = None) -> None:
             on_map = f", map {graph.map_id}" if graph.map_id else ""
             print(f"route graph {args.route_graph}: {len(graph.node_ids)} nodes, "
                   f"{graph.edge_count} edges{on_map}", file=sys.stderr)
-        robot = Vda5050Binding(robot_id=args.robot_id,
-                               manufacturer=args.manufacturer, serial=args.serial,
-                               mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
-                               route_graph=graph, state_lapse_s=args.state_lapse_seconds)
+        # A fleet's vehicles share one MQTT client and its session (mqtt_client.py), under the
+        # first vehicle's client id; a lone vehicle keeps a client of its own, as before.
+        shared = None
+        if len(vehicles) > 1:
+            from fleet_adapter_vda5050.mqtt_client import MqttClient
+            shared = MqttClient(args.mqtt_host, args.mqtt_port,
+                                client_id=f"swarmada-{vehicles[0].robot_id}",
+                                vehicles=len(vehicles))
+        robots = [Vda5050Binding(robot_id=v.robot_id,
+                                 manufacturer=v.manufacturer, serial=v.serial,
+                                 mqtt_host=args.mqtt_host, mqtt_port=args.mqtt_port,
+                                 route_graph=graph, state_lapse_s=args.state_lapse_seconds,
+                                 mqtt=shared)
+                  for v in vehicles]
+        robot = robots[0]
     else:
         # Scenarios are additive tooling, not a safety requirement (ADR-0005): if
         # scenario support is unavailable (e.g. PyYAML missing) run the $0 skeleton.
@@ -2005,9 +2287,23 @@ def main(argv: list[str] | None = None) -> None:
                 component=args.fault_component, fault_at=args.fault_at, recover_at=args.recover_at))
             engine = ScenarioEngine(scenario)
         robot = SimulatedRobot(engine)  # $0 skeleton; scenario-driven when an engine is set
-    adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, args.robot_id,
-                                           state_dir=args.state_dir or None, dial=dial,
-                                           namespace=args.namespace)
+        robots = [robot]
+    if len(robots) == 1:
+        adapter = fleet_adapter_vda5050Adapter(pb, pb_grpc, robot, vehicles[0].robot_id,
+                                               state_dir=args.state_dir or None, dial=dial,
+                                               namespace=args.namespace)
+    else:
+        # One process for the fleet: its streams, one ControlStream and one SafetyStream, are
+        # every vehicle's; the first vehicle runs them, as a lone vehicle does (process.py).
+        streams = _Streams(dial, args.namespace)
+        cores = [fleet_adapter_vda5050Adapter(pb, pb_grpc, r, v.robot_id,
+                                              state_dir=args.state_dir or None, streams=streams)
+                 for r, v in zip(robots, vehicles)]
+        FleetProcess(cores)
+        adapter = cores[0]
+        print(f"serving {len(cores)} vehicles from {args.vehicles_file} on one MQTT client "
+              f"(swarmada-{vehicles[0].robot_id}): {adapter._process.served_text()}",
+              file=sys.stderr)
     if args.comms == "simulated":
         # The simulated vehicle's reset: a local command at the vehicle, never a message.
         signal.signal(signal.SIGUSR1, lambda signum, frame: robot.request_reset())
@@ -2028,8 +2324,35 @@ def main(argv: list[str] | None = None) -> None:
         # there was no `stop()` anywhere in this adapter, so a `--comms vda5050` run left
         # paho's network thread and the broker session to the interpreter's exit. Calling
         # it here makes the shutdown explicit at the level that owns the robot; `stop()`
-        # is idempotent and safe when `start()` never ran.
-        robot.stop()
+        # is idempotent and safe when `start()` never ran. Every vehicle's: a shared client's
+        # session ends with the last.
+        for r in robots:
+            r.stop()
+
+
+def _vehicles(args, ap) -> list:
+    """The vehicles this process serves: those --vehicles-file lists, or the one --robot-id,
+    --serial and --manufacturer give (or their defaults). The file takes the place of those
+    flags, so giving it with any of them is refused, as is giving it for the simulated comms,
+    which serve one vehicle (ap.error exits 2)."""
+    from fleet_adapter_vda5050.vehicles import DEFAULT_MANUFACTURER, Vehicle, load_vehicles
+
+    if not args.vehicles_file:
+        return [Vehicle(robot_id="robot-conformance-1" if args.robot_id is None else args.robot_id,
+                        serial="amr-1" if args.serial is None else args.serial,
+                        manufacturer=(DEFAULT_MANUFACTURER if args.manufacturer is None
+                                      else args.manufacturer))]
+    if args.comms != "vda5050":
+        ap.error("--vehicles-file needs --comms vda5050: the simulated comms serve one vehicle")
+    given = [flag for flag, value in (("--robot-id", args.robot_id), ("--serial", args.serial),
+                                      ("--manufacturer", args.manufacturer)) if value is not None]
+    if given:
+        ap.error(f"--vehicles-file and {', '.join(given)} together: the file gives each "
+                 f"vehicle's robot_id, serial and manufacturer")
+    try:
+        return load_vehicles(args.vehicles_file)
+    except ValueError as exc:
+        ap.error(str(exc))
 
 
 if __name__ == "__main__":

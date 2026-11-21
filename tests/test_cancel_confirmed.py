@@ -12,7 +12,8 @@ no longer runs (it was replaced in place) stops nothing, and is STOPPED_SAFELY o
 received after the cancel shows the vehicle on the replacing order.
 
 The wait is off the ControlStream reader, so a command behind a cancel, a fence above all, is
-handled at once."""
+handled at once. It ends 1.5 s after the cancel arrived, so the answer reaches the control plane
+before its 2 s wait for it ends."""
 
 from __future__ import annotations
 
@@ -277,3 +278,55 @@ def test_no_state_after_the_stop_is_stop_unconfirmed() -> None:
     res, _ = _cancel(a, "act-1", 8)
     assert res.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
     assert "no state after the stop" in res.message
+
+
+# ── the cancel's deadline ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("case", [
+    "never at rest",
+    "at rest at 1.4 s",
+    "never at rest, its cancelOrder 0.5 s in the sending",
+    "replaced, never seen on its order",
+])
+def test_a_cancels_answer_comes_within_1_5_s_of_its_arrival(case) -> None:
+    """Each look of the wait takes its real 50 ms. The answer must come within 1.5 s of the
+    cancel's arrival, give or take a look: STOP_UNCONFIRMED when nothing is witnessed by then,
+    STOPPED_SAFELY when it is."""
+    if case.startswith("replaced"):
+        a, b, o1, _ = _replaced("1.4.0", out=False)
+        moving = {"order_id": o1, "driving": True, "nodes": 2}  # still the replaced order
+        rest = moving
+        cancelled = "act-1"
+    else:
+        a, b = _adapter("1.4.0")
+        _assign(a, "act-1", 7)
+        o1 = b._last_order_id
+        moving = {"order_id": o1, "driving": True, "nodes": 2}
+        rest = {"order_id": o1}
+        cancelled = "act-1"
+        b.on_state(_state(**moving))
+    if "0.5 s in the sending" in case:
+        real = b.command_stop
+
+        def slow_stop(robot_id) -> None:
+            time.sleep(0.5)
+            real(robot_id)
+        b.command_stop = slow_stop
+    at = 1.4 if case == "at rest at 1.4 s" else float("inf")
+    t0 = [0.0]
+
+    def look(seconds) -> None:
+        b.on_state(_state(**(rest if time.monotonic() - t0[0] >= at else moving)))
+        time.sleep(seconds)
+    a._stop_confirm_sleep = look
+    t0[0] = time.monotonic()
+    res, _ = _cancel(a, cancelled, 9)
+    took = time.monotonic() - t0[0]
+    assert took <= 1.6, f"answered {took:.2f} s after the cancel arrived"
+    if case == "at rest at 1.4 s":
+        assert res.disposition == pb.CANCEL_DISPOSITION_STOPPED_SAFELY
+    else:
+        assert took >= 1.45, f"answered {took:.2f} s after it arrived, before its 1.5 s"
+        assert res.acknowledged
+        assert res.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
+        assert "1.5 s" in res.message

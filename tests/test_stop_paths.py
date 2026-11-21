@@ -373,7 +373,7 @@ def test_a_stop_that_is_not_an_estop_never_pauses() -> None:
 def test_the_adapter_estop_sends_one_pause_and_one_cancel(monkeypatch) -> None:
     """Before, the stop was commanded by the interrupt and again by the confirmation: two
     cancelOrders for one estop, before any pause."""
-    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None: ESTOP_STOPPED)
+    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None, **_: ESTOP_STOPPED)
     b = _live_binding()
     b.on_state(_state(driving=True, vx=0.8, order_id="x", nodes=2))
     a = mark_registered(Adapter(pb, None, b, ROBOT))
@@ -416,7 +416,7 @@ def _race_assign_with(a: Adapter, monkeypatch, during):
 def test_an_estop_during_an_assignment_sends_no_order_and_no_stop_pause(monkeypatch) -> None:
     """The safety review's race: the estop commands the vehicle without the action lock, so an
     assignment already past the latch went on to send stopPause and its order after it."""
-    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None: ESTOP_STOPPED)
+    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None, **_: ESTOP_STOPPED)
     for vehicle in (_state(), _state(driving=True, vx=0.8, order_id="x", nodes=2)):
         b = _live_binding()
         b.on_state(vehicle)
@@ -447,7 +447,7 @@ class _HeldAfterOrder(Vda5050Binding):
 
 def test_an_estop_just_after_the_order_went_out_stops_it_and_interrupts_the_action(
         monkeypatch) -> None:
-    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None: ESTOP_STOPPED)
+    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None, **_: ESTOP_STOPPED)
     b = mark_transport_live(_HeldAfterOrder())
     b.on_state(_state())
     a = mark_registered(Adapter(pb, None, b, ROBOT))
@@ -485,7 +485,7 @@ def test_a_resume_racing_an_estop_does_not_lift_its_pause() -> None:
 
 
 def test_a_binding_without_command_estop_still_stops_and_answers(monkeypatch) -> None:
-    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None: ESTOP_STOPPED)
+    monkeypatch.setattr(adapter_mod, "await_estop_confirmation", lambda robot, rid, since=None, **_: ESTOP_STOPPED)
 
     class _Older(SimulatedRobot):
         command_estop = None  # written before command_estop was declared

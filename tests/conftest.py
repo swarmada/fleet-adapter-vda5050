@@ -75,6 +75,9 @@ def mark_transport_live(binding):
             return PublishInfo(published=True)
 
         @staticmethod
+        def subscribe(topic, qos=1) -> None: ...
+
+        @staticmethod
         def loop_stop() -> None: ...
 
         @staticmethod
@@ -82,10 +85,75 @@ def mark_transport_live(binding):
 
     binding._mqtt._client = _RecordingClient()
     binding._mqtt._up = True  # the broker session is up, as after on_connect
+    binding._mqtt._users = 1  # this binding counts as its user, as after start()
+    binding._mqtt_held = True
     binding._started = True
     binding._connection = profiles.CONN_ONLINE
     binding.published = published
     return binding
+
+
+class SharedBroker:
+    """Stands in for paho's client inside the one MqttClient every vehicle of a process shares
+    (fleet_on_one_client). Each publish is recorded with its topic and acknowledged at once,
+    unless ``hold`` names its topic. Each disconnect records how many users the client still
+    counted and how many messages had been published."""
+
+    def __init__(self, shared) -> None:
+        self.published: list[tuple[str, str]] = []
+        self.hold = lambda topic: False
+        self.disconnects: list[tuple[int, int]] = []
+        self._shared = shared
+
+    def publish(self, topic, payload, qos=1):
+        self.published.append((topic, payload))
+        return PublishInfo(published=not self.hold(topic))
+
+    @staticmethod
+    def subscribe(topic, qos=1) -> None: ...
+
+    @staticmethod
+    def loop_stop() -> None: ...
+
+    def disconnect(self) -> None:
+        self.disconnects.append((self._shared._users, len(self.published)))
+
+
+class _Own:
+    """One binding's own publishes on the shared broker, as mark_transport_live's
+    ``published`` lists them."""
+
+    def __init__(self, broker: SharedBroker, topics) -> None:
+        self._broker, self._mine = broker, {topics.order, topics.instant_actions}
+
+    def __iter__(self):
+        return iter([(t, p) for t, p in list(self._broker.published) if t in self._mine])
+
+
+def fleet_on_one_client(robot_ids):
+    """A ``Vda5050Binding`` for each of ``robot_ids``, all on one ``MqttClient``, as one process
+    serving them runs them: each live as ``mark_transport_live`` leaves a binding, and the
+    client counting each as a user. Returns (client, broker, bindings); each binding's
+    ``published`` lists its own publishes."""
+    from fleet_adapter_vda5050 import profiles
+    from fleet_adapter_vda5050.mqtt_client import MqttClient
+    from fleet_adapter_vda5050.vda5050_binding import Vda5050Binding
+
+    shared = MqttClient("broker", 1883, client_id=f"swarmada-{robot_ids[0]}",
+                        vehicles=len(robot_ids))
+    broker = SharedBroker(shared)
+    shared._client = broker
+    shared._up = True  # the broker session is up, as after on_connect
+    shared._users = len(robot_ids)  # each binding counts as a user, as after its start()
+    bindings = []
+    for rid in robot_ids:
+        b = Vda5050Binding(robot_id=rid, serial=rid, mqtt=shared)
+        b._mqtt_held = True
+        b._started = True
+        b._connection = profiles.CONN_ONLINE
+        b.published = _Own(broker, b._topics)
+        bindings.append(b)
+    return shared, broker, bindings
 
 
 # ── "the robot is registered on this session" fixture ───────────────────────
