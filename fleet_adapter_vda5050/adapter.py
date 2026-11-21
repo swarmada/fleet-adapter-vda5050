@@ -299,6 +299,12 @@ class fleet_adapter_vda5050Adapter:
         self._pb_grpc = pb_grpc
         self._robot = robot
         self._robot_lock = threading.Lock()
+        # Held from a stop's or a clear's latch decision until its answer has its place on the
+        # lane (_on_fence, _on_safety_message, _on_clear): a fence is read on the ControlStream
+        # and its clear on the SafetyStream, and without it a clear read while the fence's stop
+        # was being commanded could take the lane ahead of that stop and be answered first.
+        # Taken before _robot_lock; never while holding it.
+        self._stop_order_lock = threading.Lock()
         # The action the robot holds, and what is kept about it (_current_action, its token and
         # last state, _action_tokens, _interrupted), changes only under this lock. Several
         # threads end an action -- the SafetyStream and the EdgeStream (a stop), the telemetry
@@ -1931,9 +1937,10 @@ class fleet_adapter_vda5050Adapter:
                                    "ignored; nothing was lifted")
             return
         if kind == "estop":
-            if _at_least_14(self._negotiated):
-                self._latch.on_estop(self._robot_id, cp.estop.estop_id)
-            self._stop_and_ack(cp.estop.estop_id, self._send_safety)
+            with self._stop_order_lock:
+                if _at_least_14(self._negotiated):
+                    self._latch.on_estop(self._robot_id, cp.estop.estop_id)
+                self._stop_and_ack(cp.estop.estop_id, self._send_safety)
         elif kind == "estop_clear":
             self._on_clear(cp.estop_clear)
 
@@ -2011,34 +2018,40 @@ class fleet_adapter_vda5050Adapter:
 
     def _on_fence(self, estop_id: str) -> None:
         """The fence (Command.estop) on the current ControlStream: a stop, latched; a clear
-        that came first takes effect with it."""
-        stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
-        lifted_ms = _now_ms()  # when the kept clear took effect, if it did
-        if stop:
-            self._stop_and_ack(estop_id, self._send_safety)
-        if lifted:
-            # After the stop's own answer, which may still be waiting on the lane: the stop is
-            # answered before its clear.
-            self._lane.submit(lambda: self._send_clear_ack(estop_id, lifted_ms))
+        that came first takes effect with it. Under _stop_order_lock from the latch decision
+        until the stop's answer has its place on the lane, so a clear for it read meanwhile on
+        the SafetyStream (_on_clear) is answered after it."""
+        with self._stop_order_lock:
+            stop, lifted = self._latch.on_fence(self._robot_id, estop_id)
+            lifted_ms = _now_ms()  # when the kept clear took effect, if it did
+            if stop:
+                self._stop_and_ack(estop_id, self._send_safety)
+            if lifted:
+                # After the stop's own answer, which may still be waiting on the lane: the stop
+                # is answered before its clear.
+                self._lane.submit(lambda: self._send_clear_ack(estop_id, lifted_ms))
 
     def _on_clear(self, clear) -> None:
         """A SafetyStream clear. The latch decides it here, on the reader; the answer goes on
         the vehicle's lane, after the answer of any stop still waiting there, so a stop is
         answered before its clear (as in _on_fence). The local report a clear that ends the
-        local set brings follows its EstopClearAck."""
-        verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
-                                       clear.ends_local_set)
-        lifted_ms = _now_ms() if verdict == "lifted" else None
-        print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
-              file=sys.stderr)
-        if verdict in ("lifted", "ack"):
-            estop_id, ends_local = clear.estop_id, bool(clear.ends_local_set)
+        local set brings follows its EstopClearAck. Under _stop_order_lock, so a clear read
+        while its fence's stop is being commanded on the ControlStream waits until that stop has
+        its place on the lane."""
+        with self._stop_order_lock:
+            verdict = self._latch.on_clear(self._robot_id, clear.estop_id, clear.leader_term,
+                                           clear.ends_local_set)
+            lifted_ms = _now_ms() if verdict == "lifted" else None
+            print(f"estop clear id={clear.estop_id} term={clear.leader_term}: {verdict}",
+                  file=sys.stderr)
+            if verdict in ("lifted", "ack"):
+                estop_id, ends_local = clear.estop_id, bool(clear.ends_local_set)
 
-            def answer() -> None:
-                self._send_clear_ack(estop_id, lifted_ms)
-                if ends_local:
-                    self._send_local_report()
-            self._lane.submit(answer)
+                def answer() -> None:
+                    self._send_clear_ack(estop_id, lifted_ms)
+                    if ends_local:
+                        self._send_local_report()
+                self._lane.submit(answer)
 
     def _send_clear_ack(self, estop_id: str, lifted_ms: int | None) -> None:
         """The EstopClearAck for ``estop_id``. ``lifted_ms`` is when the latch lifted the stop,

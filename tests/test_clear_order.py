@@ -7,7 +7,8 @@ A stop is commanded on the reader and answered from the vehicle's lane once rest
 up to 2 s later. A clear for that stop can arrive on the SafetyStream meanwhile. Its
 EstopClearAck, and the local report a clear that ends the local set brings, must come after the
 stop's final EstopAck (STOPPED or FAILED), in that order, whichever stream the stop came on and
-whether the clear came before or after its fence.
+whether the clear came before or after its fence, and when the clear is read on the SafetyStream
+while the fence's stop is still being commanded on the ControlStream.
 
 Its lifted_at_ms is the time the latch lifted the stop, not the time the ack was sent; an ack
 sent again for an ID lifted earlier carries the time it is sent."""
@@ -204,3 +205,33 @@ def test_a_clear_ack_carries_the_time_the_latch_lifted(adapter, path) -> None:
     _until(lambda: len(_clear_acks(s, "e1", start)) == 2)
     again = _clear_acks(s, "e1", start)[1]
     assert abs(again.lifted_at_ms - resent_ms) <= 100, again.lifted_at_ms - resent_ms
+
+
+def test_a_clear_read_while_its_fence_is_being_commanded_is_answered_after_the_stop(
+        adapter) -> None:
+    """The fence and its clear come on two streams, read on two threads. The clear is read after
+    the fence has marked the stop fenced, while the fence is still commanding the stop (slowed
+    here to 0.3 s). The clear must still be answered after the stop's own answer."""
+    a, b, stub = adapter, adapter._robot, adapter.stub
+    threading.Thread(target=a.run_safety_stream, args=(stub,), daemon=True).start()
+    _until(lambda: len(stub.streams) == 1)
+    s = stub.streams[0]
+    _until(lambda: any(m.WhichOneof("payload") == "local_stop" for m in list(s.sent)))
+    time.sleep(0.1)  # the opening report is all sent
+    start = len(s.sent)
+    b.rest_at = time.monotonic() + 0.8
+    real = b.command_estop
+
+    def slow_estop(robot_id) -> None:
+        time.sleep(0.3)  # the fence commanding its stop
+        real(robot_id)
+    b.command_estop = slow_estop
+    fencing = threading.Thread(target=_fence, args=(a, "e1"), daemon=True)
+    fencing.start()
+    _until(lambda: "e1" in a._latch._r(ROBOT).fenced)  # fenced, the stop not yet commanded
+    _safety(s, estop_clear=pb.EstopClear(estop_id="e1", leader_term=1))
+    fencing.join(5)
+    _until(lambda: "clear" in s.events("e1", start), timeout=4)
+    _until(lambda: a._stops_in_flight == 0)
+    time.sleep(0.2)
+    assert s.events("e1", start) == ["final", "clear"]
