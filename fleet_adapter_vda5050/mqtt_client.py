@@ -240,8 +240,11 @@ class MqttClient:
 
     def stop(self) -> None:
         """Release the caller's use. The last user's stop disconnects and stops paho's network
-        thread; an earlier one leaves the session to the others. A no-op with no user, so a
-        binding that never connected, or already stopped, can call it safely."""
+        thread; an earlier one leaves the session to the others. A no-op with no user. On a
+        client several bindings share, each call takes one use away, whoever makes it, so a
+        binding calls it only for the use its own connect() took (Vda5050Binding._mqtt_held):
+        a call for a use it never took would end another binding's, and with it, if that was
+        the last, the whole fleet's session."""
         with self._use_lock:
             if self._users == 0:
                 return
