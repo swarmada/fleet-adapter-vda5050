@@ -17,7 +17,8 @@ A process serving several vehicles does all of that once, for every vehicle: the
 the process's streams', so every vehicle is stopped and refuses work, the waits for rest run at
 the same time, and each MQTT session is released once. With every vehicle on one MQTT client,
 as a process serving several runs them, each releases it once and its session ends with the
-last release, after every vehicle's cancelOrder."""
+last release, after every vehicle's cancelOrder. A vehicle brought up after the supersession
+doesn't take the session back."""
 
 from __future__ import annotations
 
@@ -574,3 +575,84 @@ def test_a_superseded_fleet_on_one_mqtt_client_ends_its_session_once_after_every
         assert c._robot.stops == [True] and not c._robot._mqtt_held, c._robot_id
     assert p.shared.users == 0
     assert p.broker.disconnects == [(0, len(p.broker.published))]  # once, last, after all
+
+
+def _unstarted_fleet(monkeypatch):
+    """FLEET on one MQTT client, none of them started yet: the client connects (a stand-in for
+    paho's connect, counted) only when the first binding starts."""
+    monkeypatch.setattr(Adapter, "_telemetry_loop", lambda self, stub: None)
+    shared, broker, bindings = fleet_on_one_client(FLEET)
+    shared._client, shared._up, shared._users = None, False, 0
+    for b in bindings:
+        b._mqtt_held = b._started = False
+        b.on_state(_IDLE)
+    opens: list = []
+
+    def _open() -> None:
+        opens.append(True)
+        shared._client, shared._up = broker, True
+    shared._open = _open
+    streams = _Streams()
+    cores = [Adapter(pb, None, b, b._robot_id, streams=streams) for b in bindings]
+    for c in cores:
+        c._stop_confirm_sleep = lambda s: None
+    p = FleetProcess(cores)
+    return p, shared, broker, opens
+
+
+def _supersede(p) -> None:
+    p.cores[0]._on_superseded("ControlStream", _Closed(grpc.StatusCode.ABORTED, SUPERSEDED))
+
+
+def test_a_vehicle_brought_up_after_a_supersession_is_not_started(monkeypatch) -> None:
+    """The streams are superseded after two of three vehicles are up. Their bindings are released
+    and the session ends; the third, brought up afterwards, isn't started: the client doesn't
+    connect again, and nothing is published for it."""
+    p, shared, broker, opens = _unstarted_fleet(monkeypatch)
+    a1, a2, a3 = p.cores
+    a1.bring_up_robot()
+    a2.bring_up_robot()
+    _supersede(p)
+    assert shared.users == 0 and broker.disconnects == [(0, len(broker.published))]
+    a3.bring_up_robot()
+    assert opens == [True]  # connected once, for the first two only
+    assert shared.users == 0 and shared._client is None
+    assert not a3._robot._started and not a3._robot._mqtt_held
+    assert list(a3._robot.published) == []
+
+
+def test_a_vehicle_whose_start_was_under_way_at_the_supersession_is_released(
+        monkeypatch) -> None:
+    """The first vehicle's start is still connecting when the streams are superseded. The
+    supersession's stop of it waits for the start (the vehicle's lock, held across it), then
+    releases it: the client doesn't connect again, nothing is published for the vehicle, which
+    has no order to cancel, and the session ends."""
+    p, shared, broker, opens = _unstarted_fleet(monkeypatch)
+    connecting, go = threading.Event(), threading.Event()
+    opened = shared._open
+
+    def slow_open() -> None:
+        connecting.set()
+        go.wait(5)
+        opened()
+    shared._open = slow_open
+    a1 = p.cores[0]
+    up = threading.Thread(target=a1.bring_up_robot, daemon=True)
+    up.start()
+    assert connecting.wait(5)
+    # The supersession, on the stream reader's thread: recorded at once; its stop of this
+    # vehicle waits for the vehicle's lock, which the bring-up holds while it connects.
+    superseding = threading.Thread(target=_supersede, args=(p,), daemon=True)
+    superseding.start()
+    _until(lambda: a1._superseded.is_set())
+    superseding.join(0.3)
+    assert superseding.is_alive()  # held behind the start, not run while it connects
+    go.set()
+    up.join(5)
+    superseding.join(5)
+    assert not up.is_alive() and not superseding.is_alive()
+    assert opens == [True]  # the one connect, and not again
+    assert shared.users == 0 and shared._client is None
+    assert broker.disconnects == [(0, len(broker.published))]
+    assert not a1._robot._mqtt_held
+    assert list(a1._robot.published) == []

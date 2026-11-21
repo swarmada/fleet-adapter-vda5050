@@ -421,8 +421,19 @@ class fleet_adapter_vda5050Adapter:
         A failure here is fatal on purpose: `start()` raising stops the run, rather than
         letting the adapter register and stream plausible telemetry (pose `(0,0,0)`,
         battery `0`, phase `IDLE`, `is_stopped` permanently False) read off a binding
-        connected to no broker."""
+        connected to no broker.
+
+        Not after a supersession. The streams can be superseded while the process is still
+        bringing its vehicles up (the SafetyStream opens alongside), and the supersession
+        releases only the bindings started by then (FleetProcess.stop_superseded). A binding
+        started after it would take the MQTT session back, under the client id the process that
+        took over uses. So a vehicle isn't started once the streams are superseded. One whose
+        start is under way when they are is released by the supersession itself: its stop of
+        the vehicle takes this lock, held here across the start, so it runs once the start has
+        returned. Starting outside the lock would need a check after the start as well."""
         with self._robot_lock:
+            if self._superseded.is_set():
+                return
             self._robot.start()
             self._robot.spawn(self._robot_id)
 
