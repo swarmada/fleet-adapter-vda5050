@@ -151,7 +151,8 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 \
   the whole fleet. See [Known limitations](#known-limitations) for a broker that allows fewer.
 - **Each vehicle answers for itself.** Every command, stop and clear is for the vehicle it names,
   and is answered from that vehicle alone. A cancel is answered `STOPPED_SAFELY` only on that
-  vehicle's own rest and the broker's acknowledgement of its own `cancelOrder`. A vehicle's stops
+  vehicle's own rest and the broker's acknowledgement of its own `cancelOrder`, and is answered
+  within 1.5 s of arriving, while the control plane still waits for the answer. A vehicle's stops
   are answered in the order they arrived, each within 2 s of arriving, and a stop for one vehicle
   doesn't wait behind another's.
 - **A robot id the process doesn't serve.** A command for it is refused, and a heartbeat for it

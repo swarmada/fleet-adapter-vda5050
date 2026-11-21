@@ -87,6 +87,11 @@ _TERMINAL = (task_map.TASK_SUCCEEDED, task_map.TASK_FAILED, task_map.TASK_CANCEL
 # (swarmada_sdk.safety.await_estop_confirmation's default, 40 x 0.05 s).
 _STOP_CONFIRM_TICK_S = 0.05
 _STOP_CONFIRM_TICKS = 40
+# A cancel's answer is due within this long of the cancel's arrival. The control plane waits 2 s
+# for it (swarmada internal/controller/fleetaction_controller.go, wireTimeout) and drops an answer
+# that comes later, holding the action until its lease is provably dead; the 0.5 s left over is
+# for the answer's way back. An estop keeps the 2 s above.
+_CANCEL_BUDGET_S = 1.5
 
 # The Command arms this adapter implements that act on the robot (its motion, its lease, a hold)
 # or attest something about it (zone_constraints). Each is refused, before anything else runs,
@@ -1180,7 +1185,11 @@ class fleet_adapter_vda5050Adapter:
 
         One look is taken here, on the reader. If it doesn't settle the answer, the rest of the
         wait and the answer run on a thread of their own, so no command behind the cancel waits
-        for it, a fence least of all. Returns True when the answer is left to that thread."""
+        for it, a fence least of all. Returns True when the answer is left to that thread.
+
+        Either wait ends _CANCEL_BUDGET_S after the cancel arrived, after one look at least, so
+        the answer reaches the control plane while it still waits for it."""
+        deadline = time.monotonic() + _CANCEL_BUDGET_S  # from the cancel's arrival
         replaced = ""
         with self._action_lock:
             named = cancel.action_id
@@ -1208,7 +1217,7 @@ class fleet_adapter_vda5050Adapter:
                 return False
 
             def confirm(looks: int = _STOP_CONFIRM_TICKS) -> str:
-                return self._witness_replaced(since, replaced, looks)
+                return self._witness_replaced(since, replaced, looks, deadline)
         else:
             action, cause = named or cancelled, cancel.cause
             accepted = None
@@ -1217,7 +1226,8 @@ class fleet_adapter_vda5050Adapter:
                     return self._robot.cancel_accepted(ticket)
 
             def confirm(looks: int = _STOP_CONFIRM_TICKS) -> str:
-                return self._confirm_stop(since, accepted=accepted, looks=looks)
+                return self._confirm_stop(since, accepted=accepted, looks=looks,
+                                          deadline=deadline)
         if not confirm(looks=1):
             self._answer_cancel(result, action, "", cause=cause)
             return False
@@ -1236,12 +1246,14 @@ class fleet_adapter_vda5050Adapter:
         self._answer_cancel(result, action, why, cause=cause)
         outbox.put(self._pb.AdapterMessage(command_result=result))
 
-    def _witness_replaced(self, since: int | None, replaced: str, looks: int) -> str:
+    def _witness_replaced(self, since: int | None, replaced: str, looks: int,
+                          deadline: float | None = None) -> str:
         """C3.9: "" once a state received after the cancel (``state_seq`` > ``since``) shows
         the vehicle on the order the binding sent last, the one that replaced the action
         named, and none held behind a cancel (``runs_last_order``); else why not, within the
-        estop's budget. A state that still shows the old order, or comes from before the
-        cancel, witnesses nothing."""
+        estop's budget, or by ``deadline`` (``time.monotonic()``, the cancel's) after one look
+        at least. A state that still shows the old order, or comes from before the cancel,
+        witnesses nothing."""
         on_order = self._robot.runs_last_order
         state_seq = getattr(self._robot, "state_seq", None)
         if not callable(state_seq) or since is None:
@@ -1253,7 +1265,10 @@ class fleet_adapter_vda5050Adapter:
                 seen = state_seq(self._robot_id)
                 if type(seen) is int and seen > since and on_order(self._robot_id):
                     return ""
-        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+        budget = (_CANCEL_BUDGET_S if deadline is not None
+                  else _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S)
         return (f"no state after the cancel showed the vehicle on the order of {replaced}, "
                 f"which replaced it, within {budget:g} s")
 
@@ -1278,7 +1293,7 @@ class fleet_adapter_vda5050Adapter:
         result.cancel_action.CopyFrom(answer)
 
     def _confirm_stop(self, since: int | None, accepted=None,
-                      looks: int = _STOP_CONFIRM_TICKS) -> str:
+                      looks: int = _STOP_CONFIRM_TICKS, deadline: float | None = None) -> str:
         """Wait for the vehicle's own confirmation of a cancelOrder stop: "" when a state
         counted after the stop (``state_seq`` > ``since``) shows it at rest
         (``stop_confirmed``, else ``is_stopped``), or the reason it was not confirmed within
@@ -1290,7 +1305,8 @@ class fleet_adapter_vda5050Adapter:
 
         ``accepted`` (a cancel's): the stop is confirmed only once it also answers True, the
         broker having accepted the cancelOrder, within the same budget. ``looks`` = 1 takes one
-        look and doesn't wait."""
+        look and doesn't wait. ``deadline`` (``time.monotonic()``, a cancel's) also ends the
+        wait, after one look at least."""
         confirmed = getattr(self._robot, "stop_confirmed", None) or self._robot.is_stopped
         rested = False
         state_seq = getattr(self._robot, "state_seq", None)
@@ -1308,7 +1324,10 @@ class fleet_adapter_vda5050Adapter:
                     self._robot_id))
                 if rested and (accepted is None or accepted(self._robot_id)):
                     return ""
-        budget = _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+        budget = (_CANCEL_BUDGET_S if deadline is not None
+                  else _STOP_CONFIRM_TICKS * _STOP_CONFIRM_TICK_S)
         if rested:
             return f"the broker did not acknowledge the cancelOrder within {budget:g} s"
         if counted and not self._robot.transport_alive():
