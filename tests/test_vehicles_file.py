@@ -6,6 +6,9 @@
 * The file lists each vehicle's robot_id, serial and optionally manufacturer; a robot id or a
   (manufacturer, serial) pair given twice, an unknown key, a missing or empty value, a key given
   twice in an entry, or anything but a list of mappings is refused at start-up, naming the entry.
+* A serial or a manufacturer that can't be an MQTT topic level is refused at start-up, from the
+  file or from --serial and --manufacturer: two vehicles could otherwise share one topic, and a
+  wildcard would match no message.
 * It takes the place of --robot-id, --serial and --manufacturer, and needs --comms vda5050.
 * Its vehicles are served by one process, on one MQTT client whose client id is the first
   vehicle's and whose in-flight limit is the fleet's (inflight_for).
@@ -67,6 +70,19 @@ def test_one_serial_under_two_manufacturers_is_two_vehicles(tmp_path) -> None:
     ("- {robot_id: a, serial: s-1}\n- {robot_id: b, serial: s-1}\n",
      "entry 2: manufacturer 'swarmada' and serial 's-1' are already entry 1"),
     ("- robot_id: a\n  serial: s-1\n  robot_id: b\n", "key 'robot_id' is given twice"),
+    # Two vehicles on one topic, uagv/v2/a/b/c/...: each is refused at its first entry.
+    ("- {robot_id: x, serial: c, manufacturer: a/b}\n- {robot_id: y, serial: b/c, manufacturer: a}\n",
+     "entry 1: manufacturer 'a/b' has '/', which can't be in an MQTT topic level"),
+    ("- {robot_id: y, serial: b/c, manufacturer: a}\n",
+     "entry 1: serial 'b/c' has '/', which VDA 5050 doesn't allow in a serialNumber"),
+    # Wildcards, which a published topic never matches.
+    ("- {robot_id: a, serial: s+1}\n", "entry 1: serial 's+1' has '+'"),
+    ("- {robot_id: a, serial: s-1, manufacturer: 'M#'}\n",
+     "entry 1: manufacturer 'M#' has '#', which can't be in an MQTT topic level"),
+    ("- {robot_id: a, serial: 's 1'}\n", "entry 1: serial 's 1' has ' '"),
+    # "$" begins a broker's own topics ($SYS/...).
+    ("- {robot_id: a, serial: s-1, manufacturer: '$SYS'}\n",
+     "entry 1: manufacturer '$SYS' has '$', which can't be in an MQTT topic level"),
 ])
 def test_a_bad_file_is_refused_naming_the_entry(tmp_path, text, says) -> None:
     path = _file(tmp_path, text)
@@ -93,6 +109,20 @@ def test_the_file_with_a_vehicle_flag_or_the_simulated_comms_is_refused(
         tmp_path, capsys, extra, says) -> None:
     with pytest.raises(SystemExit) as stop:
         adapter_mod.main(["--insecure", "--vehicles-file", _file(tmp_path, FLEET), *extra])
+    assert stop.value.code == 2
+    assert says in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("flags", "says"), [
+    (["--serial", "s/1"], "serial 's/1' has '/'"),
+    (["--serial", "s#1"], "serial 's#1' has '#'"),
+    (["--manufacturer", "a+b"], "manufacturer 'a+b' has '+'"),
+    (["--manufacturer", "$SYS"], "manufacturer '$SYS' has '$'"),
+])
+def test_a_serial_or_manufacturer_that_cant_be_a_topic_level_is_refused(
+        capsys, flags, says) -> None:
+    with pytest.raises(SystemExit) as stop:
+        adapter_mod.main(["--insecure", "--comms", "vda5050", *flags])
     assert stop.value.code == 2
     assert says in capsys.readouterr().err
 

@@ -85,7 +85,9 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 \
 `--manufacturer` / `--serial` set the robot's VDA5050 topic identity
 (`<interfaceName>/<version>/<manufacturer>/<serialNumber>/…`); they must match the
 robot's own identity. They default to `swarmada` / `amr-1` (the simulator's identity), so
-the `--comms simulated` path and existing setups are unaffected.
+the `--comms simulated` path and existing setups are unaffected. Each is one topic level, so a
+serial may hold only the characters VDA 5050 allows in a `serialNumber` (A-Z a-z 0-9 _ . : -), and
+a manufacturer no `/`, `+`, `#` or `$`. Anything else stops the adapter at start-up.
 
 The image includes paho-mqtt 2.1.0, so it runs `--comms vda5050` as it is; the Dockerfile shows
 the run line. The broker session works like this:
@@ -136,10 +138,10 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 \
 ```
 
 - **The file.** Each robot id is listed once, and so is each pair of manufacturer and serial.
-  An unknown key, a missing or empty value, or a key given twice stops the adapter at start-up,
-  naming the entry. The file takes the place of `--robot-id`, `--serial` and `--manufacturer`,
-  and giving it with any of them is refused. It needs `--comms vda5050`: the simulated comms
-  serve one vehicle.
+  An unknown key, a missing or empty value, a key given twice, or a serial or manufacturer that
+  can't be a topic level stops the adapter at start-up, naming the entry. The file takes the
+  place of `--robot-id`, `--serial` and `--manufacturer`, and giving it with any of them is
+  refused. It needs `--comms vda5050`: the simulated comms serve one vehicle.
 - **One identity for each process.** The vehicles share the process's ControlStream and
   SafetyStream, under the identity of its client certificate. Give every process an identity of
   its own: the control plane serves one identity on one stream, and a second process under the
