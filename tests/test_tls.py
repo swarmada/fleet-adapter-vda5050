@@ -133,6 +133,7 @@ def test_the_edge_loop_dials_through_the_adapters_dialler() -> None:
                 stubs.append(channel)
 
             def EdgeStream(self, requests):
+                a._shutdown.set()  # so the ended stream isn't dialled again, and the loop returns
                 return iter(())
 
     robot = SimulatedRobot()
