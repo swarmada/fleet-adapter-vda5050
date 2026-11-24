@@ -2334,14 +2334,24 @@ def _vehicles(args, ap) -> list:
     """The vehicles this process serves: those --vehicles-file lists, or the one --robot-id,
     --serial and --manufacturer give (or their defaults). The file takes the place of those
     flags, so giving it with any of them is refused, as is giving it for the simulated comms,
-    which serve one vehicle (ap.error exits 2)."""
-    from fleet_adapter_vda5050.vehicles import DEFAULT_MANUFACTURER, Vehicle, load_vehicles
+    which serve one vehicle (ap.error exits 2). A serial or a manufacturer that can't be an
+    MQTT topic level is refused too (vehicles.identity_problem)."""
+    from fleet_adapter_vda5050.vehicles import (
+        DEFAULT_MANUFACTURER,
+        Vehicle,
+        identity_problem,
+        load_vehicles,
+    )
 
     if not args.vehicles_file:
-        return [Vehicle(robot_id="robot-conformance-1" if args.robot_id is None else args.robot_id,
-                        serial="amr-1" if args.serial is None else args.serial,
-                        manufacturer=(DEFAULT_MANUFACTURER if args.manufacturer is None
-                                      else args.manufacturer))]
+        v = Vehicle(robot_id="robot-conformance-1" if args.robot_id is None else args.robot_id,
+                    serial="amr-1" if args.serial is None else args.serial,
+                    manufacturer=(DEFAULT_MANUFACTURER if args.manufacturer is None
+                                  else args.manufacturer))
+        problem = identity_problem(v.manufacturer, v.serial)
+        if problem:
+            ap.error(f"--manufacturer and --serial: {problem}")
+        return [v]
     if args.comms != "vda5050":
         ap.error("--vehicles-file needs --comms vda5050: the simulated comms serve one vehicle")
     given = [flag for flag, value in (("--robot-id", args.robot_id), ("--serial", args.serial),

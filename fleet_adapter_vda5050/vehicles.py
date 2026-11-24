@@ -21,7 +21,14 @@ For example::
 Each robot id is given once, and so is each (manufacturer, serial) pair: two entries for one
 vehicle would have two cores command it. A key given twice in an entry, a key not listed here,
 an empty value or a value that isn't a string is an error, so a typo stops the process at start-up
-rather than leaving a vehicle unserved or served under the wrong identity."""
+rather than leaving a vehicle unserved or served under the wrong identity.
+
+The manufacturer and the serial are each one level of the vehicle's MQTT topics
+(``uagv/v2/<manufacturer>/<serial>/...``), so each is checked as one (identity_problem): a serial
+holds only the characters VDA 5050 allows in a ``serialNumber``, A-Z a-z 0-9 _ . : -, and a
+manufacturer none that MQTT gives a meaning in a topic: ``/`` (which would split it, so two
+vehicles could share one topic), ``+`` and ``#`` (wildcards, which a published topic never
+matches), ``$`` (which begins a broker's own topics) and NUL."""
 
 from __future__ import annotations
 
@@ -29,6 +36,26 @@ from dataclasses import dataclass
 
 DEFAULT_MANUFACTURER = "swarmada"
 _KEYS = ("robot_id", "serial", "manufacturer")
+# VDA 5050 3.0.0, section 4.2: the serialNumber consists of A-Z a-z 0-9 _ . : -; "/" shall not
+# be used in any of the topic's fields, and "+", "#" and "$" (reserved for broker-internal topics)
+# should not be. The 2.0.0 text this adapter speaks wasn't to hand; vda-5050-lib 1.7.2 checks a
+# serialNumber against the same characters ("not restricted to A-Z a-z 0-9 _ . : -").
+_SERIAL_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:-")
+_NOT_IN_A_TOPIC_LEVEL = ("/", "+", "#", "$", "\0")
+
+
+def identity_problem(manufacturer: str, serial: str) -> str | None:
+    """Why ``manufacturer`` and ``serial`` can't be a vehicle's MQTT topic levels, or None when
+    they can (the module docstring gives the rule)."""
+    bad = next((ch for ch in serial if ch not in _SERIAL_CHARS), None)
+    if bad is not None:
+        return (f"serial {serial!r} has {bad!r}, which VDA 5050 doesn't allow in a serialNumber: "
+                f"only A-Z a-z 0-9 _ . : -")
+    bad = next((ch for ch in manufacturer if ch in _NOT_IN_A_TOPIC_LEVEL), None)
+    if bad is not None:
+        return (f"manufacturer {manufacturer!r} has {bad!r}, which can't be in an MQTT topic "
+                f"level: no '/', '+', '#', '$' or NUL")
+    return None
 
 
 @dataclass(frozen=True)
@@ -84,6 +111,9 @@ def load_vehicles(path: str) -> list[Vehicle]:
                 raise ValueError(f"{where}: {key} is {value!r}, not a non-empty string")
         v = Vehicle(robot_id=entry["robot_id"], serial=entry["serial"],
                     manufacturer=entry.get("manufacturer", DEFAULT_MANUFACTURER))
+        problem = identity_problem(v.manufacturer, v.serial)
+        if problem:
+            raise ValueError(f"{where}: {problem}")
         if v.robot_id in ids:
             raise ValueError(f"{where}: robot_id {v.robot_id!r} is already entry "
                              f"{ids[v.robot_id]}")
