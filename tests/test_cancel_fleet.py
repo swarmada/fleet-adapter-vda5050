@@ -4,7 +4,7 @@
 """The cancel rule for every vehicle of a process (test_cancel_confirmed.py has it for one).
 
 A cancel is answered STOPPED_SAFELY only on that vehicle's own witnessed rest, counted after its
-own stop, and the broker's acknowledgement of that vehicle's own cancelOrder, within the estop's
+own stop, and the broker's acknowledgement of that vehicle's own cancelOrder, within its 1.5 s
 budget; a cancel naming an action replaced in place on that vehicle, only once a state from that
 vehicle shows its own replacing order. Nothing another vehicle reports answers for it. The one
 ControlStream reader serves every vehicle, so a cancel's wait runs on a thread of its own: not
@@ -221,7 +221,7 @@ def test_on_one_mqtt_client_another_vehicles_acknowledgement_never_confirms_this
 
 def test_a_fence_and_a_cancel_for_other_vehicles_during_a_cancels_wait_go_on_at_once(
         monkeypatch) -> None:
-    """amr-1 sends nothing after its cancel, so its wait runs the whole 2 s. A fence for amr-3
+    """amr-1 sends nothing after its cancel, so its wait runs its whole 1.5 s. A fence for amr-3
     and a cancel for amr-2 behind it on the one reader are handled at once."""
     p = _fleet(monkeypatch)
     a1, a2, a3 = (_core(p, r) for r in FLEET)
@@ -243,11 +243,11 @@ def test_a_fence_and_a_cancel_for_other_vehicles_during_a_cancels_wait_go_on_at_
     while "startPause" not in _wire(a3._robot):
         assert time.monotonic() < deadline, "amr-3's fence was never commanded"
         time.sleep(0.01)
-    assert time.monotonic() - t0 < 0.5  # the fence, not after amr-1's 2 s
+    assert time.monotonic() - t0 < 0.5  # the fence, not after amr-1's 1.5 s
     at, res = _await(p, seen, 3)
     assert at - t0 < 0.5 and res.cancel_action.disposition == pb.CANCEL_DISPOSITION_STOPPED_SAFELY
     at, res = _await(p, seen, 1)
-    assert at - t0 > 1.5  # amr-1's own wait ran its budget
+    assert 1.4 < at - t0 < 2.0  # amr-1's own wait ran its 1.5 s budget, and no longer
     assert res.cancel_action.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
 
 
@@ -256,13 +256,25 @@ def test_two_cancels_for_two_vehicles_wait_at_the_same_time(monkeypatch) -> None
     a1, a2 = _core(p, "amr-1"), _core(p, "amr-2")
     _looks(a1, real=True)
     _looks(a2, real=True)
+    # When each wait's own looks begin, off the reader (the test's thread). Each deadline runs
+    # from its cancel's arrival, so two waits run one after the other would still both end by
+    # about 1.5 s: only when each began tells them apart.
+    began: dict = {}
+    for c in (a1, a2):
+        def look(s, c=c, sleep=c._stop_confirm_sleep) -> None:
+            if threading.current_thread() is not threading.main_thread():
+                began.setdefault(c._robot_id, time.monotonic())
+            sleep(s)
+        c._stop_confirm_sleep = look
     seen: dict = {}
     t0 = time.monotonic()
     p.handle_control_plane(_cancel_msg("amr-1", "act-1", 1), None)
     p.handle_control_plane(_cancel_msg("amr-2", "act-2", 2), None)
     at1, r1 = _await(p, seen, 1)
     at2, r2 = _await(p, seen, 2)
-    assert max(at1, at2) - t0 < 3.0  # one 2 s budget each, at the same time, not 4 s
+    assert sorted(began) == ["amr-1", "amr-2"]
+    assert all(b - t0 < 0.5 for b in began.values())  # both waits under way at once
+    assert all(1.4 < at - t0 < 2.0 for at in (at1, at2))  # each its own 1.5 s budget
     for r in (r1, r2):
         assert r.cancel_action.disposition == pb.CANCEL_DISPOSITION_STOP_UNCONFIRMED
 
@@ -270,7 +282,7 @@ def test_two_cancels_for_two_vehicles_wait_at_the_same_time(monkeypatch) -> None
 def test_a_stop_for_the_same_vehicle_during_its_cancels_wait_is_answered_at_once(
         monkeypatch) -> None:
     """amr-1 is at rest, but the broker never acknowledges its cancelOrder, so the cancel waits
-    its whole 2 s. An estop for amr-1 meanwhile needs only the vehicle's rest, paused, and is
+    its whole 1.5 s. An estop for amr-1 meanwhile needs only the vehicle's rest, paused, and is
     answered STOPPED at once: its wait doesn't queue behind the cancel's."""
     p = _fleet(monkeypatch)
     a1 = _core(p, "amr-1")
