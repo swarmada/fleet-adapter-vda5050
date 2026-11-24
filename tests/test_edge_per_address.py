@@ -8,7 +8,11 @@ through it.
   member tees it a PositionFrame.
 * Its estop names no robot: every member's local latch is set and its stop commanded, then all
   of them are awaited in parallel, and the stop is answered once: STOPPED only if every member
-  confirmed, else FAILED."""
+  confirmed, else FAILED.
+* Its EdgeStream, when it ends, is dialled again for as long as a vehicle is served through it,
+  and its members tee the new stream a PositionFrame. A link with no member left is dropped, so
+  a later RegisterAck that lists it dials it afresh. Nothing is dialled again after a
+  supersession."""
 
 from __future__ import annotations
 
@@ -67,6 +71,10 @@ class _EdgeNodes:
     def dial(self, addr: str) -> str:
         self.dialled.append(addr)
         return addr
+
+    def end(self, addr: str) -> None:
+        """The edge node ends the stream it has open."""
+        self.out[addr].put(None)
 
     def estop(self, addr: str, estop_id: str) -> None:
         _until(lambda: addr in self.out)
@@ -215,3 +223,53 @@ def test_an_edge_stop_with_no_member_is_answered_failed() -> None:
     assert ack.state == pb.ESTOP_STATE_FAILED
     assert ack.message == "no vehicle is served through this edge node"
     assert _wire(a) == [] and _wire(b) == []
+
+
+def test_an_ended_edge_stream_is_dialled_again_and_its_estops_still_reach_the_vehicles() -> None:
+    p, nodes = _fleet()
+    a, b = p.cores
+    _register(p, [E1], [E1])
+    _until(lambda: len(nodes.frames(E1)) == 2)
+    nodes.end(E1)
+    _until(lambda: nodes.dialled == [E1, E1])  # after its backoff (0.5 s)
+    _until(lambda: len(nodes.frames(E1)) == 4)  # each member tees the new stream a frame
+    nodes.estop(E1, "x2")
+    _until(lambda: nodes.acks(E1))
+    assert [(k.estop_id, k.state) for k in nodes.acks(E1)] == [("x2", pb.ESTOP_STATE_STOPPED)]
+    for c in (a, b):
+        assert _wire(c) == ["startPause", "cancelOrder"]
+
+
+def test_an_ended_edge_stream_with_no_vehicle_is_dropped_and_dialled_afresh_when_listed() -> None:
+    p, nodes = _fleet()
+    a, _b = p.cores
+    _register(p, [E1], [])
+    _until(lambda: len(nodes.frames(E1)) == 1)
+    p.new_session()  # amr-1 is no longer served through E1
+    p.handle_control_plane(pb.ControlPlaneMessage(hello_ack=pb.HelloAck(
+        accepted=True, negotiated_contract_version="1.4.0")), None)
+    _register(p, [], [])
+    nodes.end(E1)
+    time.sleep(1.0)  # past a redial's backoff
+    assert nodes.dialled == [E1]  # not dialled again: no vehicle is served through it
+    assert E1 not in p._edges
+    p.new_session()  # listed again: dialled afresh, and its stops reach amr-1
+    p.handle_control_plane(pb.ControlPlaneMessage(hello_ack=pb.HelloAck(
+        accepted=True, negotiated_contract_version="1.4.0")), None)
+    _register(p, [E1], [])
+    _until(lambda: nodes.dialled == [E1, E1])
+    nodes.estop(E1, "x3")
+    _until(lambda: nodes.acks(E1))
+    assert [(k.estop_id, k.state) for k in nodes.acks(E1)] == [("x3", pb.ESTOP_STATE_STOPPED)]
+    assert _wire(a) == ["startPause", "cancelOrder"]
+
+
+def test_an_ended_edge_stream_is_not_dialled_again_after_a_supersession() -> None:
+    p, nodes = _fleet()
+    _register(p, [E1], [E1])
+    _until(lambda: len(nodes.frames(E1)) == 2)
+    p.cores[0]._superseded.set()  # recorded, as _on_superseded records it
+    nodes.end(E1)
+    time.sleep(1.0)  # past a redial's backoff
+    assert nodes.dialled == [E1]
+    assert E1 not in p._edges

@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import threading
@@ -255,10 +256,12 @@ def _edge_first_message(robot):
 
         def EdgeStream(self, requests):
             # The tee is queued before the stream opens: take the first message, if any is
-            # there within 0.3 s, then close the stream.
-            t = threading.Thread(target=lambda: sent.append(next(requests)), daemon=True)
+            # there within 0.3 s, then close the stream (its requests then end, with none).
+            t = threading.Thread(target=lambda: sent.extend(itertools.islice(requests, 1)),
+                                 daemon=True)
             t.start()
             t.join(0.3)
+            a._shutdown.set()  # so the ended stream isn't dialled again, and the loop returns
             return iter(())
 
     class _Grpc:
@@ -266,7 +269,7 @@ def _edge_first_message(robot):
 
     a._pb_grpc = _Grpc()
     a._dial = lambda addr: object()
-    a._process._start_edge = a._process._edge_loop  # inline: the loop returns when the stream ends
+    a._process._start_edge = a._process._edge_loop  # inline: it returns once the stream ends
     a._process.edge_endpoints(a, ["edge:1"])
     return sent[0] if sent else None
 

@@ -32,11 +32,18 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from collections import deque
 
 # How long a supersession waits for one vehicle's lane to finish its wait: the lane may first
 # finish a stop that was already waiting there, and each wait is bounded at 2 s.
 _SUPERSEDED_WAIT_S = 10.0
+
+# An EdgeStream that ends is dialled again after this wait, doubled after each stream that
+# didn't stay up for _EDGE_STEADY_S, up to _EDGE_REDIAL_MAX_S.
+_EDGE_REDIAL_MIN_S = 0.5
+_EDGE_REDIAL_MAX_S = 5.0
+_EDGE_STEADY_S = 5.0
 
 
 class FleetProcess:
@@ -278,17 +285,61 @@ class FleetProcess:
         threading.Thread(target=self._edge_loop, args=(link,), daemon=True).start()
 
     def _edge_loop(self, link: _EdgeLink) -> None:
-        """One edge node's EdgeStream, dialled as the control plane is."""
-        estub = self._first._pb_grpc.EdgeServiceStub(self._first._dial_edge(link.addr))
+        """One edge node's EdgeStream, dialled as the control plane is. When it ends it is
+        dialled again, with backoff, for as long as a vehicle is served through it: an edge
+        node whose stream had ended could no longer stop its vehicles. A link with no member
+        left is dropped instead (a later RegisterAck that lists it dials it afresh), and none is
+        dialled again once the streams are superseded or the adapter is shutting down. Each new
+        stream has an outbox of its own, and each member tees it a PositionFrame (C8.2)."""
+        delay = _EDGE_REDIAL_MIN_S
+        while True:
+            began = time.monotonic()
+            try:
+                estub = self._first._pb_grpc.EdgeServiceStub(self._first._dial_edge(link.addr))
 
-        def send(ack) -> None:
-            link.outbox.put(self._pb.AdapterEdgeMessage(estop_ack=ack))
+                def send(ack) -> None:  # on the stream open when the answer is sent
+                    link.outbox.put(self._pb.AdapterEdgeMessage(estop_ack=ack))
 
-        for ec in estub.EdgeStream(link.requests()):
-            if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
-                with self._edge_lock:
-                    members = list(link.members)
-                self.edge_stop(members, ec.estop.estop_id, send)
+                for ec in estub.EdgeStream(link.requests()):
+                    if ec.WhichOneof("msg") == "estop":  # C8.3: same confirmed discipline as C5
+                        with self._edge_lock:
+                            members = list(link.members)
+                        self.edge_stop(members, ec.estop.estop_id, send)
+                why = "ended"
+            except Exception as exc:  # noqa: BLE001 - a dropped edge node is dialled again
+                why = f"ended: {exc!r}"
+            old, link.outbox = link.outbox, queue.Queue()
+            old.put(None)  # the ended stream's requests end
+            if self._edge_link_done(link, f"EdgeStream {why}"):
+                return
+            delay = (_EDGE_REDIAL_MIN_S if time.monotonic() - began >= _EDGE_STEADY_S
+                     else delay)
+            print(f"edge {link.addr}: EdgeStream {why}; dialling again in {delay:g} s",
+                  file=sys.stderr, flush=True)
+            self._first._shutdown.wait(delay)
+            delay = min(delay * 2, _EDGE_REDIAL_MAX_S)
+            if self._edge_link_done(link, "before its redial"):
+                return
+            with self._edge_lock:
+                members = list(link.members)
+            for core in members:
+                frame = core._edge_frame()
+                if frame is not None:
+                    link.outbox.put(frame)
+
+    def _edge_link_done(self, link: _EdgeLink, why: str) -> bool:
+        """Whether ``link``'s ended stream is not to be dialled again: the streams are
+        superseded, the adapter is shutting down, or no vehicle is served through it. Such a
+        link is dropped from the edge nodes, so a RegisterAck that lists it later dials it
+        afresh."""
+        with self._edge_lock:
+            done = (self._first._superseded.is_set() or self._first._shutdown.is_set()
+                    or not link.members)
+            if done and self._edges.get(link.addr) is link:
+                del self._edges[link.addr]
+        if done:
+            print(f"edge {link.addr}: {why}; not dialled again", file=sys.stderr, flush=True)
+        return done
 
     def edge_stop(self, members: list, estop_id: str, send) -> None:
         """An edge estop names no robot: it stops every vehicle served through that edge node,
@@ -322,8 +373,11 @@ class _EdgeLink:
         self.outbox: queue.Queue = queue.Queue()
 
     def requests(self):
+        """The messages for the stream open now: from the outbox it was opened with, which is
+        replaced when the stream ends (FleetProcess._edge_loop)."""
+        outbox = self.outbox
         while True:
-            msg = self.outbox.get()
+            msg = outbox.get()
             if msg is None:
                 return
             yield msg
