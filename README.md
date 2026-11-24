@@ -429,8 +429,8 @@ closed that way:
 - stops each vehicle it serves with a `cancelOrder`, without pausing it, so the process that took
   over can give it work;
 - ends the action each vehicle held, never continues it, and refuses all later work;
-- waits up to 2 s for a `state` that shows each vehicle at rest, all at once, and logs whether
-  one came;
+- waits for a `state` that shows each vehicle at rest, all at once, and logs whether one came:
+  up to 2 s, or about 4 s for a vehicle whose lane first finishes a stop that arrived before;
 - then closes its MQTT session, once, so it doesn't take the client id back from the process that
   took over;
 - when only its SafetyStream was superseded, closes its ControlStream too, so a stop for the robot
