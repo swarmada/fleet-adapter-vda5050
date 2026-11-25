@@ -19,7 +19,7 @@ def _factsheet(**overrides) -> str:
     doc = {
         "manufacturer": "acme",
         "serialNumber": "agv-7",
-        "typeSpecification": {"seriesName": "MiR250", "agvClass": "CARRIER"},
+        "typeSpecification": {"seriesName": "examplebots-250", "agvClass": "CARRIER"},
         "protocolFeatures": {"agvActions": [
             {"actionType": "pick"}, {"actionType": "drop"}, {"actionType": "startPause"}]},
     }
@@ -30,7 +30,7 @@ def _factsheet(**overrides) -> str:
 def test_parse_factsheet_extracts_type_and_actions() -> None:
     info = P.parse_factsheet(_factsheet())
     assert (info.manufacturer, info.serial) == ("acme", "agv-7")
-    assert (info.series, info.agv_class) == ("MiR250", "CARRIER")
+    assert (info.series, info.agv_class) == ("examplebots-250", "CARRIER")
     assert info.actions == ["pick", "drop", "startPause"]
 
 
@@ -57,4 +57,4 @@ def test_on_factsheet_stores_parsed_capabilities() -> None:
     assert b.factsheet("amr-1").actions == []      # nothing until the AGV reports
     b.on_factsheet(_factsheet())
     fs = b.factsheet("amr-1")
-    assert fs.series == "MiR250" and "pick" in fs.actions
+    assert fs.series == "examplebots-250" and "pick" in fs.actions

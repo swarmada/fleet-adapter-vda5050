@@ -79,7 +79,7 @@ python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 --comms simula
 pip install -e '.[vda5050]'
 python -m fleet_adapter_vda5050.adapter --endpoint localhost:9090 \
     --comms vda5050 --mqtt-host broker.local --mqtt-port 1883 \
-    --manufacturer MiR --serial 200-abc123
+    --manufacturer examplebots --serial 200-abc123
 ```
 
 `--manufacturer` / `--serial` set the robot's VDA5050 topic identity
@@ -124,12 +124,12 @@ One process can serve several vehicles. List them in a YAML file and give it wit
 `--vehicles-file`:
 
 ```yaml
-- robot_id: amr-1        # the Robot's swarmada.io/robot-id
-  serial: 200-abc123     # the vehicle's VDA 5050 serialNumber
-  manufacturer: MiR      # its VDA 5050 manufacturer; swarmada if left out
+- robot_id: amr-1          # the Robot's swarmada.io/robot-id
+  serial: 200-abc123       # the vehicle's VDA 5050 serialNumber
+  manufacturer: examplebots  # its VDA 5050 manufacturer; swarmada if left out
 - robot_id: amr-2
   serial: 200-abc124
-  manufacturer: MiR
+  manufacturer: examplebots
 ```
 
 ```bash

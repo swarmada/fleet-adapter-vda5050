@@ -13,10 +13,10 @@ For example::
 
     - robot_id: amr-1
       serial: 200-abc123
-      manufacturer: MiR
+      manufacturer: examplebots
     - robot_id: amr-2
       serial: 200-abc124
-      manufacturer: MiR
+      manufacturer: examplebots
 
 Each robot id is given once, and so is each (manufacturer, serial) pair: two entries for one
 vehicle would have two cores command it. A key given twice in an entry, a key not listed here,

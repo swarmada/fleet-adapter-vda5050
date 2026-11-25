@@ -26,10 +26,10 @@ from fleet_adapter_vda5050.vehicles import Vehicle, load_vehicles
 FLEET = """\
 - robot_id: amr-1
   serial: 200-abc123
-  manufacturer: MiR
+  manufacturer: examplebots
 - robot_id: amr-2
   serial: 200-abc124
-  manufacturer: MiR
+  manufacturer: examplebots
 - robot_id: amr-3
   serial: s-7
 """
@@ -45,13 +45,14 @@ def _file(tmp_path, text: str) -> str:
 
 def test_each_vehicle_is_read_with_its_manufacturer_or_the_default(tmp_path) -> None:
     assert load_vehicles(_file(tmp_path, FLEET)) == [
-        Vehicle("amr-1", "200-abc123", "MiR"), Vehicle("amr-2", "200-abc124", "MiR"),
+        Vehicle("amr-1", "200-abc123", "examplebots"),
+        Vehicle("amr-2", "200-abc124", "examplebots"),
         Vehicle("amr-3", "s-7", "swarmada")]
 
 
 def test_one_serial_under_two_manufacturers_is_two_vehicles(tmp_path) -> None:
-    text = ("- {robot_id: a, serial: s-1, manufacturer: MiR}\n"
-            "- {robot_id: b, serial: s-1, manufacturer: OTTO}\n")
+    text = ("- {robot_id: a, serial: s-1, manufacturer: examplebots}\n"
+            "- {robot_id: b, serial: s-1, manufacturer: otherbots}\n")
     assert [v.robot_id for v in load_vehicles(_file(tmp_path, text))] == ["a", "b"]
 
 
@@ -102,7 +103,7 @@ def test_a_file_that_cannot_be_read_is_refused(tmp_path) -> None:
     (["--comms", "simulated"], "--vehicles-file needs --comms vda5050"),
     (["--comms", "vda5050", "--robot-id", "amr-1"], "--vehicles-file and --robot-id together"),
     (["--comms", "vda5050", "--serial", "s-1"], "--vehicles-file and --serial together"),
-    (["--comms", "vda5050", "--manufacturer", "MiR"],
+    (["--comms", "vda5050", "--manufacturer", "examplebots"],
      "--vehicles-file and --manufacturer together"),
 ])
 def test_the_file_with_a_vehicle_flag_or_the_simulated_comms_is_refused(
@@ -160,17 +161,17 @@ def test_the_files_vehicles_are_served_by_one_process_on_one_mqtt_client(
     assert client == id(shared) and shared._client_id == "swarmada-amr-1"
     assert shared._max_inflight == inflight_for(3)
     assert [(b._manufacturer, b._serial) for b in bindings] == [
-        ("MiR", "200-abc123"), ("MiR", "200-abc124"), ("swarmada", "s-7")]
+        ("examplebots", "200-abc123"), ("examplebots", "200-abc124"), ("swarmada", "s-7")]
     assert "serving 3 vehicles from" in capsys.readouterr().err
 
 
 def test_without_the_file_one_vehicle_is_served_on_a_client_of_its_own(served) -> None:
     adapter_mod.main(["--insecure", "--comms", "vda5050", "--robot-id", "amr-9",
-                      "--serial", "s-9", "--manufacturer", "MiR"])
+                      "--serial", "s-9", "--manufacturer", "examplebots"])
     (first,) = served
     assert [c._robot_id for c in first._process.cores] == ["amr-9"]
     b = first._robot
-    assert (b._manufacturer, b._serial) == ("MiR", "s-9")
+    assert (b._manufacturer, b._serial) == ("examplebots", "s-9")
     assert b._mqtt._client_id == "swarmada-amr-9"
     assert b._mqtt._max_inflight == PAHO_MAX_INFLIGHT
 
