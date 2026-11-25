@@ -48,7 +48,7 @@ def test_declares_the_current_contract_version() -> None:
     assert adapter_mod.CONTRACT_VERSION == "1.4.0"
 
 
-def test_the_adapter_version_is_the_contract_plus_its_own_fixes() -> None:
+def test_the_adapter_version_is_the_contract_plus_its_own_releases() -> None:
     """X.Y of the adapter's version is the contract its hello declares; the package metadata,
     __version__ and the hello's adapter_version are one value."""
     pyproject = pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml"
