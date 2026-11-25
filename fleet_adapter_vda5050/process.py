@@ -373,9 +373,15 @@ class _EdgeLink:
         self.outbox: queue.Queue = queue.Queue()
 
     def requests(self):
-        """The messages for the stream open now: from the outbox it was opened with, which is
-        replaced when the stream ends (FleetProcess._edge_loop)."""
-        outbox = self.outbox
+        """The messages for the stream being opened: from the outbox it's opened with, which is
+        replaced when the stream ends (FleetProcess._edge_loop). The outbox is taken here, not
+        on the first read: gRPC reads a call's first request on a thread of its own, which can
+        run only after the call has ended and the outbox been replaced, and a read from the new
+        outbox would take a message meant for the next stream and drop it."""
+        return self._drain(self.outbox)
+
+    @staticmethod
+    def _drain(outbox: queue.Queue):
         while True:
             msg = outbox.get()
             if msg is None:

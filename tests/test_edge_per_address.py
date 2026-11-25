@@ -12,7 +12,8 @@ through it.
 * Its EdgeStream, when it ends, is dialled again for as long as a vehicle is served through it,
   and its members tee the new stream a PositionFrame. A link with no member left is dropped, so
   a later RegisterAck that lists it dials it afresh. Nothing is dialled again after a
-  supersession."""
+  supersession. Each stream reads the outbox it was opened with, so a stream that failed at once
+  takes nothing meant for the next."""
 
 from __future__ import annotations
 
@@ -48,6 +49,8 @@ class _EdgeNodes:
         self.dialled: list[str] = []
         self.got: dict[str, list] = {}
         self.out: dict[str, queue.Queue] = {}
+        # An address's next stream fails at once; called with that stream's requests.
+        self.fail_next: dict[str, object] = {}
 
         nodes = self
 
@@ -57,6 +60,14 @@ class _EdgeNodes:
 
             def EdgeStream(self, requests):
                 addr = self.addr
+                late = nodes.fail_next.pop(addr, None)
+                if late is not None:
+                    late(requests)
+
+                    def failed():
+                        raise RuntimeError("the edge node refused the stream")
+                        yield  # a generator, which raises on its first read as a failed call does
+                    return failed()
                 got = nodes.got.setdefault(addr, [])
                 out = nodes.out.setdefault(addr, queue.Queue())
                 threading.Thread(target=lambda: got.extend(requests), daemon=True).start()
@@ -273,3 +284,36 @@ def test_an_ended_edge_stream_is_not_dialled_again_after_a_supersession() -> Non
     time.sleep(1.0)  # past a redial's backoff
     assert nodes.dialled == [E1]
     assert E1 not in p._edges
+
+
+def test_a_stream_that_failed_at_once_takes_nothing_from_the_next() -> None:
+    """gRPC reads a call's first request on a thread of its own, which can run only after a call
+    that failed at once has ended and its outbox been replaced. That read takes from the outbox
+    the call was opened with, so the next stream still gets each member's PositionFrame and the
+    estop's answer."""
+    p, nodes = _fleet()
+    a, b = p.cores
+    _register(p, [E1], [E1])
+    _until(lambda: len(nodes.frames(E1)) == 2)
+    link = p._edges[E1]
+    taken: list = []
+
+    def late(requests) -> None:  # the failed call's request thread, after the outbox is replaced
+        opened = link.outbox
+
+        def read() -> None:
+            _until(lambda: link.outbox is not opened)
+            taken.append(next(requests))  # and dropped: the call has ended
+        threading.Thread(target=read, daemon=True).start()
+
+    nodes.fail_next[E1] = late
+    nodes.end(E1)
+    # Dialled again after 0.5 s, and that stream fails at once; dialled again 1 s later.
+    _until(lambda: nodes.dialled == [E1, E1, E1])
+    _until(lambda: taken)  # the failed stream's late read was made
+    nodes.estop(E1, "x4")
+    _until(lambda: nodes.acks(E1))
+    assert sorted(nodes.frames(E1)[2:]) == ["amr-1", "amr-2"]  # the third stream's: both
+    assert [(k.estop_id, k.state) for k in nodes.acks(E1)] == [("x4", pb.ESTOP_STATE_STOPPED)]
+    for c in (a, b):
+        assert _wire(c) == ["startPause", "cancelOrder"]
