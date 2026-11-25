@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fleet-adapter-vda5050"
-version = "1.4.0"
+version = "1.4.1"
 description = "VDA5050 Fleet Adapter — a Swarmada Fleet Adapter for the VDA5050 robot class"
 authors = [{ name = "The Swarmada Authors" }]
 license = { text = "Apache-2.0" }
