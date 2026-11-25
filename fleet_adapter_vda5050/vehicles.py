@@ -28,7 +28,8 @@ The manufacturer and the serial are each one level of the vehicle's MQTT topics
 holds only the characters VDA 5050 allows in a ``serialNumber``, A-Z a-z 0-9 _ . : -, and a
 manufacturer none that MQTT gives a meaning in a topic: ``/`` (which would split it, so two
 vehicles could share one topic), ``+`` and ``#`` (wildcards, which a published topic never
-matches), ``$`` (which begins a broker's own topics) and NUL."""
+matches), ``$`` (which begins a broker's own topics) and NUL. Neither may be empty, which would
+leave a level of the topics empty (``uagv/v2//amr-1/...``)."""
 
 from __future__ import annotations
 
@@ -47,6 +48,9 @@ _NOT_IN_A_TOPIC_LEVEL = ("/", "+", "#", "$", "\0")
 def identity_problem(manufacturer: str, serial: str) -> str | None:
     """Why ``manufacturer`` and ``serial`` can't be a vehicle's MQTT topic levels, or None when
     they can (the module docstring gives the rule)."""
+    for name, value in (("serial", serial), ("manufacturer", manufacturer)):
+        if not value:
+            return f"{name} is empty, which would leave the vehicle's MQTT topics a level empty"
     bad = next((ch for ch in serial if ch not in _SERIAL_CHARS), None)
     if bad is not None:
         return (f"serial {serial!r} has {bad!r}, which VDA 5050 doesn't allow in a serialNumber: "
