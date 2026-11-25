@@ -118,6 +118,8 @@ def test_the_file_with_a_vehicle_flag_or_the_simulated_comms_is_refused(
     (["--serial", "s#1"], "serial 's#1' has '#'"),
     (["--manufacturer", "a+b"], "manufacturer 'a+b' has '+'"),
     (["--manufacturer", "$SYS"], "manufacturer '$SYS' has '$'"),
+    (["--serial", ""], "--manufacturer and --serial: serial is empty"),
+    (["--manufacturer", ""], "--manufacturer and --serial: manufacturer is empty"),
 ])
 def test_a_serial_or_manufacturer_that_cant_be_a_topic_level_is_refused(
         capsys, flags, says) -> None:
