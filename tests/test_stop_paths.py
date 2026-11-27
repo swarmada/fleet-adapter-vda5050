@@ -566,7 +566,14 @@ def test_its_own_estop_pause_and_a_swarmada_pause_are_not() -> None:
     b.on_state(_state(paused=True))
     b.command_pause(ROBOT)
     assert not b.paused_at_vehicle(ROBOT)
-    b.command_resume(ROBOT)  # resumed, and the vehicle still reports paused: not ours now
+    b.command_resume(ROBOT)  # resumed: until the vehicle reports its stopPause, still ours
+    assert not b.paused_at_vehicle(ROBOT)
+    stop_pause = json.loads(b.published[-1][1])["actions"][0]["actionId"]
+    b.on_state(json.dumps({  # stopPause FINISHED, and still paused: not ours now
+        "headerId": 1, "timestamp": "t-1", "driving": False,
+        "velocity": {"vx": 0.0, "vy": 0.0, "omega": 0.0}, "paused": True, "orderId": "",
+        "nodeStates": [], "actionStates": [
+            {"actionId": stop_pause, "actionType": "stopPause", "actionStatus": "FINISHED"}]}))
     assert b.paused_at_vehicle(ROBOT)
 
 
