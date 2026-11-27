@@ -76,6 +76,14 @@ _PREEMPT_TIMEOUT_S = 60.0
 # one can be lost: twice that interval, so one late or lost state does not drop the vehicle.
 _STATE_LAPSE_S = 60.0
 
+# How long a stopPause this binding sent keeps the vehicle's pause counted as this binding's while
+# the vehicle has not reported that stopPause ended. VDA5050 2.0.0 has the vehicle send a state when
+# an action's status changes, so its FINISHED comes with the first state after the vehicle takes it
+# (108 ms and 197 ms on vda-5050-lib's virtual vehicle). Two seconds, the deadline of a stop's
+# answer: a vehicle that has not reported the stopPause ended by then is not taken to have lifted
+# the pause, and work is refused again as a pause at the vehicle.
+_STOP_PAUSE_REPORT_S = 2.0
+
 # How many recent states a redelivery is looked for among. QoS 1 redelivers a message the
 # broker has not seen acknowledged, after a reconnect: the last few, not the last hundred.
 _STATE_DEDUP_WINDOW = 64
@@ -181,6 +189,11 @@ class Vda5050Binding:
         self._stop_cancel_ended = False            # ...and the vehicle has reported it ended
         self._estop_paused = False                 # an estop paused the vehicle; stopPause before the next order
         self._pause_requested = False              # a Swarmada pause (command_pause) is in force
+        # The actionId of this binding's latest stopPause and when it went out, until a counted
+        # state lists it as ended (FINISHED or FAILED). Until then a paused: true can be the
+        # pause that stopPause is lifting (paused_at_vehicle), for _STOP_PAUSE_REPORT_S at most.
+        self._stop_pause_id = ""
+        self._stop_pause_at = 0.0
         self._suppressed_stops = 0                 # cancelOrders not sent: nothing to cancel (test seam)
         # A preemption in progress (command_move): the order held, the cancelOrder sent for
         # the order before it, and when the hold gives up.
@@ -295,6 +308,9 @@ class Vda5050Binding:
                         if pid and pid in snapshot.ended_actions and (
                                 snapshot.paused or pid in snapshot.finished_actions):
                             self._pause_acked = True
+                        # Our stopPause ended: from this state on, the vehicle's paused is its own.
+                        if self._stop_pause_id and self._stop_pause_id in snapshot.ended_actions:
+                            self._stop_pause_id = ""
                     elif not self._unidentified_reported:
                         self._unidentified_reported = report = True
                     graph_map = self._graph.map_id if self._graph is not None else None
@@ -977,11 +993,22 @@ class Vda5050Binding:
         one an earlier adapter process set and this one does not know of. The adapter refuses
         work then. An order would wait paused, its action RUNNING for as long as its lease is
         renewed, and this binding will not send the stopPause that releases a pause it did not
-        set. Read from the last ``state`` while the vehicle can be observed; False otherwise."""
+        set. Read from the last ``state`` while the vehicle can be observed; False otherwise.
+
+        Nor while this binding's latest stopPause is not yet reported ended, for
+        ``_STOP_PAUSE_REPORT_S`` at most: a state from before the vehicle took it still says
+        paused. VDA5050 does not say who paused a vehicle, so a button pressed in that window
+        looks like this binding's pause until the stopPause is reported: work is taken then, and
+        its order, sent with no stopPause, waits paused at the vehicle. Once the stopPause is
+        reported ended (FINISHED or FAILED) or the window has passed, a pause is the vehicle's,
+        and work is refused."""
         with self._lock:
             if not (self._started and self._online_locked() and self._has_state):
                 return False
-            return self._state.paused and not (self._estop_paused or self._pause_requested)
+            lifting = (bool(self._stop_pause_id)
+                       and self._clock() - self._stop_pause_at < _STOP_PAUSE_REPORT_S)
+            return self._state.paused and not (
+                self._estop_paused or self._pause_requested or lifting)
 
     def suppressed_stops(self, robot_id: str) -> int:
         """cancelOrders not sent because there was nothing to cancel (test seam)."""
@@ -1019,6 +1046,7 @@ class Vda5050Binding:
                     self._start_pause_id, self._pause_acked = action_id, False
                 elif action_type == profiles.ACTION_STOP_PAUSE:
                     self._start_pause_id, self._pause_acked = "", False
+                    self._stop_pause_id, self._stop_pause_at = action_id, self._clock()
             payload = self._profile.encode_instant_action(
                 header_id=header_id, action_type=action_type,
                 action_id=action_id, manufacturer=self._manufacturer, serial=self._serial,
