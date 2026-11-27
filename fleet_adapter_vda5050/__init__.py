@@ -5,4 +5,4 @@
 # This adapter's version: X.Y is the fleet-adapter contract version its hello declares
 # (adapter.CONTRACT_VERSION), and Z counts this adapter's own releases at that contract. The hello
 # reports it as adapter_version. pyproject.toml's version is the same (test_contract.py checks).
-__version__ = "1.4.1"
+__version__ = "1.4.2"
